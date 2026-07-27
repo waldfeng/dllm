@@ -177,10 +177,7 @@ class GrowthController:
                         self.gradient_beta * previous
                         + (1.0 - self.gradient_beta) * gradient_norm
                     )
-                    raw_velocity = (
-                        (gradient_norm_ema - previous)
-                        / max(abs(previous), 1e-12)
-                    )
+                    raw_velocity = gradient_norm_ema - previous
                     previous_velocity = self.diagnostic_previous_velocity_ema.get(source)
                     velocity = raw_velocity if previous_velocity is None else (
                         self.gradient_beta * previous_velocity
@@ -226,10 +223,7 @@ class GrowthController:
                     self.gradient_beta * previous
                     + (1.0 - self.gradient_beta) * gradient_norm
                 )
-                velocity = (
-                    (gradient_norm_ema - previous)
-                    / max(abs(previous), 1e-12)
-                )
+                velocity = gradient_norm_ema - previous
                 previous_velocity = self.previous_velocity_ema.get(source)
                 velocity_ema = velocity if previous_velocity is None else (
                     self.gradient_beta * previous_velocity

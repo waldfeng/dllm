@@ -306,7 +306,7 @@ def test_cooldown_reports_velocity_without_affecting_growth_state():
     )
     assert torch.isclose(
         torch.tensor(controller.last_diagnostics["velocity_min"]),
-        torch.tensor(-0.25),
+        torch.tensor(-0.25 * (6**0.5)),
     )
     assert controller.previous_gradient_norm_ema == {}
     assert controller.velocity_history == {}
@@ -328,11 +328,11 @@ def test_growth_signal_uses_route_length_normalization_and_relative_velocity():
         [SimpleNamespace(source_id=0, logits=logits, sample_index=0)],
         torch.tensor([2]),
     )
-    # The normalized norm is 4 * sqrt(6) / 2, so the relative velocity is
-    # measured relative to the previous norm of 10.
+    # The normalized norm is 4 * sqrt(6) / 2, so velocity is its absolute
+    # difference from the previous EMA.
     assert torch.isclose(
         torch.tensor(controller.last_diagnostics["velocity_min"]),
-        torch.tensor((4 * (6**0.5) / 2 - 10) / 10),
+        torch.tensor(4 * (6**0.5) / 2 - 10),
     )
     controller.previous_gradient_norm_ema[0] = 1.0
     controller.previous_velocity_ema[0] = -1.0
