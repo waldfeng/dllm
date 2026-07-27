@@ -76,7 +76,13 @@ class MemoryModule(nn.Module):
         gru_input = self.gru_norm(x)
         attention_input = self.attn_norm(x)
         query = self.q_proj(attention_input)
-        gru_output, next_hidden = self.gru(gru_input, hidden)
+        # GRU backward can overflow under BF16 autocast on long dynamic paths.
+        # Keep recurrent state and its backward path in FP32 while leaving the
+        # attention and feed-forward branches eligible for autocasting.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            gru_output, next_hidden = self.gru(
+                gru_input.float(), hidden.float()
+            )
         keys = self.k_proj(gru_output)
         values = self.v_proj(gru_output)
         attended, _ = self.attn(query, keys, values, need_weights=False)

@@ -22,6 +22,20 @@ def test_module_uses_gru_qkv_and_bidirectional_attention():
     assert next_hidden.shape == hidden.shape
 
 
+def test_gru_recurrent_branch_stays_float32_under_autocast():
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    dtypes = []
+
+    def capture(_, inputs, output):
+        dtypes.extend([output[0].dtype, output[1].dtype])
+
+    handle = model.pool[0].gru.register_forward_hook(capture)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        model.pool[0](torch.randn(1, 8, 16), torch.zeros(1, 1, 16))
+    handle.remove()
+    assert dtypes == [torch.float32, torch.float32]
+
+
 def test_module_initialization_uses_xavier_and_orthogonal_gru_families():
     torch.manual_seed(7)
     model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
