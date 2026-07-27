@@ -17,8 +17,43 @@ def _finite_gradients(model: DynamicRouterLM) -> bool:
     )
 
 
+def _gradient_diagnostics(model: DynamicRouterLM) -> dict:
+    bad = []
+    largest = []
+    for name, parameter in model.named_parameters():
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        finite = torch.isfinite(gradient)
+        if not bool(finite.all()):
+            bad.append(
+                {
+                    "name": name,
+                    "shape": list(gradient.shape),
+                    "dtype": str(gradient.dtype),
+                    "nan_count": int(torch.isnan(gradient).sum()),
+                    "inf_count": int(torch.isinf(gradient).sum()),
+                    "finite_max_abs": (
+                        float(gradient[finite].abs().max()) if bool(finite.any()) else None
+                    ),
+                }
+            )
+        elif gradient.numel():
+            largest.append((float(gradient.abs().max()), name))
+    largest.sort(reverse=True)
+    return {
+        "bad_gradients": bad,
+        "largest_finite_gradients": [
+            {"name": name, "max_abs": value} for value, name in largest[:5]
+        ],
+    }
+
+
 def _invalid_result(
-    aux: dict, memory_state: Tensor | None, reason: str | None = None
+    aux: dict,
+    memory_state: Tensor | None,
+    reason: str | None = None,
+    diagnostics: dict | None = None,
 ) -> dict[str, float | int | Tensor | list[str]]:
     invalid_reasons = aux["invalid_reasons"]
     if reason is not None:
@@ -39,6 +74,7 @@ def _invalid_result(
         "invalid_reasons": invalid_reasons,
         "skipped_update": 1,
         "memory_state": safe_memory.detach(),
+        "diagnostics": diagnostics or aux.get("forward_diagnostics", {}),
     }
 
 
@@ -296,7 +332,9 @@ def train_step(
     loss.backward()
 
     if not _finite_gradients(model):
-        return _invalid_result(aux, memory_state, "nonfinite_gradient")
+        return _invalid_result(
+            aux, memory_state, "nonfinite_gradient", _gradient_diagnostics(model)
+        )
 
     inactive_parameters = _snapshot_inactive(model)
     router_snapshot = model.router.detach().clone()
@@ -313,7 +351,9 @@ def train_step(
     if grad_clip is not None:
         total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         if not torch.isfinite(total_norm):
-            return _invalid_result(aux, memory_state, "nonfinite_gradient")
+            return _invalid_result(
+                aux, memory_state, "nonfinite_gradient", _gradient_diagnostics(model)
+            )
     parameter_snapshot = {
         parameter: parameter.detach().clone()
         for parameter in model.parameters()

@@ -435,6 +435,7 @@ def main() -> None:
                     f"active_modules={model.active_count}\n"
                     f"terminations={metrics['terminations']}\n"
                     f"invalid_reasons={metrics['invalid_reasons']}\n"
+                    f"diagnostics={metrics.get('diagnostics', {})}\n"
                     "skipped_update=true\n"
                 )
                 if isinstance(log_stream, DualRollingLog):

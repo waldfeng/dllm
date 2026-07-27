@@ -204,6 +204,26 @@ class DynamicRouterLM(nn.Module):
         expected_lengths: list[Tensor] = []
         terminations: list[str] = []
         invalid_reasons: list[str | None] = []
+        forward_diagnostics = {
+            "max_query_abs": 0.0,
+            "max_route_logits_abs": 0.0,
+            "max_candidate_output_abs": 0.0,
+            "max_memory_abs": 0.0,
+            "max_route_depth": 0,
+            "nonfinite_query": False,
+            "nonfinite_route_logits": False,
+            "nonfinite_candidate_output": False,
+            "nonfinite_memory": False,
+        }
+
+        def observe_tensor(name: str, value: Tensor) -> None:
+            finite = torch.isfinite(value)
+            forward_diagnostics[f"nonfinite_{name}"] |= not bool(finite.all())
+            if bool(finite.any()):
+                forward_diagnostics[f"max_{name}_abs"] = max(
+                    forward_diagnostics[f"max_{name}_abs"],
+                    float(value.detach()[finite].abs().max()),
+                )
 
         for sample_index, sample in enumerate(x.unbind(0)):
             q = sample.unsqueeze(0)
@@ -222,10 +242,15 @@ class DynamicRouterLM(nn.Module):
             hidden_states[current] = next_hidden.squeeze(0)
             visited[current] = True
             for _ in range(self.max_depth):
+                forward_diagnostics["max_route_depth"] = max(
+                    forward_diagnostics["max_route_depth"], route_length
+                )
+                observe_tensor("query", q)
                 logits = self._route_logits(q, current, visited)
                 if logits.requires_grad:
                     logits.retain_grad()
                 records.append(RouteRecord(current, logits))
+                observe_tensor("route_logits", logits)
                 if not torch.isfinite(logits).all():
                     termination = "nonfinite_logits"
                     invalid_reason = termination
@@ -267,6 +292,8 @@ class DynamicRouterLM(nn.Module):
                     candidate_outputs[target], candidate_memories[target] = self.pool[target](
                         q, hidden_states[target].clone().unsqueeze(0)
                     )
+                    observe_tensor("candidate_output", candidate_outputs[target])
+                    observe_tensor("memory", candidate_memories[target])
                 if not self.training:
                     hidden_states[choice] = candidate_memories[choice].squeeze(0)
                     q = candidate_outputs[choice]
@@ -310,6 +337,7 @@ class DynamicRouterLM(nn.Module):
                 hidden_states[self.output_id] = next_hidden.squeeze(0)
             outputs.append(self.head(q))
             next_memories.append(torch.cat(hidden_states, dim=0))
+            observe_tensor("memory", next_memories[-1])
             route_lengths.append(route_length)
             expected_lengths.append(expected_length.squeeze(0))
             terminations.append(termination)
@@ -323,6 +351,7 @@ class DynamicRouterLM(nn.Module):
             "terminations": terminations,
             "invalid_reasons": invalid_reasons,
             "memory_state": torch.stack(next_memories),
+            "forward_diagnostics": forward_diagnostics,
         }
 
 
