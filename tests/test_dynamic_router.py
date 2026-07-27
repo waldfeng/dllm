@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import numpy as np
+from types import SimpleNamespace
 from pathlib import Path
 
 from dynamic_router import DynamicRouterLM, GrowthController, language_model_loss, train_step
@@ -262,9 +263,53 @@ def test_growth_controller_state_round_trip():
     controller = GrowthController(gradient_window=48, cooldown=3)
     controller.remaining_cooldown = 2
     controller.previous_gradient_norm_ema[1] = 1.0
+    controller.previous_velocity_ema[1] = -0.25
     controller.velocity_history[1].append(-0.5)
     restored = GrowthController(gradient_window=48, cooldown=3)
     restored.load_state_dict(controller.state_dict())
     assert restored.remaining_cooldown == 2
     assert restored.previous_gradient_norm_ema[1] == 1.0
+    assert restored.previous_velocity_ema[1] == -0.25
     assert list(restored.velocity_history[1]) == [-0.5]
+
+
+def test_cooldown_reports_velocity_without_affecting_growth_state():
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    controller = GrowthController(gradient_window=2, cooldown=2)
+    controller.remaining_cooldown = 2
+    first_logits = torch.ones(1, 6, requires_grad=True)
+    first_logits.grad = torch.ones_like(first_logits)
+    controller.observe_and_maybe_grow(
+        model, [SimpleNamespace(source_id=0, logits=first_logits)]
+    )
+    assert controller.last_diagnostics["diagnostic_only"] is True
+    assert controller.last_diagnostics["velocity_min"] is None
+    assert controller.previous_gradient_norm_ema == {}
+    second_logits = torch.full((1, 6), 0.5, requires_grad=True)
+    second_logits.grad = torch.ones_like(second_logits) * 0.5
+    controller.observe_and_maybe_grow(
+        model, [SimpleNamespace(source_id=0, logits=second_logits)]
+    )
+    assert torch.isclose(
+        torch.tensor(controller.last_diagnostics["velocity_min"]),
+        torch.tensor(-0.25 * (6**0.5)),
+    )
+    assert controller.previous_gradient_norm_ema == {}
+    assert controller.velocity_history == {}
+
+
+def test_velocity_ema_is_used_for_growth_signal():
+    controller = GrowthController(gradient_window=2)
+    assert controller.previous_velocity_ema == {}
+    controller.previous_gradient_norm_ema[0] = 1.0
+    controller.previous_velocity_ema[0] = -1.0
+    controller.velocity_history[0].extend([-1.0, -1.0])
+    logits = torch.zeros(1, 6, requires_grad=True)
+    logits.grad = torch.ones_like(logits) * 2.0
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    slot = controller.observe_and_maybe_grow(
+        model, [SimpleNamespace(source_id=0, logits=logits)]
+    )
+    assert slot == 3
+    assert controller.previous_gradient_norm_ema == {}
+    assert controller.previous_velocity_ema == {}

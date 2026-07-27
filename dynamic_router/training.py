@@ -62,6 +62,9 @@ class GrowthController:
         self.gradient_beta = 1.0 - 1.0 / gradient_window
         self.remaining_cooldown = 0
         self.previous_gradient_norm_ema: dict[int, float] = {}
+        self.previous_velocity_ema: dict[int, float] = {}
+        self.diagnostic_previous_gradient_norm_ema: dict[int, float] = {}
+        self.diagnostic_previous_velocity_ema: dict[int, float] = {}
         self.velocity_history: dict[int, deque[float]] = defaultdict(
             lambda: deque(maxlen=3)
         )
@@ -71,6 +74,13 @@ class GrowthController:
         return {
             "remaining_cooldown": self.remaining_cooldown,
             "previous_gradient_norm_ema": dict(self.previous_gradient_norm_ema),
+            "previous_velocity_ema": dict(self.previous_velocity_ema),
+            "diagnostic_previous_gradient_norm_ema": dict(
+                self.diagnostic_previous_gradient_norm_ema
+            ),
+            "diagnostic_previous_velocity_ema": dict(
+                self.diagnostic_previous_velocity_ema
+            ),
             "gradient_window": self.gradient_window,
             "velocity_history": {key: list(value) for key, value in self.velocity_history.items()},
         }
@@ -80,6 +90,22 @@ class GrowthController:
         self.previous_gradient_norm_ema = {
             int(key): float(value)
             for key, value in state.get("previous_gradient_norm_ema", {}).items()
+        }
+        self.previous_velocity_ema = {
+            int(key): float(value)
+            for key, value in state.get("previous_velocity_ema", {}).items()
+        }
+        self.diagnostic_previous_gradient_norm_ema = {
+            int(key): float(value)
+            for key, value in state.get(
+                "diagnostic_previous_gradient_norm_ema", {}
+            ).items()
+        }
+        self.diagnostic_previous_velocity_ema = {
+            int(key): float(value)
+            for key, value in state.get(
+                "diagnostic_previous_velocity_ema", {}
+            ).items()
         }
         self.velocity_history = defaultdict(lambda: deque(maxlen=3))
         for key, values in state.get("velocity_history", {}).items():
@@ -91,15 +117,47 @@ class GrowthController:
         self, model: DynamicRouterLM, records: list
     ) -> int | None:
         if self.remaining_cooldown:
+            current: dict[int, list[Tensor]] = defaultdict(list)
+            for record in records:
+                if record.logits.grad is not None:
+                    current[record.source_id].append(record.logits.grad.detach().flatten())
+            velocities: list[float] = []
+            for source, values in current.items():
+                gradient_norm = sum(value.norm().item() for value in values) / len(values)
+                previous = self.diagnostic_previous_gradient_norm_ema.get(source)
+                gradient_norm_ema = gradient_norm
+                if previous is not None:
+                    gradient_norm_ema = (
+                        self.gradient_beta * previous
+                        + (1.0 - self.gradient_beta) * gradient_norm
+                    )
+                    raw_velocity = gradient_norm_ema - previous
+                    previous_velocity = self.diagnostic_previous_velocity_ema.get(source)
+                    velocity = raw_velocity if previous_velocity is None else (
+                        self.gradient_beta * previous_velocity
+                        + (1.0 - self.gradient_beta) * raw_velocity
+                    )
+                    velocities.append(velocity)
+                    self.diagnostic_previous_velocity_ema[source] = velocity
+                self.diagnostic_previous_gradient_norm_ema[source] = gradient_norm_ema
+            sorted_velocities = sorted(velocities)
             self.last_diagnostics = {
-                "observed_sources": 0,
+                "observed_sources": len(current),
                 "velocity_min": None,
-                "velocity_median": None,
-                "velocity_max": None,
+                "velocity_median": (
+                    sorted_velocities[len(sorted_velocities) // 2]
+                    if sorted_velocities
+                    else None
+                ),
+                "velocity_max": max(velocities) if velocities else None,
                 "cooldown": self.remaining_cooldown,
                 "gradient_window": self.gradient_window,
                 "gradient_beta": self.gradient_beta,
+                "growth_triggered": False,
+                "diagnostic_only": True,
             }
+            if velocities:
+                self.last_diagnostics["velocity_min"] = min(velocities)
             self.remaining_cooldown -= 1
             return None
 
@@ -119,8 +177,14 @@ class GrowthController:
                     + (1.0 - self.gradient_beta) * gradient_norm
                 )
                 velocity = gradient_norm_ema - previous
-                self.velocity_history[source].append(velocity)
-                velocities.append(velocity)
+                previous_velocity = self.previous_velocity_ema.get(source)
+                velocity_ema = velocity if previous_velocity is None else (
+                    self.gradient_beta * previous_velocity
+                    + (1.0 - self.gradient_beta) * velocity
+                )
+                self.previous_velocity_ema[source] = velocity_ema
+                self.velocity_history[source].append(velocity_ema)
+                velocities.append(velocity_ema)
                 if (
                     len(self.velocity_history[source]) == 3
                     and self.velocity_history[source][-3] < 0
@@ -147,6 +211,7 @@ class GrowthController:
             "gradient_window": self.gradient_window,
             "gradient_beta": self.gradient_beta,
             "growth_triggered": growth_triggered,
+            "diagnostic_only": False,
         }
 
         if not growth_triggered:
@@ -156,6 +221,9 @@ class GrowthController:
             self.remaining_cooldown = self.cooldown
             self.velocity_history.clear()
             self.previous_gradient_norm_ema.clear()
+            self.previous_velocity_ema.clear()
+            self.diagnostic_previous_gradient_norm_ema.clear()
+            self.diagnostic_previous_velocity_ema.clear()
         return slot
 
 
