@@ -150,13 +150,23 @@ class GrowthController:
         self.gradient_beta = 1.0 - 1.0 / self.gradient_window
 
     def observe_and_maybe_grow(
-        self, model: DynamicRouterLM, records: list
+        self, model: DynamicRouterLM, records: list, route_lengths: Tensor | None = None
     ) -> int | None:
+        def normalized_values(record) -> Tensor | None:
+            if record.logits.grad is None:
+                return None
+            sample_index = getattr(record, "sample_index", 0)
+            path_length = 1.0
+            if route_lengths is not None and sample_index < len(route_lengths):
+                path_length = max(1.0, float(route_lengths[sample_index]))
+            return record.logits.grad.detach().flatten() / path_length
+
         if self.remaining_cooldown:
             current: dict[int, list[Tensor]] = defaultdict(list)
             for record in records:
-                if record.logits.grad is not None:
-                    current[record.source_id].append(record.logits.grad.detach().flatten())
+                values = normalized_values(record)
+                if values is not None:
+                    current[record.source_id].append(values)
             velocities: list[float] = []
             for source, values in current.items():
                 gradient_norm = sum(value.norm().item() for value in values) / len(values)
@@ -167,7 +177,10 @@ class GrowthController:
                         self.gradient_beta * previous
                         + (1.0 - self.gradient_beta) * gradient_norm
                     )
-                    raw_velocity = gradient_norm_ema - previous
+                    raw_velocity = (
+                        (gradient_norm_ema - previous)
+                        / max(abs(previous), 1e-12)
+                    )
                     previous_velocity = self.diagnostic_previous_velocity_ema.get(source)
                     velocity = raw_velocity if previous_velocity is None else (
                         self.gradient_beta * previous_velocity
@@ -199,8 +212,9 @@ class GrowthController:
 
         current: dict[int, list[Tensor]] = defaultdict(list)
         for record in records:
-            if record.logits.grad is not None:
-                current[record.source_id].append(record.logits.grad.detach().flatten())
+            values = normalized_values(record)
+            if values is not None:
+                current[record.source_id].append(values)
 
         growth_triggered = False
         velocities: list[float] = []
@@ -212,7 +226,10 @@ class GrowthController:
                     self.gradient_beta * previous
                     + (1.0 - self.gradient_beta) * gradient_norm
                 )
-                velocity = gradient_norm_ema - previous
+                velocity = (
+                    (gradient_norm_ema - previous)
+                    / max(abs(previous), 1e-12)
+                )
                 previous_velocity = self.previous_velocity_ema.get(source)
                 velocity_ema = velocity if previous_velocity is None else (
                     self.gradient_beta * previous_velocity
@@ -339,7 +356,9 @@ def train_step(
     inactive_parameters = _snapshot_inactive(model)
     router_snapshot = model.router.detach().clone()
     new_slot = (
-        controller.observe_and_maybe_grow(model, aux["route_records"])
+        controller.observe_and_maybe_grow(
+            model, aux["route_records"], aux["route_lengths"]
+        )
         if controller
         else None
     )

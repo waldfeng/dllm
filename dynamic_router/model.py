@@ -14,6 +14,7 @@ from torch.nn import functional as F
 class RouteRecord:
     source_id: int
     logits: Tensor
+    sample_index: int = 0
 
 
 class MemoryModule(nn.Module):
@@ -255,7 +256,7 @@ class DynamicRouterLM(nn.Module):
                 logits = self._route_logits(q, current, visited)
                 if logits.requires_grad:
                     logits.retain_grad()
-                records.append(RouteRecord(current, logits))
+                records.append(RouteRecord(current, logits, sample_index))
                 observe_tensor("route_logits", logits)
                 if not torch.isfinite(logits).all():
                     termination = "nonfinite_logits"
