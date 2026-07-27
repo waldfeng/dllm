@@ -10,6 +10,38 @@ from torch import Tensor
 from .model import DynamicRouterLM, language_model_loss
 
 
+def _finite_gradients(model: DynamicRouterLM) -> bool:
+    return all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
+
+
+def _invalid_result(
+    aux: dict, memory_state: Tensor | None, reason: str | None = None
+) -> dict[str, float | int | Tensor | list[str]]:
+    invalid_reasons = aux["invalid_reasons"]
+    if reason is not None:
+        invalid_reasons = [reason for _ in invalid_reasons]
+    safe_memory = (
+        torch.zeros_like(aux["memory_state"])
+        if memory_state is None
+        else torch.zeros_like(memory_state)
+    )
+    return {
+        "loss": 0.0,
+        "lm_loss": 0.0,
+        "length_loss": 0.0,
+        "expected_length": float(aux["expected_length"].detach()),
+        "mean_route_length": float(aux["route_lengths"].float().mean()),
+        "new_slot": -1,
+        "terminations": aux["terminations"],
+        "invalid_reasons": invalid_reasons,
+        "skipped_update": 1,
+        "memory_state": safe_memory.detach(),
+    }
+
+
 class GrowthController:
     """Activate capacity when route-gradient velocity stays below a threshold.
 
@@ -173,21 +205,16 @@ def train_step(
     sample_mask: Tensor | None = None,
 ) -> dict[str, float | int | Tensor | list[str]]:
     optimizer.zero_grad(set_to_none=True)
+    if memory_state is not None:
+        memory_state = memory_state.detach().clone()
+        finite_memory = torch.isfinite(memory_state).all(dim=(1, 2))
+        memory_state[~finite_memory] = 0
     logits, aux = model(x, tau=tau, memory_state=memory_state)
+    if not torch.isfinite(aux["memory_state"]).all():
+        return _invalid_result(aux, memory_state, "nonfinite_memory")
     invalid_reasons = [reason for reason in aux["invalid_reasons"] if reason is not None]
     if invalid_reasons:
-        return {
-            "loss": 0.0,
-            "lm_loss": 0.0,
-            "length_loss": 0.0,
-            "expected_length": float(aux["expected_length"].detach()),
-            "mean_route_length": float(aux["route_lengths"].float().mean()),
-            "new_slot": -1,
-            "terminations": aux["terminations"],
-            "invalid_reasons": aux["invalid_reasons"],
-            "skipped_update": 1,
-            "memory_state": memory_state.detach() if memory_state is not None else aux["memory_state"].detach(),
-        }
+        return _invalid_result(aux, memory_state)
     loss, metrics = language_model_loss(
         logits,
         targets,
@@ -196,7 +223,12 @@ def train_step(
         target_mask,
         sample_mask,
     )
+    if not torch.isfinite(loss):
+        return _invalid_result(aux, memory_state, "nonfinite_loss")
     loss.backward()
+
+    if not _finite_gradients(model):
+        return _invalid_result(aux, memory_state, "nonfinite_gradient")
 
     inactive_parameters = _snapshot_inactive(model)
     router_snapshot = model.router.detach().clone()
@@ -211,8 +243,21 @@ def train_step(
     if model.router.grad is not None:
         model.router.grad[~model.active] = 0
     if grad_clip is not None:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        if not torch.isfinite(total_norm):
+            return _invalid_result(aux, memory_state, "nonfinite_gradient")
+    parameter_snapshot = {
+        parameter: parameter.detach().clone()
+        for parameter in model.parameters()
+    }
     optimizer.step()
+
+    if not all(torch.isfinite(parameter).all() for parameter in model.parameters()):
+        with torch.no_grad():
+            for parameter, value in parameter_snapshot.items():
+                parameter.copy_(value)
+        optimizer.state.clear()
+        return _invalid_result(aux, memory_state, "nonfinite_parameter")
 
     with torch.no_grad():
         for parameter, (value, module_index) in inactive_parameters.items():

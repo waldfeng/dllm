@@ -220,6 +220,33 @@ def test_route_has_safe_termination():
     assert all(reason in {"output", "cycle", "max_depth", "dead_end"} for reason in aux["terminations"])
 
 
+def test_nonfinite_route_logits_are_reported_separately():
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    with torch.no_grad():
+        model.router.fill_(float("nan"))
+    _, aux = model(torch.randint(0, 32, (2, 8)))
+    assert aux["invalid_reasons"] == ["nonfinite_logits", "nonfinite_logits"]
+    assert aux["terminations"] == ["nonfinite_logits", "nonfinite_logits"]
+
+
+def test_nonfinite_route_skips_update_and_clears_memory():
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    with torch.no_grad():
+        model.router.fill_(float("nan"))
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    memory = torch.full((2, 6, 16), float("nan"))
+    result = train_step(
+        model,
+        optimizer,
+        torch.randint(0, 32, (2, 8)),
+        torch.randint(0, 32, (2, 8)),
+        memory_state=memory,
+    )
+    assert result["skipped_update"] == 1
+    assert all(reason == "nonfinite_logits" for reason in result["invalid_reasons"])
+    assert torch.isfinite(result["memory_state"]).all()
+
+
 def test_inactive_modules_do_not_receive_gradients_or_optimizer_updates():
     model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.1)

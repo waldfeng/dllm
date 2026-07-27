@@ -226,17 +226,26 @@ class DynamicRouterLM(nn.Module):
                 if logits.requires_grad:
                     logits.retain_grad()
                 records.append(RouteRecord(current, logits))
-                probs = (logits / tau).softmax(dim=-1)
+                if not torch.isfinite(logits).all():
+                    termination = "nonfinite_logits"
+                    invalid_reason = termination
+                    break
+                route_logits = logits.float()
+                probs = (route_logits / tau).softmax(dim=-1)
                 expected_length = expected_length + survival
                 survival = survival * (1 - probs[:, self.output_id])
 
-                legal = torch.where(logits[0] > torch.finfo(logits.dtype).min / 2)[0].tolist()
+                legal = torch.where(
+                    logits[0] > torch.finfo(logits.dtype).min / 2
+                )[0].tolist()
                 if not legal:
                     termination = "no_legal_candidate"
                     invalid_reason = termination
                     break
                 if self.training:
-                    route = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
+                    route = F.gumbel_softmax(
+                        route_logits, tau=tau, hard=True, dim=-1
+                    )
                     choice = legal[int(route[0, legal].argmax().item())]
                 else:
                     route = F.one_hot(
