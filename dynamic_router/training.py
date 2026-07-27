@@ -53,7 +53,7 @@ class GrowthController:
     def __init__(
         self,
         gradient_window: int = 48,
-        cooldown: int = 200,
+        cooldown: int = 100,
     ) -> None:
         if gradient_window <= 0 or cooldown < 0:
             raise ValueError("invalid growth controller configuration")
