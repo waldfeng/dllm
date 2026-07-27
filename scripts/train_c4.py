@@ -292,6 +292,11 @@ def main() -> None:
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         controller.load_state_dict(checkpoint.get("controller", {}))
+        if controller.remaining_cooldown:
+            if controller.cooldown_source is not None and controller.cooldown_slot is not None:
+                model.set_cooldown_connection(
+                    controller.cooldown_source, controller.cooldown_slot
+                )
         memory = checkpoint.get("memory_state")
         start_step = int(checkpoint.get("step", 0))
         global_step = start_step

@@ -64,6 +64,25 @@ def test_block_forward_and_fixed_memory_shapes():
     assert logits.shape == (3, 8, 32)
     assert aux["route_lengths"].shape == (3,)
     assert aux["memory_state"].shape == (3, 6, 16)
+    assert aux["valid_sample_mask"].tolist() == [True, True, True]
+
+
+def test_training_route_uses_unique_top_three_targets():
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    _, aux = model(torch.randint(0, 32, (1, 8)))
+    for _, targets, _, _ in aux["route_targets"]:
+        assert len(targets) <= 3
+        assert len(targets) == len(set(targets))
+
+
+def test_cooldown_source_includes_new_slot_in_top_three():
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    slot = model.activate_next()
+    model.set_cooldown_connection(0, slot)
+    _, aux = model(torch.randint(0, 32, (1, 8)))
+    source_targets = [targets for source, targets, _, _ in aux["route_targets"] if source == 0]
+    assert source_targets
+    assert slot in source_targets[0]
 
 
 def test_memory_state_is_per_sample_and_persistent():

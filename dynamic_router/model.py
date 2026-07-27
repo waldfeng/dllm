@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import defaultdict
 from typing import Any
 
 import torch
@@ -15,6 +16,7 @@ class RouteRecord:
     source_id: int
     logits: Tensor
     sample_index: int = 0
+    depth: int = 0
 
 
 class MemoryModule(nn.Module):
@@ -133,6 +135,8 @@ class DynamicRouterLM(nn.Module):
         self.register_buffer("active", torch.zeros(max_modules, dtype=torch.bool))
         self.register_buffer("exploration_bias", torch.zeros(max_modules))
         self.register_buffer("bias_age", torch.zeros(max_modules, dtype=torch.long))
+        self.cooldown_source: int | None = None
+        self.cooldown_slot: int | None = None
         with torch.no_grad():
             self.active[[self.input_id, 1, self.output_id]] = True
         nn.init.xavier_uniform_(self.head.weight)
@@ -154,6 +158,14 @@ class DynamicRouterLM(nn.Module):
             self.exploration_bias[slot] = initial_bias
             self.bias_age[slot] = 0
         return slot
+
+    def set_cooldown_connection(self, source_id: int, slot: int) -> None:
+        self.cooldown_source = source_id
+        self.cooldown_slot = slot
+
+    def clear_cooldown_connection(self) -> None:
+        self.cooldown_source = None
+        self.cooldown_slot = None
 
     def decay_exploration(self, amount: float = 0.99) -> None:
         with torch.no_grad():
@@ -177,13 +189,11 @@ class DynamicRouterLM(nn.Module):
             f"[batch, {self.block_size}, {self.d_model}]"
         )
 
-    def _route_logits(self, q: Tensor, source_id: int, visited: Tensor) -> Tensor:
+    def _route_logits(self, q: Tensor, source_id: int) -> Tensor:
         query = q.mean(dim=1)
         logits = query @ self.router.T + self.exploration_bias
         forbidden = ~self.active.clone()
         forbidden[self.input_id] = True
-        forbidden[source_id] = True
-        forbidden |= visited
         forbidden[self.output_id] = False
         return logits.masked_fill(forbidden.unsqueeze(0), torch.finfo(logits.dtype).min)
 
@@ -207,7 +217,9 @@ class DynamicRouterLM(nn.Module):
         outputs: list[Tensor] = []
         next_memories: list[Tensor] = []
         records: list[RouteRecord] = []
+        route_targets: list[tuple[int, list[int], int, int]] = []
         route_lengths: list[int] = []
+        valid_samples: list[bool] = []
         expected_lengths: list[Tensor] = []
         terminations: list[str] = []
         invalid_reasons: list[str | None] = []
@@ -235,114 +247,97 @@ class DynamicRouterLM(nn.Module):
         for sample_index, sample in enumerate(x.unbind(0)):
             q = sample.unsqueeze(0)
             hidden_states = [memory_state[sample_index, i : i + 1].clone() for i in range(self.max_modules)]
-            current = self.input_id
-            visited = torch.zeros(self.max_modules, dtype=torch.bool, device=x.device)
-            survival = q.new_ones(1)
             expected_length = q.new_zeros(1)
+            frontier = [(self.input_id, q, hidden_states[self.input_id], 0)]
+            output_inputs: list[Tensor] = []
             route_length = 0
             termination = "output"
             invalid_reason = None
-            output_processed = False
 
             # Input is the only externally-entered module.
-            q, next_hidden = self.pool[current](q, hidden_states[current].unsqueeze(0))
-            hidden_states[current] = next_hidden.squeeze(0)
-            visited[current] = True
-            for _ in range(self.max_depth):
+            q, next_hidden = self.pool[self.input_id](q, hidden_states[self.input_id].unsqueeze(0))
+            hidden_states[self.input_id] = next_hidden.squeeze(0)
+            frontier = [(self.input_id, q, hidden_states[self.input_id], 0)]
+            for depth in range(self.max_depth):
                 forward_diagnostics["max_route_depth"] = max(
-                    forward_diagnostics["max_route_depth"], route_length
+                    forward_diagnostics["max_route_depth"], depth
                 )
-                observe_tensor("query", q)
-                logits = self._route_logits(q, current, visited)
-                if logits.requires_grad:
-                    logits.retain_grad()
-                records.append(RouteRecord(current, logits, sample_index))
-                observe_tensor("route_logits", logits)
-                if not torch.isfinite(logits).all():
-                    termination = "nonfinite_logits"
-                    invalid_reason = termination
-                    break
-                route_logits = logits.float()
-                probs = (route_logits / tau).softmax(dim=-1)
-                expected_length = expected_length + survival
-                survival = survival * (1 - probs[:, self.output_id])
-
-                legal = torch.where(
-                    logits[0] > torch.finfo(logits.dtype).min / 2
-                )[0].tolist()
-                if not legal:
-                    termination = "no_legal_candidate"
-                    invalid_reason = termination
-                    break
-                if self.training:
-                    route = F.gumbel_softmax(
-                        route_logits, tau=tau, hard=True, dim=-1
+                next_frontier: dict[int, list[tuple[Tensor, Tensor]]] = defaultdict(list)
+                for source_id, source_q, source_hidden, _ in frontier:
+                    observe_tensor("query", source_q)
+                    logits = self._route_logits(source_q, source_id)
+                    if logits.requires_grad:
+                        logits.retain_grad()
+                    records.append(RouteRecord(source_id, logits, sample_index, depth))
+                    observe_tensor("route_logits", logits)
+                    if not torch.isfinite(logits).all():
+                        invalid_reason = "nonfinite_logits"
+                        termination = "nonfinite_logits"
+                        continue
+                    legal = torch.where(logits[0] > torch.finfo(logits.dtype).min / 2)[0].tolist()
+                    if not legal:
+                        invalid_reason = "no_legal_candidate"
+                        termination = "no_legal_candidate"
+                        continue
+                    forced = (
+                        self.cooldown_slot
+                        if source_id == self.cooldown_source
+                        else None
                     )
-                    choice = legal[int(route[0, legal].argmax().item())]
-                else:
-                    route = F.one_hot(
-                        logits.argmax(dim=-1), num_classes=self.max_modules
-                    ).to(logits.dtype)
-                    choice = int(logits[0, legal].argmax().item())
-                    choice = legal[choice]
-                if bool(visited[choice]) or choice not in legal:
-                    termination = "cycle"
-                    invalid_reason = termination
-                    break
-
-                # Candidate computation supplies the straight-through gradient.
-                # Only the selected candidate's memory is committed.
-                candidate_outputs: dict[int, Tensor] = {}
-                candidate_memories: dict[int, Tensor] = {}
-                candidate_targets = legal if self.training else [choice]
-                for target in candidate_targets:
-                    candidate_outputs[target], candidate_memories[target] = self.pool[target](
-                        q, hidden_states[target].clone().unsqueeze(0)
+                    ranked = sorted(
+                        legal,
+                        key=lambda target: float(logits[0, target].detach()),
+                        reverse=True,
                     )
-                    observe_tensor("candidate_output", candidate_outputs[target])
-                    observe_tensor("memory", candidate_memories[target])
-                if not self.training:
-                    hidden_states[choice] = candidate_memories[choice].squeeze(0)
-                    q = candidate_outputs[choice]
-                    current = choice
-                    route_length += 1
-                    visited[current] = True
-                    if current == self.output_id:
-                        output_processed = True
-                        break
-                    continue
-                soft_q = sum(
-                    candidate_outputs[target] * route[:, target].view(1, 1)
-                    for target in legal
-                )
-                if self.training:
-                    hard_q = sum(
-                        candidate_outputs[target]
-                        * route[:, target].detach().view(1, 1)
-                        for target in legal
-                    )
-                    q = hard_q + (soft_q - soft_q.detach())
-                hidden_states[choice] = candidate_memories[choice].squeeze(0)
-                current = choice
-                route_length += 1
-                visited[current] = True
-                if current == self.output_id:
-                    output_processed = True
+                    if forced is not None and forced in legal:
+                        ranked = [forced] + [target for target in ranked if target != forced]
+                    targets = ranked[:3]
+                    route_targets.append((source_id, targets, sample_index, depth))
+                    route_probs = (logits.float() / tau).softmax(dim=-1)
+                    selected = torch.zeros_like(route_probs)
+                    selected[:, targets] = 1
+                    # Hard top-3 routing in the forward pass, with a dense
+                    # softmax backward path for route-logit learning.
+                    gates = selected + route_probs - route_probs.detach()
+                    route_length = max(route_length, depth + 1)
+                    expected_length = expected_length + 1.0 / len(frontier)
+                    for target in targets:
+                        gated_q = source_q * gates[:, target].view(1, 1)
+                        if target == self.output_id:
+                            output_inputs.append(gated_q)
+                        else:
+                            next_frontier[target].append((gated_q, source_hidden))
+                if not next_frontier:
                     break
-            else:
+                frontier = []
+                for target, inputs in next_frontier.items():
+                    target_q = torch.stack([item[0] for item in inputs]).mean(dim=0)
+                    target_hidden = torch.stack([item[1] for item in inputs]).mean(dim=0)
+                    target_q, target_hidden_next = self.pool[target](
+                        target_q, target_hidden.unsqueeze(0)
+                    )
+                    target_hidden = target_hidden_next.squeeze(0)
+                    observe_tensor("candidate_output", target_q)
+                    observe_tensor("memory", target_hidden)
+                    hidden_states[target] = target_hidden
+                    frontier.append((target, target_q, target_hidden, depth + 1))
+            if frontier and invalid_reason is None:
                 termination = "max_depth"
-                current = self.output_id
-
-            if not output_processed and invalid_reason is None:
-                if termination == "output":
-                    termination = "no_legal_candidate"
-                    invalid_reason = termination
-            if not output_processed and invalid_reason is None:
-                q, next_hidden = self.pool[self.output_id](
-                    q, hidden_states[self.output_id].unsqueeze(0)
+                output_inputs.extend(node[1] for node in frontier)
+            if output_inputs:
+                output_input = torch.stack(output_inputs).mean(dim=0)
+                output_hidden = hidden_states[self.output_id]
+                output_q, output_hidden_next = self.pool[self.output_id](
+                    output_input, output_hidden.unsqueeze(0)
                 )
-                hidden_states[self.output_id] = next_hidden.squeeze(0)
-            outputs.append(self.head(q))
+                hidden_states[self.output_id] = output_hidden_next.squeeze(0)
+                outputs.append(self.head(output_q))
+                valid_samples.append(True)
+            else:
+                outputs.append(torch.zeros_like(self.head(q)))
+                valid_samples.append(False)
+                if invalid_reason is None:
+                    invalid_reason = "no_valid_path"
             next_memories.append(torch.cat(hidden_states, dim=0))
             observe_tensor("memory", next_memories[-1])
             route_lengths.append(route_length)
@@ -352,9 +347,11 @@ class DynamicRouterLM(nn.Module):
 
         return torch.cat(outputs, dim=0), {
             "route_records": records,
+            "route_targets": route_targets,
             "expected_length_per_sample": torch.stack(expected_lengths),
             "expected_length": torch.stack(expected_lengths).mean(),
             "route_lengths": torch.tensor(route_lengths, device=x.device),
+            "valid_sample_mask": torch.tensor(valid_samples, dtype=torch.bool, device=x.device),
             "terminations": terminations,
             "invalid_reasons": invalid_reasons,
             "memory_state": torch.stack(next_memories),

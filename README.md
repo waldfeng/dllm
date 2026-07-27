@@ -20,13 +20,16 @@ stable.
   input to each module's Q projection and GRU path.
 - Each module has an independent recurrent GRU state shaped `[B, modules, d_model]`.
 - The GRU state is passed between calls through `aux["memory_state"]` and detached by `train_step`.
-- There are no fixed edges: every active module can route to every other active
-  module or the output module at each forward pass.
-- Input, the current module, and visited modules are masked; output is always legal.
-- Gumbel-Softmax uses a hard forward choice and a differentiable soft backward path.
-- During training, every legal active candidate is evaluated so the straight-through
-  mixture can carry route gradients; only the hard-selected candidate's memory is
-  committed. This is a differentiable prototype, not sparse candidate execution.
+- There are no permanent fixed edges: every active module can route to up to three
+  distinct active modules or the output module at each forward pass. The input module
+  is the sole external entry and the output module is the sole final exit.
+- Multiple inputs to one module at the same depth are averaged before that module
+  runs. A module may be visited again at a later depth and receives its updated state.
+- Top-3 routing is hard in the forward pass and uses a softmax straight-through
+  gradient for route logits. Only paths that reach output, or reach max depth and
+  are then forced to output, are valid for training.
+- During cooldown, the newly activated module occupies one of the triggering source's
+  three temporary successors; the connection is removed when cooldown ends.
 - During evaluation, the current implementation still uses the same candidate
   route semantics but uses deterministic argmax routing and evaluates only the
   selected candidate; inference is sparse over the active module graph.

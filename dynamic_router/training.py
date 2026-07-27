@@ -97,6 +97,8 @@ class GrowthController:
         self.cooldown = cooldown
         self.gradient_beta = 1.0 - 1.0 / gradient_window
         self.remaining_cooldown = 0
+        self.cooldown_source: int | None = None
+        self.cooldown_slot: int | None = None
         self.previous_gradient_norm_ema: dict[int, float] = {}
         self.previous_velocity_ema: dict[int, float] = {}
         self.diagnostic_previous_gradient_norm_ema: dict[int, float] = {}
@@ -109,6 +111,8 @@ class GrowthController:
     def state_dict(self) -> dict:
         return {
             "remaining_cooldown": self.remaining_cooldown,
+            "cooldown_source": self.cooldown_source,
+            "cooldown_slot": self.cooldown_slot,
             "previous_gradient_norm_ema": dict(self.previous_gradient_norm_ema),
             "previous_velocity_ema": dict(self.previous_velocity_ema),
             "diagnostic_previous_gradient_norm_ema": dict(
@@ -123,6 +127,8 @@ class GrowthController:
 
     def load_state_dict(self, state: dict) -> None:
         self.remaining_cooldown = int(state.get("remaining_cooldown", 0))
+        self.cooldown_source = state.get("cooldown_source")
+        self.cooldown_slot = state.get("cooldown_slot")
         self.previous_gradient_norm_ema = {
             int(key): float(value)
             for key, value in state.get("previous_gradient_norm_ema", {}).items()
@@ -162,6 +168,8 @@ class GrowthController:
             return record.logits.grad.detach().flatten() / path_length
 
         if self.remaining_cooldown:
+            if self.cooldown_source is not None and self.cooldown_slot is not None:
+                model.set_cooldown_connection(self.cooldown_source, self.cooldown_slot)
             current: dict[int, list[Tensor]] = defaultdict(list)
             for record in records:
                 values = normalized_values(record)
@@ -205,6 +213,10 @@ class GrowthController:
             if velocities:
                 self.last_diagnostics["velocity_min"] = min(velocities)
             self.remaining_cooldown -= 1
+            if self.remaining_cooldown == 0:
+                model.clear_cooldown_connection()
+                self.cooldown_source = None
+                self.cooldown_slot = None
             return None
 
         current: dict[int, list[Tensor]] = defaultdict(list)
@@ -214,6 +226,7 @@ class GrowthController:
                 current[record.source_id].append(values)
 
         growth_triggered = False
+        triggered_source: int | None = None
         velocities: list[float] = []
         for source, values in current.items():
             gradient_norm = sum(value.norm().item() for value in values) / len(values)
@@ -239,6 +252,7 @@ class GrowthController:
                     and self.velocity_history[source][-1] >= 0
                 ):
                     growth_triggered = True
+                    triggered_source = source
                 self.previous_gradient_norm_ema[source] = gradient_norm_ema
             else:
                 self.previous_gradient_norm_ema[source] = gradient_norm
@@ -265,6 +279,9 @@ class GrowthController:
             return None
         slot = model.activate_next()
         if slot is not None:
+            model.set_cooldown_connection(triggered_source, slot)
+            self.cooldown_source = triggered_source
+            self.cooldown_slot = slot
             self.remaining_cooldown = self.cooldown
             self.velocity_history.clear()
             self.previous_gradient_norm_ema.clear()
@@ -327,16 +344,22 @@ def train_step(
     logits, aux = model(x, tau=tau, memory_state=memory_state)
     if not torch.isfinite(aux["memory_state"]).all():
         return _invalid_result(aux, memory_state, "nonfinite_memory")
-    invalid_reasons = [reason for reason in aux["invalid_reasons"] if reason is not None]
-    if invalid_reasons:
-        return _invalid_result(aux, memory_state)
+    valid_sample_mask = aux.get("valid_sample_mask")
+    if valid_sample_mask is None or not bool(valid_sample_mask.any()):
+        reason = next(
+            (item for item in aux["invalid_reasons"] if item is not None),
+            "no_valid_path",
+        )
+        return _invalid_result(aux, memory_state, reason)
     loss, metrics = language_model_loss(
         logits,
         targets,
         aux.get("expected_length_per_sample", aux["expected_length"]),
         length_weight,
         target_mask,
-        sample_mask,
+        valid_sample_mask
+        if sample_mask is None
+        else (sample_mask.to(valid_sample_mask.device) & valid_sample_mask),
     )
     if not torch.isfinite(loss):
         return _invalid_result(aux, memory_state, "nonfinite_loss")
