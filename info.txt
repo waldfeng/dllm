@@ -1,0 +1,86 @@
+项目当前设计与实现说明
+======================
+
+一、定位
+--------
+
+本项目是固定容量、block 级动态路由语言模型的 PyTorch 研究原型。模型代码属于本项目；训练语料使用 AllenAI C4，下载渠道可以是 ModelScope 或 HF mirror。
+
+数据默认使用 `Qwen/Qwen2.5-0.5B-Instruct` fast tokenizer。当前 tokenizer length 为 151665，EOS ID 为 151645，PAD ID 为 151643；PAD 只用于补齐并由 target mask 排除，不作为普通训练目标。
+
+二、模块结构
+------------
+
+输入默认是 token IDs [B, 8]，先经过 embedding 得到 x [B, 8, d_model]。也支持直接输入 hidden states [B, 8, d_model]。两种输入都会加上可学习的 block 位置 embedding，得到 `x_with_pos = x + position_embedding`；同一个 `x_with_pos` 同时进入 q_proj 和 GRU。
+
+每个预分配模块都是一个标准的 recurrent QKV attention 模块：
+
+    Q = q_proj(x)
+    H, h_next = GRU(x, h_prev)
+    K = k_proj(H)
+    V = v_proj(H)
+    A = MultiheadAttention(Q, K, V)
+    Z = LayerNorm(x + A)
+    Y = LayerNorm(Z + FFN(Z))
+
+GRU 的输入与 q_proj 的输入完全相同，都是原始 x。Attention 不使用 causal mask，因此当前 8-token block 内是双向全注意力，每个 Q token 可以读取整个 GRU 输出序列的 K/V。
+
+模块有两级标准残差：
+
+1. 注意力残差：`LayerNorm(x + attention_output)`。
+2. FFN 残差：`LayerNorm(attention_hidden + FFN(attention_hidden))`。
+
+每个模块拥有独立的 q_proj、GRU、k_proj、v_proj、attention、LayerNorm 和 FFN 参数。
+
+三、固定容量与动态路由
+----------------------
+
+默认 `max_modules=1024`，模块池在构造时一次性分配全部模块。槽位 0 是 input，槽位 2 是 output，槽位 1 及之后是中间模块。初始激活槽位为 0、1、2；增长只激活下一个预分配槽位，不追加 nn.Module，因此 optimizer、checkpoint 和 DDP 参数集合稳定。C4 trainer 默认使用 `d_model=256`、`n_heads=8`，每个 attention head 为 32 维。此配置下单模块实际参数量为 1,381,888，是 `d_model=363` 模块 2,775,135 的 49.79%；1024 个预分配模块为 1,415,053,312 参数，连同 embedding、LM head、router 和位置 embedding 后模型总计 1,493,121,649 参数，约 1.493B。
+
+没有持久化 parent->child 边。每次路由都使用当前模块输出 Y 的 token 平均作为 block-level query：
+
+    logits = mean(Y) @ router.T + exploration_bias
+
+未激活、input、current 和 visited 模块被 mask；output 始终合法。对合法候选使用 hard Gumbel-Softmax。所有合法 active 候选都会执行，以构造 straight-through soft mixture；前向使用 hard-selected 输出，反向通过 soft 分支训练共享 router。只有 hard-selected 候选的 GRU hidden state 写回正式 memory_state。
+
+四、跨 block hidden state
+------------------------
+
+每个模块有独立 GRU hidden state。模型 memory_state 的形状为：
+
+    [B, max_modules, d_model]
+
+单个模块调用时转换为 GRU 要求的：
+
+    [1, B, d_model]
+
+Input 模块每个 block 都会执行并提交自己的 state。路由候选的 state 只临时计算，只有 hard-selected 候选提交；未选候选 state 丢弃。选择 output 时提交 output state；max_depth、cycle 或 dead_end 时，当前表示经过 output 模块并提交 output state。train_step 返回 detached state，调用方可以跨连续 block 传递，实现 truncated BPTT。
+
+五、损失与增长
+--------------
+
+语言模型损失是 token-level cross entropy，长度损失为：
+
+    total = lm_loss + length_weight * expected_length
+
+`route_lengths` 统计 hard 路径的路由决策次数，包括跳转到 output。`expected_length` 是沿实际 hard sampled path 累积的 soft survival cost，不是完全展开全部可能路由树的全局期望。
+
+GrowthController 观察 route logits 梯度的连续归一化差分，作为二阶信号的低成本代理。满足 patience 和 threshold 条件时激活新槽位。source 只用于梯度统计，不代表固定物理边。
+
+未激活模块参数的梯度和 AdamW 状态受到保护；激活槽位会重新初始化，router 行置零，探索偏置设置为初始值，相关 optimizer state 清零。
+
+六、C4 与 checkpoint
+--------------------
+
+C4 数据脚本输出 uint32 token shard、`samples.offsets`、metadata.json 和 progress.json，并校验 metadata.tokens 等于实际 shard token 数。`samples.offsets` 是 uint64 mmap 文件，保存每个文本样本的起止 token offset，训练据此禁止跨文本边界。当前 datasets/c4_2b 已验证为 1,191,536,181 tokens，但它是旧格式，必须重新准备才能进行新的 Qwen/offsets 训练。
+
+训练按样本内 block 顺序执行。样本 `[x0...x99]` 被补齐为 13 个 8-token block，产生 12 个训练步骤：`[x0...x7] -> [x8...x15]`，然后 `[x8...x15] -> [x16...x23]`，依次推进。每一步输出 `[B, 8, vocab_size]`，八个 logits 分别对齐下一个 block 的八个目标位置；最后 target block 的 padding 位置不计入 loss。样本结束后对应 batch lane 的 GRU state 清零。
+
+train_c4.py 是 smoke trainer，支持 GPU、GRU hidden state、GrowthController 和 checkpoint。checkpoint 使用同目录唯一临时文件原子替换，并保存模型、optimizer、controller、hidden state、data cursor、metadata 和模型配置。resume 会校验模型配置和 batch size，并使用 data cursor 恢复 shard/batch 位置。
+
+训练是 truncation length 1 的 truncated BPTT：下一个 block 使用上一个 block 的 detached hidden state 数值，但梯度不会跨 block 反传。eval/inference 使用确定性的 argmax 路由，并且只执行 hard-selected 模块；训练模式才使用 Gumbel-Softmax 和全部合法候选。
+
+七、验证与限制
+--------------
+
+当前 17 个测试覆盖 token/hidden input、block-to-block pair、padding mask、GRU state 形状和跨 block 传递、路由梯度、eval/no-grad、loss 指标、增长、inactive optimizer 保护和安全终止。模型按 sample 和 route depth 循环，每次路由执行所有合法 active 候选，因此仍是可微研究原型，不是严格稀疏执行。项目也不是完整的大规模训练系统，尚未提供验证集、分布式训练和完整性能优化。

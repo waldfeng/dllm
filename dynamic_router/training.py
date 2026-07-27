@@ -1,0 +1,250 @@
+"""Training utilities and second-order proxy growth control."""
+
+from __future__ import annotations
+
+from collections import defaultdict, deque
+
+import torch
+from torch import Tensor
+
+from .model import DynamicRouterLM, language_model_loss
+
+
+class GrowthController:
+    """Activate capacity when route-gradient velocity stays below a threshold.
+
+    The finite difference of consecutive route-logit gradients is used as a
+    practical proxy for a second-order signal. It avoids building a full Hessian
+    through a sampled dynamic execution path.
+    """
+
+    def __init__(
+        self,
+        gradient_window: int = 48,
+        cooldown: int = 200,
+    ) -> None:
+        if gradient_window <= 0 or cooldown < 0:
+            raise ValueError("invalid growth controller configuration")
+        self.gradient_window = gradient_window
+        self.cooldown = cooldown
+        self.gradient_beta = 1.0 - 1.0 / gradient_window
+        self.remaining_cooldown = 0
+        self.previous_gradient_norm_ema: dict[int, float] = {}
+        self.velocity_history: dict[int, deque[float]] = defaultdict(
+            lambda: deque(maxlen=3)
+        )
+        self.last_diagnostics: dict[str, float | int | None] = {}
+
+    def state_dict(self) -> dict:
+        return {
+            "remaining_cooldown": self.remaining_cooldown,
+            "previous_gradient_norm_ema": dict(self.previous_gradient_norm_ema),
+            "gradient_window": self.gradient_window,
+            "velocity_history": {key: list(value) for key, value in self.velocity_history.items()},
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.remaining_cooldown = int(state.get("remaining_cooldown", 0))
+        self.previous_gradient_norm_ema = {
+            int(key): float(value)
+            for key, value in state.get("previous_gradient_norm_ema", {}).items()
+        }
+        self.velocity_history = defaultdict(lambda: deque(maxlen=3))
+        for key, values in state.get("velocity_history", {}).items():
+            self.velocity_history[int(key)].extend(float(value) for value in values)
+        self.gradient_window = max(1, int(state.get("gradient_window", self.gradient_window)))
+        self.gradient_beta = 1.0 - 1.0 / self.gradient_window
+
+    def observe_and_maybe_grow(
+        self, model: DynamicRouterLM, records: list
+    ) -> int | None:
+        if self.remaining_cooldown:
+            self.last_diagnostics = {
+                "observed_sources": 0,
+                "velocity_min": None,
+                "velocity_median": None,
+                "velocity_max": None,
+                "cooldown": self.remaining_cooldown,
+                "gradient_window": self.gradient_window,
+                "gradient_beta": self.gradient_beta,
+            }
+            self.remaining_cooldown -= 1
+            return None
+
+        current: dict[int, list[Tensor]] = defaultdict(list)
+        for record in records:
+            if record.logits.grad is not None:
+                current[record.source_id].append(record.logits.grad.detach().flatten())
+
+        growth_triggered = False
+        velocities: list[float] = []
+        for source, values in current.items():
+            gradient_norm = sum(value.norm().item() for value in values) / len(values)
+            previous = self.previous_gradient_norm_ema.get(source)
+            if previous is not None:
+                gradient_norm_ema = (
+                    self.gradient_beta * previous
+                    + (1.0 - self.gradient_beta) * gradient_norm
+                )
+                velocity = gradient_norm_ema - previous
+                self.velocity_history[source].append(velocity)
+                velocities.append(velocity)
+                if (
+                    len(self.velocity_history[source]) == 3
+                    and self.velocity_history[source][-3] < 0
+                    and self.velocity_history[source][-2] < 0
+                    and self.velocity_history[source][-1] >= 0
+                ):
+                    growth_triggered = True
+                self.previous_gradient_norm_ema[source] = gradient_norm_ema
+            else:
+                self.previous_gradient_norm_ema[source] = gradient_norm
+
+        sorted_velocities = sorted(velocities)
+        median_velocity = (
+            sorted_velocities[len(sorted_velocities) // 2]
+            if sorted_velocities
+            else None
+        )
+        self.last_diagnostics = {
+            "observed_sources": len(current),
+            "velocity_min": min(velocities) if velocities else None,
+            "velocity_median": median_velocity,
+            "velocity_max": max(velocities) if velocities else None,
+            "cooldown": 0,
+            "gradient_window": self.gradient_window,
+            "gradient_beta": self.gradient_beta,
+            "growth_triggered": growth_triggered,
+        }
+
+        if not growth_triggered:
+            return None
+        slot = model.activate_next()
+        if slot is not None:
+            self.remaining_cooldown = self.cooldown
+            self.velocity_history.clear()
+            self.previous_gradient_norm_ema.clear()
+        return slot
+
+
+def _snapshot_inactive(model: DynamicRouterLM) -> dict[Tensor, tuple[Tensor, int]]:
+    return {
+        parameter: (parameter.detach().clone(), index)
+        for index, module in enumerate(model.pool)
+        if not bool(model.active[index])
+        for parameter in module.parameters()
+    }
+
+
+def _clear_optimizer_state(optimizer: torch.optim.Optimizer, parameter: Tensor) -> None:
+    optimizer.state.pop(parameter, None)
+
+
+def _protect_inactive_optimizer_state(
+    optimizer: torch.optim.Optimizer, model: DynamicRouterLM
+) -> None:
+    inactive = ~model.active
+    inactive_parameters = {
+        parameter
+        for index, module in enumerate(model.pool)
+        if not bool(model.active[index])
+        for parameter in module.parameters()
+    }
+    for parameter, state in list(optimizer.state.items()):
+        if parameter is model.router:
+            for value in state.values():
+                if torch.is_tensor(value) and value.ndim and value.shape[0] == model.max_modules:
+                    value[inactive] = 0
+        elif parameter in inactive_parameters:
+            _clear_optimizer_state(optimizer, parameter)
+
+
+def train_step(
+    model: DynamicRouterLM,
+    optimizer: torch.optim.Optimizer,
+    x: Tensor,
+    targets: Tensor,
+    controller: GrowthController | None = None,
+    tau: float = 1.0,
+    length_weight: float = 1e-3,
+    memory_state: Tensor | None = None,
+    grad_clip: float | None = 1.0,
+    target_mask: Tensor | None = None,
+    sample_mask: Tensor | None = None,
+) -> dict[str, float | int | Tensor | list[str]]:
+    optimizer.zero_grad(set_to_none=True)
+    logits, aux = model(x, tau=tau, memory_state=memory_state)
+    invalid_reasons = [reason for reason in aux["invalid_reasons"] if reason is not None]
+    if invalid_reasons:
+        return {
+            "loss": 0.0,
+            "lm_loss": 0.0,
+            "length_loss": 0.0,
+            "expected_length": float(aux["expected_length"].detach()),
+            "mean_route_length": float(aux["route_lengths"].float().mean()),
+            "new_slot": -1,
+            "terminations": aux["terminations"],
+            "invalid_reasons": aux["invalid_reasons"],
+            "skipped_update": 1,
+            "memory_state": memory_state.detach() if memory_state is not None else aux["memory_state"].detach(),
+        }
+    loss, metrics = language_model_loss(
+        logits,
+        targets,
+        aux.get("expected_length_per_sample", aux["expected_length"]),
+        length_weight,
+        target_mask,
+        sample_mask,
+    )
+    loss.backward()
+
+    inactive_parameters = _snapshot_inactive(model)
+    router_snapshot = model.router.detach().clone()
+    new_slot = (
+        controller.observe_and_maybe_grow(model, aux["route_records"])
+        if controller
+        else None
+    )
+
+    for parameter in inactive_parameters:
+        parameter.grad = None
+    if model.router.grad is not None:
+        model.router.grad[~model.active] = 0
+    if grad_clip is not None:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    optimizer.step()
+
+    with torch.no_grad():
+        for parameter, (value, module_index) in inactive_parameters.items():
+            if not bool(model.active[module_index]):
+                parameter.copy_(value)
+        # Preserve inactive route rows against AdamW decay. A newly activated
+        # row is intentionally not restored and starts from its zero seed.
+        inactive_rows = ~model.active
+        model.router[inactive_rows].copy_(router_snapshot[inactive_rows])
+    _protect_inactive_optimizer_state(optimizer, model)
+    if new_slot is not None:
+        # The newly activated row must not inherit a preallocated slot's state.
+        state = optimizer.state.get(model.router)
+        if state is not None:
+            for value in state.values():
+                if torch.is_tensor(value) and value.ndim and value.shape[0] == model.max_modules:
+                    value[new_slot] = 0
+
+    model.decay_exploration()
+    result: dict[str, float | int | Tensor | list[str]] = {
+        key: float(value) for key, value in metrics.items()
+    }
+    result.update(
+        {
+            "expected_length": float(aux["expected_length"].detach()),
+            "mean_route_length": float(aux["route_lengths"].float().mean()),
+            "new_slot": new_slot if new_slot is not None else -1,
+            "terminations": aux["terminations"],
+            "invalid_reasons": aux["invalid_reasons"],
+            "skipped_update": 0,
+            "growth_diagnostics": controller.last_diagnostics if controller else {},
+            "memory_state": aux["memory_state"].detach(),
+        }
+    )
+    return result

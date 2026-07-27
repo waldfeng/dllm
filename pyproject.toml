@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dynamic-router-prototype"
+version = "0.1.0"
+dependencies = ["torch", "numpy", "transformers", "modelscope"]
+
+[tool.setuptools.packages.find]
+include = ["dynamic_router*"]
+
+[project.scripts]
+prepare-c4 = "scripts.prepare_c4_modelscope:main"
+train-c4 = "scripts.train_c4:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
