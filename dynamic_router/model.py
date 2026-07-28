@@ -200,6 +200,15 @@ class DynamicRouterLM(nn.Module):
         forbidden[self.output_id] = False
         return logits.masked_fill(forbidden.unsqueeze(0), torch.finfo(logits.dtype).min)
 
+    def _route_logits_batch(self, q: Tensor, visited: Tensor) -> Tensor:
+        """Compute route logits for all live branches at one depth."""
+        logits = q.mean(dim=1) @ self.router.T + self.exploration_bias
+        forbidden = (~self.active).unsqueeze(0).expand(q.shape[0], -1).clone()
+        forbidden[:, self.input_id] = True
+        forbidden |= visited
+        forbidden[:, self.output_id] = False
+        return logits.masked_fill(forbidden, torch.finfo(logits.dtype).min)
+
     def _execute_target_groups_batch(
         self,
         target: int,
@@ -296,110 +305,105 @@ class DynamicRouterLM(nn.Module):
             q = sample.unsqueeze(0)
             hidden_states = [memory_state[sample_index, i : i + 1].clone() for i in range(self.max_modules)]
             expected_length = q.new_zeros(1)
-            frontier = [(self.input_id, q, hidden_states[self.input_id], (self.input_id,), 0)]
             output_inputs: list[Tensor] = []
             route_length = 0
             termination = "output"
             invalid_reason = None
+            completed_lengths: list[int] = []
 
             # Input is the only externally-entered module.
             q, next_hidden = self.pool[self.input_id](q, hidden_states[self.input_id].unsqueeze(0))
             hidden_states[self.input_id] = next_hidden.squeeze(0)
-            frontier = [(self.input_id, q, hidden_states[self.input_id], (self.input_id,), 0)]
+            frontier_q = q
+            frontier_hidden = hidden_states[self.input_id]
+            frontier_modules = torch.tensor([self.input_id], device=x.device, dtype=torch.long)
+            frontier_visited = torch.zeros(
+                (1, self.max_modules), device=x.device, dtype=torch.bool
+            )
+            frontier_visited[0, self.input_id] = True
+            frontier_lengths = torch.zeros(1, device=x.device, dtype=torch.long)
+            frontier_paths: list[tuple[int, ...]] = [(self.input_id,)]
             for depth in range(self.max_depth):
                 forward_diagnostics["max_route_depth"] = max(
                     forward_diagnostics["max_route_depth"], depth
                 )
-                next_frontier: dict[
-                    tuple[int, tuple[int, ...]], list[tuple[Tensor, Tensor]]
-                ] = defaultdict(list)
-                for source_id, source_q, source_hidden, visited_ids, path_length in frontier:
-                    visited = torch.zeros(self.max_modules, dtype=torch.bool, device=x.device)
-                    visited[list(visited_ids)] = True
-                    observe_tensor("query", source_q)
-                    if path_length >= self.max_depth:
-                        output_inputs.append(source_q)
-                        route_length = max(route_length, path_length + 1)
-                        termination = "max_depth"
-                        branch_paths.append(
-                            (sample_index, (*visited_ids, self.output_id))
-                        )
-                        continue
-                    logits = self._route_logits(source_q, source_id, visited)
+                if frontier_q.shape[0] == 0:
+                    break
+                observe_tensor("query", frontier_q)
+                logits_batch = self._route_logits_batch(frontier_q, frontier_visited)
+                if not torch.isfinite(logits_batch).all():
+                    invalid_reason = "nonfinite_logits"
+                    termination = invalid_reason
+                    break
+                next_groups: dict[int, list[tuple[int, Tensor, Tensor, tuple[int, ...], int]]] = defaultdict(list)
+                next_q_parts: list[Tensor] = []
+                next_h_parts: list[Tensor] = []
+                next_modules: list[int] = []
+                next_visited_parts: list[Tensor] = []
+                next_lengths: list[int] = []
+                for branch_index in range(frontier_q.shape[0]):
+                    logits = logits_batch[branch_index : branch_index + 1]
                     if logits.requires_grad:
                         logits.retain_grad()
+                    source_id = int(frontier_modules[branch_index])
+                    path_length = int(frontier_lengths[branch_index])
                     records.append(RouteRecord(source_id, logits, sample_index, depth, path_length))
                     observe_tensor("route_logits", logits)
-                    if not torch.isfinite(logits).all():
-                        invalid_reason = "nonfinite_logits"
-                        termination = "nonfinite_logits"
-                        continue
                     legal = torch.where(logits[0] > torch.finfo(logits.dtype).min / 2)[0].tolist()
                     if not legal:
                         invalid_reason = "no_legal_candidate"
-                        termination = "no_legal_candidate"
+                        termination = invalid_reason
                         continue
-                    forced = (
-                        self.cooldown_slot
-                        if source_id == self.cooldown_source
-                        else None
-                    )
-                    ranked = sorted(
-                        legal,
-                        key=lambda target: float(logits[0, target].detach()),
-                        reverse=True,
-                    )
+                    ranked = torch.topk(logits[0], k=min(3, len(legal))).indices.tolist()
+                    ranked = [target for target in ranked if target in legal]
+                    forced = self.cooldown_slot if source_id == self.cooldown_source else None
                     if forced is not None and forced in legal:
                         ranked = [forced] + [target for target in ranked if target != forced]
                     targets = ranked[:3]
                     route_targets.append((source_id, targets, sample_index, depth))
-                    selected = torch.zeros_like(logits)
-                    selected[:, targets] = 1
-                    # Keep the forward route hard while restricting the
-                    # straight-through gradient to the selected Top-3.
-                    topk_probs = (logits[:, targets].float() / tau).softmax(dim=-1)
-                    route_probs = torch.zeros_like(logits.float())
-                    route_probs[:, targets] = topk_probs
-                    gates = selected + route_probs - route_probs.detach()
-                    expected_length = expected_length + 1.0 / len(frontier)
-                    for target in targets:
-                        gated_q = source_q * gates[:, target].view(1, 1)
+                    target_tensor = torch.tensor(targets, device=x.device, dtype=torch.long)
+                    topk_probs = (logits[:, target_tensor].float() / tau).softmax(dim=-1)
+                    for target_index, target in enumerate(targets):
+                        gate = 1.0 + topk_probs[:, target_index] - topk_probs[:, target_index].detach()
+                        gated_q = frontier_q[branch_index : branch_index + 1] * gate.view(1, 1, 1)
                         if target == self.output_id:
                             output_inputs.append(gated_q)
-                            route_length = max(route_length, path_length + 1)
-                            branch_paths.append(
-                                (sample_index, (*visited_ids, self.output_id))
-                            )
+                            completed_length = path_length + 1
+                            completed_lengths.append(completed_length)
+                            route_length = max(route_length, completed_length)
+                            branch_paths.append((sample_index, (*frontier_paths[branch_index], target)))
                         else:
-                            next_visited = tuple(sorted((*visited_ids, target)))
-                            next_frontier[(target, next_visited)].append(
-                                (gated_q, source_hidden)
+                            next_visited = frontier_visited[branch_index].clone()
+                            next_visited[target] = True
+                            next_groups[target].append(
+                                (branch_index, gated_q, frontier_hidden[branch_index : branch_index + 1],
+                                 (*frontier_paths[branch_index], target), path_length + 1)
                             )
-                if not next_frontier:
+                if not next_groups:
                     break
-                frontier = []
-                grouped_targets: dict[int, list[tuple[tuple[int, ...], list[tuple[Tensor, Tensor]]]]] = defaultdict(list)
-                for (target, visited_ids), inputs in next_frontier.items():
-                    grouped_targets[target].append((visited_ids, inputs))
-                for target, target_groups in grouped_targets.items():
-                    execute_groups = (
-                        self._execute_target_groups_batch
-                        if self.use_batched_group_execution
-                        else self._execute_target_groups_loop
-                    )
-                    batch_results = execute_groups(
-                        target, [inputs for _, inputs in target_groups]
-                    )
-                    for (visited_ids, _), (target_q, target_hidden_next) in zip(
-                        target_groups, batch_results
-                    ):
-                        target_hidden = target_hidden_next.squeeze(0)
-                        observe_tensor("candidate_output", target_q)
-                        observe_tensor("memory", target_hidden)
-                        hidden_states[target] = target_hidden
-                        frontier.append(
-                            (target, target_q, target_hidden, visited_ids, len(visited_ids) - 1)
-                        )
+                for target, group in next_groups.items():
+                    q_mean = torch.cat([item[1] for item in group], dim=0).mean(dim=0, keepdim=True)
+                    h_mean = torch.cat([item[2] for item in group], dim=0).mean(
+                        dim=0, keepdim=True
+                    ).unsqueeze(0)
+                    target_q, target_h = self.pool[target](q_mean, h_mean)
+                    observe_tensor("candidate_output", target_q)
+                    observe_tensor("memory", target_h)
+                    for _, _, _, path, length in group:
+                        next_q_parts.append(target_q)
+                        next_h_parts.append(target_h.squeeze(0))
+                        next_modules.append(target)
+                        next_visited = torch.zeros(self.max_modules, device=x.device, dtype=torch.bool)
+                        next_visited[list(path)] = True
+                        next_visited_parts.append(next_visited)
+                        next_lengths.append(length)
+                        frontier_paths_next = path
+                frontier_q = torch.cat(next_q_parts, dim=0)
+                frontier_hidden = torch.cat(next_h_parts, dim=0)
+                frontier_modules = torch.tensor(next_modules, device=x.device, dtype=torch.long)
+                frontier_visited = torch.stack(next_visited_parts)
+                frontier_lengths = torch.tensor(next_lengths, device=x.device, dtype=torch.long)
+                frontier_paths = [item[3] for group in next_groups.values() for item in group]
             if output_inputs:
                 output_input = torch.stack(output_inputs).mean(dim=0)
                 output_hidden = hidden_states[self.output_id]
