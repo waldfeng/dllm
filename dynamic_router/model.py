@@ -308,11 +308,13 @@ class DynamicRouterLM(nn.Module):
                         ranked = [forced] + [target for target in ranked if target != forced]
                     targets = ranked[:3]
                     route_targets.append((source_id, targets, sample_index, depth))
-                    route_probs = (logits.float() / tau).softmax(dim=-1)
-                    selected = torch.zeros_like(route_probs)
+                    selected = torch.zeros_like(logits)
                     selected[:, targets] = 1
-                    # Hard top-3 routing in the forward pass, with a dense
-                    # softmax backward path for route-logit learning.
+                    # Keep the forward route hard while restricting the
+                    # straight-through gradient to the selected Top-3.
+                    topk_probs = (logits[:, targets].float() / tau).softmax(dim=-1)
+                    route_probs = torch.zeros_like(logits.float())
+                    route_probs[:, targets] = topk_probs
                     gates = selected + route_probs - route_probs.detach()
                     expected_length = expected_length + 1.0 / len(frontier)
                     for target in targets:

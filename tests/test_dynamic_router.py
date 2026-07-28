@@ -168,6 +168,30 @@ def test_language_loss_reaches_route_logits():
     assert model.router.grad is not None
 
 
+def test_route_gradients_are_masked_outside_top_three():
+    torch.manual_seed(2)
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    x = torch.randint(0, 32, (1, 8))
+    logits, aux = model(x)
+    torch.nn.functional.cross_entropy(logits.flatten(0, 1), x.flatten()).backward()
+    routed = [
+        (record, targets)
+        for record, target_info in zip(aux["route_records"], aux["route_targets"])
+        for source, targets, sample_index, depth in [target_info]
+        if record.source_id == source
+        and record.sample_index == sample_index
+        and record.depth == depth
+    ]
+    assert routed
+    for record, targets in routed:
+        assert record.logits.grad is not None
+        outside = [index for index in range(model.max_modules) if index not in targets]
+        assert torch.equal(
+            record.logits.grad[:, outside],
+            torch.zeros_like(record.logits.grad[:, outside]),
+        )
+
+
 def test_train_step_returns_detached_memory():
     model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
