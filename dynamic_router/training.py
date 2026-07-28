@@ -162,10 +162,16 @@ class GrowthController:
             if record.logits.grad is None:
                 return None
             sample_index = getattr(record, "sample_index", 0)
-            path_length = 1.0
-            if route_lengths is not None and sample_index < len(route_lengths):
+            path_length = getattr(record, "path_length", None)
+            if (
+                path_length is None
+                and route_lengths is not None
+                and sample_index < len(route_lengths)
+            ):
                 path_length = max(1.0, float(route_lengths[sample_index]))
-            return record.logits.grad.detach().flatten() / path_length
+            if path_length is None:
+                path_length = 1.0
+            return record.logits.grad.detach().flatten() / max(1.0, float(path_length))
 
         if self.remaining_cooldown:
             if self.cooldown_source is not None and self.cooldown_slot is not None:

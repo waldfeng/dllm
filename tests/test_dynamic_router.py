@@ -75,6 +75,20 @@ def test_training_route_uses_unique_top_three_targets():
         assert len(targets) == len(set(targets))
 
 
+def test_each_branch_path_has_unique_modules_and_bounded_length():
+    model = DynamicRouterLM(
+        d_model=16, vocab_size=32, max_modules=6, n_heads=4, max_depth=32
+    )
+    _, aux = model(torch.randint(0, 32, (1, 8)))
+    assert aux["route_lengths"].item() <= model.active_count
+    assert aux["branch_paths"]
+    for sample_index, path in aux["branch_paths"]:
+        assert sample_index == 0
+        assert len(path) == len(set(path))
+        assert path[0] == model.input_id
+        assert path[-1] == model.output_id
+
+
 def test_cooldown_source_includes_new_slot_in_top_three():
     model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
     slot = model.activate_next()

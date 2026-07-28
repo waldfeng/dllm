@@ -17,6 +17,7 @@ class RouteRecord:
     logits: Tensor
     sample_index: int = 0
     depth: int = 0
+    path_length: int = 0
 
 
 class MemoryModule(nn.Module):
@@ -189,11 +190,12 @@ class DynamicRouterLM(nn.Module):
             f"[batch, {self.block_size}, {self.d_model}]"
         )
 
-    def _route_logits(self, q: Tensor, source_id: int) -> Tensor:
+    def _route_logits(self, q: Tensor, source_id: int, visited: Tensor) -> Tensor:
         query = q.mean(dim=1)
         logits = query @ self.router.T + self.exploration_bias
         forbidden = ~self.active.clone()
         forbidden[self.input_id] = True
+        forbidden |= visited
         forbidden[self.output_id] = False
         return logits.masked_fill(forbidden.unsqueeze(0), torch.finfo(logits.dtype).min)
 
@@ -218,6 +220,7 @@ class DynamicRouterLM(nn.Module):
         next_memories: list[Tensor] = []
         records: list[RouteRecord] = []
         route_targets: list[tuple[int, list[int], int, int]] = []
+        branch_paths: list[tuple[int, tuple[int, ...]]] = []
         route_lengths: list[int] = []
         valid_samples: list[bool] = []
         expected_lengths: list[Tensor] = []
@@ -248,7 +251,7 @@ class DynamicRouterLM(nn.Module):
             q = sample.unsqueeze(0)
             hidden_states = [memory_state[sample_index, i : i + 1].clone() for i in range(self.max_modules)]
             expected_length = q.new_zeros(1)
-            frontier = [(self.input_id, q, hidden_states[self.input_id], 0)]
+            frontier = [(self.input_id, q, hidden_states[self.input_id], (self.input_id,), 0)]
             output_inputs: list[Tensor] = []
             route_length = 0
             termination = "output"
@@ -257,18 +260,30 @@ class DynamicRouterLM(nn.Module):
             # Input is the only externally-entered module.
             q, next_hidden = self.pool[self.input_id](q, hidden_states[self.input_id].unsqueeze(0))
             hidden_states[self.input_id] = next_hidden.squeeze(0)
-            frontier = [(self.input_id, q, hidden_states[self.input_id], 0)]
+            frontier = [(self.input_id, q, hidden_states[self.input_id], (self.input_id,), 0)]
             for depth in range(self.max_depth):
                 forward_diagnostics["max_route_depth"] = max(
                     forward_diagnostics["max_route_depth"], depth
                 )
-                next_frontier: dict[int, list[tuple[Tensor, Tensor]]] = defaultdict(list)
-                for source_id, source_q, source_hidden, _ in frontier:
+                next_frontier: dict[
+                    tuple[int, tuple[int, ...]], list[tuple[Tensor, Tensor]]
+                ] = defaultdict(list)
+                for source_id, source_q, source_hidden, visited_ids, path_length in frontier:
+                    visited = torch.zeros(self.max_modules, dtype=torch.bool, device=x.device)
+                    visited[list(visited_ids)] = True
                     observe_tensor("query", source_q)
-                    logits = self._route_logits(source_q, source_id)
+                    if path_length >= self.max_depth:
+                        output_inputs.append(source_q)
+                        route_length = max(route_length, path_length + 1)
+                        termination = "max_depth"
+                        branch_paths.append(
+                            (sample_index, (*visited_ids, self.output_id))
+                        )
+                        continue
+                    logits = self._route_logits(source_q, source_id, visited)
                     if logits.requires_grad:
                         logits.retain_grad()
-                    records.append(RouteRecord(source_id, logits, sample_index, depth))
+                    records.append(RouteRecord(source_id, logits, sample_index, depth, path_length))
                     observe_tensor("route_logits", logits)
                     if not torch.isfinite(logits).all():
                         invalid_reason = "nonfinite_logits"
@@ -299,20 +314,28 @@ class DynamicRouterLM(nn.Module):
                     # Hard top-3 routing in the forward pass, with a dense
                     # softmax backward path for route-logit learning.
                     gates = selected + route_probs - route_probs.detach()
-                    route_length = max(route_length, depth + 1)
                     expected_length = expected_length + 1.0 / len(frontier)
                     for target in targets:
                         gated_q = source_q * gates[:, target].view(1, 1)
                         if target == self.output_id:
                             output_inputs.append(gated_q)
+                            route_length = max(route_length, path_length + 1)
+                            branch_paths.append(
+                                (sample_index, (*visited_ids, self.output_id))
+                            )
                         else:
-                            next_frontier[target].append((gated_q, source_hidden))
+                            next_visited = tuple(sorted((*visited_ids, target)))
+                            next_frontier[(target, next_visited)].append(
+                                (gated_q, source_hidden)
+                            )
                 if not next_frontier:
                     break
                 frontier = []
-                for target, inputs in next_frontier.items():
+                for (target, visited_ids), inputs in next_frontier.items():
                     target_q = torch.stack([item[0] for item in inputs]).mean(dim=0)
-                    target_hidden = torch.stack([item[1] for item in inputs]).mean(dim=0)
+                    target_hidden = torch.stack(
+                        [item[1] for item in inputs]
+                    ).mean(dim=0)
                     target_q, target_hidden_next = self.pool[target](
                         target_q, target_hidden.unsqueeze(0)
                     )
@@ -320,10 +343,9 @@ class DynamicRouterLM(nn.Module):
                     observe_tensor("candidate_output", target_q)
                     observe_tensor("memory", target_hidden)
                     hidden_states[target] = target_hidden
-                    frontier.append((target, target_q, target_hidden, depth + 1))
-            if frontier and invalid_reason is None:
-                termination = "max_depth"
-                output_inputs.extend(node[1] for node in frontier)
+                    frontier.append(
+                        (target, target_q, target_hidden, visited_ids, len(visited_ids) - 1)
+                    )
             if output_inputs:
                 output_input = torch.stack(output_inputs).mean(dim=0)
                 output_hidden = hidden_states[self.output_id]
@@ -348,6 +370,7 @@ class DynamicRouterLM(nn.Module):
         return torch.cat(outputs, dim=0), {
             "route_records": records,
             "route_targets": route_targets,
+            "branch_paths": branch_paths,
             "expected_length_per_sample": torch.stack(expected_lengths),
             "expected_length": torch.stack(expected_lengths).mean(),
             "route_lengths": torch.tensor(route_lengths, device=x.device),
