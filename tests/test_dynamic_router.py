@@ -192,6 +192,66 @@ def test_route_gradients_are_masked_outside_top_three():
         )
 
 
+def test_target_visited_group_batch_matches_loop_forward_and_backward():
+    torch.manual_seed(3)
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    target = 1
+    q_values = [torch.randn(1, 8, 16, requires_grad=True) for _ in range(2)]
+    h_values = [torch.randn(1, 1, 16, requires_grad=True) for _ in range(2)]
+    inputs = list(zip(q_values, h_values))
+
+    loop_q = torch.stack([q for q, _ in inputs]).mean(dim=0)
+    loop_hidden = torch.stack([hidden for _, hidden in inputs]).mean(dim=0)
+    loop_output, loop_next_hidden = model.pool[target](loop_q, loop_hidden)
+    loop_loss = loop_output.square().mean() + loop_next_hidden.square().mean()
+    loop_loss.backward()
+    loop_grads = [parameter.grad.detach().clone() for parameter in model.pool[target].parameters()]
+
+    model.zero_grad(set_to_none=True)
+    batch_inputs = [
+        (q.detach().clone().requires_grad_(), hidden.detach().clone().requires_grad_())
+        for q, hidden in inputs
+    ]
+    batch_results = model._execute_target_groups_batch(target, [batch_inputs])
+    batch_output, batch_hidden = batch_results[0]
+    batch_loss = batch_output.square().mean() + batch_hidden.square().mean()
+    batch_loss.backward()
+    batch_grads = [parameter.grad.detach().clone() for parameter in model.pool[target].parameters()]
+
+    assert torch.allclose(batch_output.detach(), loop_output.detach())
+    assert torch.allclose(batch_hidden.detach(), loop_next_hidden.detach())
+    assert len(loop_grads) == len(batch_grads)
+    assert all(torch.allclose(left, right) for left, right in zip(loop_grads, batch_grads))
+
+
+def test_full_forward_batch_execution_matches_loop_baseline():
+    torch.manual_seed(4)
+    batch_model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    loop_model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    loop_model.load_state_dict(batch_model.state_dict())
+    loop_model.use_batched_group_execution = False
+    x = torch.randint(0, 32, (2, 8))
+    batch_logits, batch_aux = batch_model(x)
+    loop_logits, loop_aux = loop_model(x)
+    assert torch.allclose(batch_logits, loop_logits)
+    assert batch_aux["route_targets"] == loop_aux["route_targets"]
+    assert batch_aux["branch_paths"] == loop_aux["branch_paths"]
+
+    batch_loss = batch_logits.square().mean()
+    loop_loss = loop_logits.square().mean()
+    batch_loss.backward()
+    loop_loss.backward()
+    batch_route_grads = [record.logits.grad for record in batch_aux["route_records"]]
+    loop_route_grads = [record.logits.grad for record in loop_aux["route_records"]]
+    assert len(batch_route_grads) == len(loop_route_grads)
+    assert all(
+        left is not None
+        and right is not None
+        and torch.allclose(left, right)
+        for left, right in zip(batch_route_grads, loop_route_grads)
+    )
+
+
 def test_train_step_returns_detached_memory():
     model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)

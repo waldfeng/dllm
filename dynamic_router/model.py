@@ -124,6 +124,7 @@ class DynamicRouterLM(nn.Module):
         self.block_size = block_size
         self.max_modules = max_modules
         self.max_depth = max_depth
+        self.use_batched_group_execution = True
         self.input_id, self.output_id = 0, 2
         self.pool = nn.ModuleList(
             MemoryModule(d_model, n_heads) for _ in range(max_modules)
@@ -198,6 +199,50 @@ class DynamicRouterLM(nn.Module):
         forbidden |= visited
         forbidden[self.output_id] = False
         return logits.masked_fill(forbidden.unsqueeze(0), torch.finfo(logits.dtype).min)
+
+    def _execute_target_groups_batch(
+        self,
+        target: int,
+        groups: list[list[tuple[Tensor, Tensor]]],
+    ) -> list[tuple[Tensor, Tensor]]:
+        """Batch independent visited-history groups for one target module."""
+        q_batch = torch.cat(
+            [torch.stack([item[0] for item in group]).mean(dim=0) for group in groups],
+            dim=0,
+        )
+        hidden_batch = torch.cat(
+            [
+                torch.stack(
+                    [
+                        item[1].unsqueeze(0) if item[1].ndim == 2 else item[1]
+                        for item in group
+                    ]
+                ).mean(dim=0)
+                for group in groups
+            ],
+            dim=1,
+        )
+        output_batch, next_hidden_batch = self.pool[target](q_batch, hidden_batch)
+        return [
+            (output_batch[index : index + 1], next_hidden_batch[:, index : index + 1])
+            for index in range(len(groups))
+        ]
+
+    def _execute_target_groups_loop(
+        self,
+        target: int,
+        groups: list[list[tuple[Tensor, Tensor]]],
+    ) -> list[tuple[Tensor, Tensor]]:
+        """Reference implementation for grouped module execution."""
+        results = []
+        for group in groups:
+            q = torch.stack([item[0] for item in group]).mean(dim=0)
+            hidden = torch.stack([
+                item[1].unsqueeze(0) if item[1].ndim == 2 else item[1]
+                for item in group
+            ]).mean(dim=0)
+            results.append(self.pool[target](q, hidden))
+        return results
 
     def forward(
         self,
@@ -333,21 +378,28 @@ class DynamicRouterLM(nn.Module):
                 if not next_frontier:
                     break
                 frontier = []
+                grouped_targets: dict[int, list[tuple[tuple[int, ...], list[tuple[Tensor, Tensor]]]]] = defaultdict(list)
                 for (target, visited_ids), inputs in next_frontier.items():
-                    target_q = torch.stack([item[0] for item in inputs]).mean(dim=0)
-                    target_hidden = torch.stack(
-                        [item[1] for item in inputs]
-                    ).mean(dim=0)
-                    target_q, target_hidden_next = self.pool[target](
-                        target_q, target_hidden.unsqueeze(0)
+                    grouped_targets[target].append((visited_ids, inputs))
+                for target, target_groups in grouped_targets.items():
+                    execute_groups = (
+                        self._execute_target_groups_batch
+                        if self.use_batched_group_execution
+                        else self._execute_target_groups_loop
                     )
-                    target_hidden = target_hidden_next.squeeze(0)
-                    observe_tensor("candidate_output", target_q)
-                    observe_tensor("memory", target_hidden)
-                    hidden_states[target] = target_hidden
-                    frontier.append(
-                        (target, target_q, target_hidden, visited_ids, len(visited_ids) - 1)
+                    batch_results = execute_groups(
+                        target, [inputs for _, inputs in target_groups]
                     )
+                    for (visited_ids, _), (target_q, target_hidden_next) in zip(
+                        target_groups, batch_results
+                    ):
+                        target_hidden = target_hidden_next.squeeze(0)
+                        observe_tensor("candidate_output", target_q)
+                        observe_tensor("memory", target_hidden)
+                        hidden_states[target] = target_hidden
+                        frontier.append(
+                            (target, target_q, target_hidden, visited_ids, len(visited_ids) - 1)
+                        )
             if output_inputs:
                 output_input = torch.stack(output_inputs).mean(dim=0)
                 output_hidden = hidden_states[self.output_id]
