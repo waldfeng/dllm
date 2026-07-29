@@ -190,7 +190,7 @@ def main() -> None:
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--max-modules", type=int, default=1024)
     parser.add_argument("--max-depth", type=int, default=128)
-    parser.add_argument("--cooldown", type=int, default=50)
+    parser.add_argument("--cooldown", type=int, default=32)
     parser.add_argument("--length-weight", type=float, default=1e-3)
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--vocab-size", type=int, default=151665)

@@ -158,6 +158,9 @@ class GrowthController:
     def observe_and_maybe_grow(
         self, model: DynamicRouterLM, records: list, route_lengths: Tensor | None = None
     ) -> int | None:
+        self.gradient_window = max(1, model.active_count * 3)
+        self.gradient_beta = 1.0 - 1.0 / self.gradient_window
+
         def normalized_values(record) -> float | None:
             gradient_norm = getattr(record, "gradient_norm", None)
             if gradient_norm is None and record.logits.grad is not None:

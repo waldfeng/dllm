@@ -269,10 +269,21 @@ def test_language_loss_reports_weighted_length_loss():
 
 def test_training_cli_exposes_route_controls():
     source = Path("scripts/train_c4.py").read_text()
-    assert '"--cooldown", type=int, default=50' in source
+    assert '"--cooldown", type=int, default=32' in source
     assert '"--length-weight", type=float, default=1e-3' in source
     assert "controller = GrowthController(cooldown=args.cooldown)" in source
     assert "length_weight=args.length_weight" in source
+
+
+def test_growth_ema_window_tracks_active_module_count():
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=8, n_heads=4)
+    controller = GrowthController(gradient_window=48, cooldown=32)
+    controller.observe_and_maybe_grow(model, [])
+    assert controller.gradient_window == model.active_count * 3
+    assert controller.gradient_beta == 1.0 - 1.0 / (model.active_count * 3)
+    model.activate_next()
+    controller.observe_and_maybe_grow(model, [])
+    assert controller.gradient_window == model.active_count * 3
 
 
 def test_sample_pairs_are_next_blocks_with_padding_mask():
@@ -422,9 +433,10 @@ def test_cooldown_reports_velocity_without_affecting_growth_state():
     controller.observe_and_maybe_grow(
         model, [SimpleNamespace(source_id=0, logits=second_logits)]
     )
+    expected = -(6**0.5) / 18.0
     assert torch.isclose(
         torch.tensor(controller.last_diagnostics["velocity_min"]),
-        torch.tensor(-0.25 * (6**0.5)),
+        torch.tensor(expected),
     )
     assert controller.previous_gradient_norm_ema == {}
     assert controller.velocity_history == {}
@@ -435,7 +447,7 @@ def test_velocity_ema_is_used_for_growth_signal():
     assert controller.previous_velocity_ema == {}
 
 
-def test_growth_signal_uses_route_length_normalization_and_relative_velocity():
+def test_growth_signal_uses_route_length_normalization_and_dynamic_ema():
     controller = GrowthController(gradient_window=1)
     controller.previous_gradient_norm_ema[0] = 10.0
     logits = torch.zeros(1, 6, requires_grad=True)
@@ -446,17 +458,19 @@ def test_growth_signal_uses_route_length_normalization_and_relative_velocity():
         [SimpleNamespace(source_id=0, logits=logits, sample_index=0)],
         torch.tensor([2]),
     )
-    # The normalized norm is 4 * sqrt(6) / 2, so velocity is its absolute
-    # difference from the previous EMA.
+    # The normalized norm is 4 * sqrt(6) / 2 and the active-module EMA window
+    # is 9, so the smoothed velocity is blended with the previous EMA.
+    current = 4 * (6**0.5) / 2
+    expected = (8.0 / 9.0) * 10.0 + (1.0 / 9.0) * current - 10.0
     assert torch.isclose(
         torch.tensor(controller.last_diagnostics["velocity_min"]),
-        torch.tensor(4 * (6**0.5) / 2 - 10),
+        torch.tensor(expected),
     )
     controller.previous_gradient_norm_ema[0] = 1.0
     controller.previous_velocity_ema[0] = -1.0
     controller.velocity_history[0].extend([-1.0, -1.0])
     logits = torch.zeros(1, 6, requires_grad=True)
-    logits.grad = torch.ones_like(logits) * 2.0
+    logits.grad = torch.ones_like(logits) * 100.0
     model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
     slot = controller.observe_and_maybe_grow(
         model, [SimpleNamespace(source_id=0, logits=logits)]
