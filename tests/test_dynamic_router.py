@@ -276,6 +276,16 @@ def test_language_loss_reports_weighted_length_loss():
     assert torch.isclose(total, metrics["lm_loss"] + metrics["length_loss"])
 
 
+def test_language_loss_length_ratio_is_thirty_percent():
+    logits = torch.zeros(1, 8, 32)
+    targets = torch.zeros(1, 8, dtype=torch.long)
+    total, metrics = language_model_loss(
+        logits, targets, torch.tensor(8.0), length_weight=1e-3, length_ratio=0.30
+    )
+    assert torch.isclose(metrics["length_ratio"], torch.tensor(0.30))
+    assert torch.isclose(metrics["length_loss"] / total.detach(), torch.tensor(0.30))
+
+
 def test_training_cli_exposes_route_controls():
     source = Path("scripts/train_c4.py").read_text()
     assert '"--cooldown", type=int, default=32' in source

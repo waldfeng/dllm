@@ -470,6 +470,7 @@ def language_model_loss(
     length_weight: float = 1e-3,
     target_mask: Tensor | None = None,
     sample_mask: Tensor | None = None,
+    length_ratio: float | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     if logits.shape[:2] != targets.shape:
         raise ValueError("targets must have shape [batch, block_size]")
@@ -493,11 +494,20 @@ def language_model_loss(
             expected_length = expected_length[sample_mask].mean()
     elif expected_length.ndim == 1:
         expected_length = expected_length.mean()
-    total = lm + length_weight * expected_length
+    raw_length_loss = length_weight * expected_length
+    if length_ratio is not None:
+        if not 0 <= length_ratio < 1:
+            raise ValueError("length_ratio must be in [0, 1)")
+        length_loss = lm.detach() * length_ratio / max(1e-12, 1.0 - length_ratio)
+    else:
+        length_loss = raw_length_loss
+    total = lm + length_loss
     return total, {
         "loss": total.detach(),
         "lm_loss": lm.detach(),
-        "length_loss": (length_weight * expected_length).detach(),
+        "length_loss": length_loss.detach(),
+        "raw_length_loss": raw_length_loss.detach(),
+        "length_ratio": (length_loss / total).detach(),
         "expected_length": expected_length.detach(),
     }
 

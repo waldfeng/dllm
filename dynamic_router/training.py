@@ -337,6 +337,7 @@ def train_step(
     length_weight: float = 1e-3,
     memory_state: Tensor | None = None,
     grad_clip: float | None = 1.0,
+    length_ratio: float | None = None,
     target_mask: Tensor | None = None,
     sample_mask: Tensor | None = None,
 ) -> dict[str, float | int | Tensor | list[str]]:
@@ -364,6 +365,7 @@ def train_step(
         valid_sample_mask
         if sample_mask is None
         else (sample_mask.to(valid_sample_mask.device) & valid_sample_mask),
+        length_ratio=length_ratio,
     )
     if not torch.isfinite(loss):
         return _invalid_result(aux, memory_state, "nonfinite_loss")
