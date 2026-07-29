@@ -190,6 +190,8 @@ def main() -> None:
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--max-modules", type=int, default=1024)
     parser.add_argument("--max-depth", type=int, default=128)
+    parser.add_argument("--cooldown", type=int, default=50)
+    parser.add_argument("--length-weight", type=float, default=1e-3)
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--vocab-size", type=int, default=151665)
     parser.add_argument("--device", default="cpu")
@@ -226,8 +228,18 @@ def main() -> None:
         log_stream = DualRollingLog(Path(args.log_file), nan_path)
     else:
         log_stream = None
-    if args.epochs <= 0 or args.steps < 0 or args.warmup_steps < 0 or args.max_depth <= 0:
-        raise ValueError("epochs, steps, warmup_steps, and max_depth must be non-negative/positive")
+    if (
+        args.epochs <= 0
+        or args.steps < 0
+        or args.warmup_steps < 0
+        or args.max_depth <= 0
+        or args.cooldown < 0
+        or args.length_weight < 0
+    ):
+        raise ValueError(
+            "epochs, steps, warmup_steps, max_depth, cooldown, and length_weight "
+            "must be non-negative/positive"
+        )
     if not 0 < args.min_lr_ratio <= 1:
         raise ValueError("min_lr_ratio must be in (0, 1]")
     if args.precision == "bf16" and args.device.startswith("cuda") and not torch.cuda.is_bf16_supported():
@@ -276,7 +288,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1
     )
-    controller = GrowthController()
+    controller = GrowthController(cooldown=args.cooldown)
     memory = None
     start_step = 0
     resume_cursor = None
@@ -419,7 +431,7 @@ def main() -> None:
                     x.to(args.device),
                     y.to(args.device),
                     controller,
-                    length_weight=0.0,
+                    length_weight=args.length_weight,
                     memory_state=memory,
                     target_mask=target_mask,
                     sample_mask=active_mask,

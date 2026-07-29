@@ -267,6 +267,14 @@ def test_language_loss_reports_weighted_length_loss():
     assert torch.isclose(total, metrics["lm_loss"] + metrics["length_loss"])
 
 
+def test_training_cli_exposes_route_controls():
+    source = Path("scripts/train_c4.py").read_text()
+    assert '"--cooldown", type=int, default=50' in source
+    assert '"--length-weight", type=float, default=1e-3' in source
+    assert "controller = GrowthController(cooldown=args.cooldown)" in source
+    assert "length_weight=args.length_weight" in source
+
+
 def test_sample_pairs_are_next_blocks_with_padding_mask():
     pairs = list(sample_block_pairs(np.arange(20, dtype=np.uint32), 8, 50256))
     assert len(pairs) == 2
