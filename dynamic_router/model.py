@@ -265,9 +265,12 @@ class DynamicRouterLM(nn.Module):
         x: Tensor,
         tau: float = 1.0,
         memory_state: Tensor | None = None,
+        top_k: int = 3,
     ) -> tuple[Tensor, dict[str, Any]]:
         if tau <= 0:
             raise ValueError("tau must be positive")
+        if top_k <= 0:
+            raise ValueError("top_k must be positive")
         x = self._prepare_input(x)
         x = x + self.position_embedding.unsqueeze(0)
         batch_size = x.shape[0]
@@ -293,6 +296,8 @@ class DynamicRouterLM(nn.Module):
             "max_candidate_output_abs": 0.0,
             "max_memory_abs": 0.0,
             "max_route_depth": 0,
+            "max_frontier_count": 0,
+            "total_frontier_states": 0,
             "nonfinite_query": False,
             "nonfinite_route_logits": False,
             "nonfinite_candidate_output": False,
@@ -337,6 +342,10 @@ class DynamicRouterLM(nn.Module):
                 )
                 if frontier_q.shape[0] == 0:
                     break
+                forward_diagnostics["max_frontier_count"] = max(
+                    forward_diagnostics["max_frontier_count"], frontier_q.shape[0]
+                )
+                forward_diagnostics["total_frontier_states"] += frontier_q.shape[0]
                 observe_tensor("query", frontier_q)
                 logits_batch = self._route_logits_batch(frontier_q, frontier_visited)
                 if not torch.isfinite(logits_batch).all():
@@ -366,12 +375,12 @@ class DynamicRouterLM(nn.Module):
                         invalid_reason = "no_legal_candidate"
                         termination = invalid_reason
                         continue
-                    ranked = torch.topk(logits[0], k=min(3, len(legal))).indices.tolist()
+                    ranked = torch.topk(logits[0], k=min(top_k, len(legal))).indices.tolist()
                     ranked = [target for target in ranked if target in legal]
                     forced = self.cooldown_slot if source_id == self.cooldown_source else None
                     if forced is not None and forced in legal:
                         ranked = [forced] + [target for target in ranked if target != forced]
-                    targets = ranked[:3]
+                    targets = ranked[:top_k]
                     route_targets.append((source_id, targets, sample_index, depth))
                     target_tensor = torch.tensor(targets, device=x.device, dtype=torch.long)
                     topk_probs = (logits[:, target_tensor].float() / tau).softmax(dim=-1)
@@ -430,6 +439,8 @@ class DynamicRouterLM(nn.Module):
                 valid_samples.append(False)
                 if invalid_reason is None:
                     invalid_reason = "no_valid_path"
+            if completed_lengths:
+                expected_length = q.new_tensor(completed_lengths, dtype=torch.float32).mean()
             next_memories.append(torch.cat(hidden_states, dim=0))
             observe_tensor("memory", next_memories[-1])
             route_lengths.append(route_length)

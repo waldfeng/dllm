@@ -303,15 +303,6 @@ class GrowthController:
         return slot
 
 
-def _snapshot_inactive(model: DynamicRouterLM) -> dict[Tensor, tuple[Tensor, int]]:
-    return {
-        parameter: (parameter.detach().clone(), index)
-        for index, module in enumerate(model.pool)
-        if not bool(model.active[index])
-        for parameter in module.parameters()
-    }
-
-
 def _clear_optimizer_state(optimizer: torch.optim.Optimizer, parameter: Tensor) -> None:
     optimizer.state.pop(parameter, None)
 
@@ -342,6 +333,7 @@ def train_step(
     targets: Tensor,
     controller: GrowthController | None = None,
     tau: float = 1.0,
+    top_k: int = 3,
     length_weight: float = 1e-3,
     memory_state: Tensor | None = None,
     grad_clip: float | None = 1.0,
@@ -353,7 +345,7 @@ def train_step(
         memory_state = memory_state.detach().clone()
         finite_memory = torch.isfinite(memory_state).all(dim=(1, 2))
         memory_state[~finite_memory] = 0
-    logits, aux = model(x, tau=tau, memory_state=memory_state)
+    logits, aux = model(x, tau=tau, memory_state=memory_state, top_k=top_k)
     if not torch.isfinite(aux["memory_state"]).all():
         return _invalid_result(aux, memory_state, "nonfinite_memory")
     valid_sample_mask = aux.get("valid_sample_mask")
@@ -382,7 +374,6 @@ def train_step(
             aux, memory_state, "nonfinite_gradient", _gradient_diagnostics(model)
         )
 
-    inactive_parameters = _snapshot_inactive(model)
     router_snapshot = model.router.detach().clone()
     new_slot = (
         controller.observe_and_maybe_grow(
@@ -392,8 +383,6 @@ def train_step(
         else None
     )
 
-    for parameter in inactive_parameters:
-        parameter.grad = None
     if model.router.grad is not None:
         model.router.grad[~model.active] = 0
     if grad_clip is not None:
@@ -405,20 +394,19 @@ def train_step(
     parameter_snapshot = {
         parameter: parameter.detach().clone()
         for parameter in model.parameters()
+        if parameter.grad is not None
     }
     optimizer.step()
 
     if not all(torch.isfinite(parameter).all() for parameter in model.parameters()):
         with torch.no_grad():
             for parameter, value in parameter_snapshot.items():
-                parameter.copy_(value)
+                if not torch.isfinite(parameter).all():
+                    parameter.copy_(value)
         optimizer.state.clear()
         return _invalid_result(aux, memory_state, "nonfinite_parameter")
 
     with torch.no_grad():
-        for parameter, (value, module_index) in inactive_parameters.items():
-            if not bool(model.active[module_index]):
-                parameter.copy_(value)
         # Preserve inactive route rows against AdamW decay. A newly activated
         # row is intentionally not restored and starts from its zero seed.
         inactive_rows = ~model.active
@@ -440,6 +428,8 @@ def train_step(
         {
             "expected_length": float(aux["expected_length"].detach()),
             "mean_route_length": float(aux["route_lengths"].float().mean()),
+            "max_frontier_count": aux["forward_diagnostics"]["max_frontier_count"],
+            "total_frontier_states": aux["forward_diagnostics"]["total_frontier_states"],
             "new_slot": new_slot if new_slot is not None else -1,
             "terminations": aux["terminations"],
             "invalid_reasons": aux["invalid_reasons"],

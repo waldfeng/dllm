@@ -192,6 +192,7 @@ def main() -> None:
     parser.add_argument("--max-depth", type=int, default=128)
     parser.add_argument("--cooldown", type=int, default=32)
     parser.add_argument("--length-weight", type=float, default=1e-3)
+    parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--vocab-size", type=int, default=151665)
     parser.add_argument("--device", default="cpu")
@@ -235,6 +236,7 @@ def main() -> None:
         or args.max_depth <= 0
         or args.cooldown < 0
         or args.length_weight < 0
+        or args.top_k <= 0
     ):
         raise ValueError(
             "epochs, steps, warmup_steps, max_depth, cooldown, and length_weight "
@@ -432,6 +434,7 @@ def main() -> None:
                     y.to(args.device),
                     controller,
                     length_weight=args.length_weight,
+                    top_k=args.top_k,
                     memory_state=memory,
                     target_mask=target_mask,
                     sample_mask=active_mask,

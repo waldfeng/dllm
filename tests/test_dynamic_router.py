@@ -75,6 +75,15 @@ def test_training_route_uses_unique_top_three_targets():
         assert len(targets) == len(set(targets))
 
 
+def test_forward_top_k_limits_route_targets_and_reports_frontier():
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=8, n_heads=4)
+    _, aux = model(torch.randint(0, 32, (1, 8)), top_k=2)
+    assert aux["forward_diagnostics"]["max_frontier_count"] >= 1
+    assert aux["forward_diagnostics"]["total_frontier_states"] >= 1
+    for _, targets, _, _ in aux["route_targets"]:
+        assert len(targets) <= 2
+
+
 def test_each_branch_path_has_unique_modules_and_bounded_length():
     model = DynamicRouterLM(
         d_model=16, vocab_size=32, max_modules=6, n_heads=4, max_depth=32
@@ -271,8 +280,10 @@ def test_training_cli_exposes_route_controls():
     source = Path("scripts/train_c4.py").read_text()
     assert '"--cooldown", type=int, default=32' in source
     assert '"--length-weight", type=float, default=1e-3' in source
+    assert '"--top-k", type=int, default=3' in source
     assert "controller = GrowthController(cooldown=args.cooldown)" in source
     assert "length_weight=args.length_weight" in source
+    assert "top_k=args.top_k" in source
 
 
 def test_growth_ema_window_tracks_active_module_count():
