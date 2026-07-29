@@ -9,6 +9,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 @dataclass
@@ -18,6 +19,7 @@ class RouteRecord:
     sample_index: int = 0
     depth: int = 0
     path_length: int = 0
+    gradient_norm: float | None = None
 
 
 class MemoryModule(nn.Module):
@@ -72,11 +74,7 @@ class MemoryModule(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    def forward(self, x: Tensor, hidden: Tensor) -> tuple[Tensor, Tensor]:
-        if x.ndim != 3 or hidden.ndim != 3:
-            raise ValueError("module input and hidden state must be rank-3 tensors")
-        if hidden.shape[0] != 1 or hidden.shape[1] != x.shape[0]:
-            raise ValueError("hidden state must have shape [1, batch, d_model]")
+    def _forward_impl(self, x: Tensor, hidden: Tensor) -> tuple[Tensor, Tensor]:
         gru_input = self.gru_norm(x)
         attention_input = self.attn_norm(x)
         query = self.q_proj(attention_input)
@@ -93,6 +91,15 @@ class MemoryModule(nn.Module):
         attention_hidden = x + attended
         output = attention_hidden + self.ffn(self.ffn_norm(attention_hidden))
         return output, next_hidden
+
+    def forward(self, x: Tensor, hidden: Tensor) -> tuple[Tensor, Tensor]:
+        if x.ndim != 3 or hidden.ndim != 3:
+            raise ValueError("module input and hidden state must be rank-3 tensors")
+        if hidden.shape[0] != 1 or hidden.shape[1] != x.shape[0]:
+            raise ValueError("hidden state must have shape [1, batch, d_model]")
+        if self.training and torch.is_grad_enabled():
+            return checkpoint(self._forward_impl, x, hidden, use_reentrant=False)
+        return self._forward_impl(x, hidden)
 
 
 class DynamicRouterLM(nn.Module):
@@ -294,11 +301,12 @@ class DynamicRouterLM(nn.Module):
 
         def observe_tensor(name: str, value: Tensor) -> None:
             finite = torch.isfinite(value)
-            forward_diagnostics[f"nonfinite_{name}"] |= not bool(finite.all())
-            if bool(finite.any()):
+            all_finite = bool(finite.all())
+            forward_diagnostics[f"nonfinite_{name}"] |= not all_finite
+            if all_finite:
                 forward_diagnostics[f"max_{name}_abs"] = max(
                     forward_diagnostics[f"max_{name}_abs"],
-                    float(value.detach()[finite].abs().max()),
+                    float(value.detach().abs().amax()),
                 )
 
         for sample_index, sample in enumerate(x.unbind(0)):
@@ -343,11 +351,15 @@ class DynamicRouterLM(nn.Module):
                 next_lengths: list[int] = []
                 for branch_index in range(frontier_q.shape[0]):
                     logits = logits_batch[branch_index : branch_index + 1]
-                    if logits.requires_grad:
-                        logits.retain_grad()
                     source_id = int(frontier_modules[branch_index])
                     path_length = int(frontier_lengths[branch_index])
-                    records.append(RouteRecord(source_id, logits, sample_index, depth, path_length))
+                    record = RouteRecord(source_id, logits, sample_index, depth, path_length)
+                    if logits.requires_grad:
+                        def capture_gradient(gradient: Tensor, record: RouteRecord = record) -> Tensor:
+                            record.gradient_norm = float(gradient.detach().float().norm().cpu())
+                            return gradient
+                        logits.register_hook(capture_gradient)
+                    records.append(record)
                     observe_tensor("route_logits", logits)
                     legal = torch.where(logits[0] > torch.finfo(logits.dtype).min / 2)[0].tolist()
                     if not legal:

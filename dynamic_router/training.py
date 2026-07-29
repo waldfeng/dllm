@@ -158,8 +158,11 @@ class GrowthController:
     def observe_and_maybe_grow(
         self, model: DynamicRouterLM, records: list, route_lengths: Tensor | None = None
     ) -> int | None:
-        def normalized_values(record) -> Tensor | None:
-            if record.logits.grad is None:
+        def normalized_values(record) -> float | None:
+            gradient_norm = getattr(record, "gradient_norm", None)
+            if gradient_norm is None and record.logits.grad is not None:
+                gradient_norm = float(record.logits.grad.detach().float().norm().cpu())
+            if gradient_norm is None:
                 return None
             sample_index = getattr(record, "sample_index", 0)
             path_length = getattr(record, "path_length", None)
@@ -171,19 +174,19 @@ class GrowthController:
                 path_length = max(1.0, float(route_lengths[sample_index]))
             if path_length is None:
                 path_length = 1.0
-            return record.logits.grad.detach().flatten() / max(1.0, float(path_length))
+            return gradient_norm / max(1.0, float(path_length))
 
         if self.remaining_cooldown:
             if self.cooldown_source is not None and self.cooldown_slot is not None:
                 model.set_cooldown_connection(self.cooldown_source, self.cooldown_slot)
-            current: dict[int, list[Tensor]] = defaultdict(list)
+            current: dict[int, list[float]] = defaultdict(list)
             for record in records:
                 values = normalized_values(record)
                 if values is not None:
                     current[record.source_id].append(values)
             velocities: list[float] = []
             for source, values in current.items():
-                gradient_norm = sum(value.norm().item() for value in values) / len(values)
+                gradient_norm = sum(values) / len(values)
                 previous = self.diagnostic_previous_gradient_norm_ema.get(source)
                 gradient_norm_ema = gradient_norm
                 if previous is not None:
@@ -225,7 +228,7 @@ class GrowthController:
                 self.cooldown_slot = None
             return None
 
-        current: dict[int, list[Tensor]] = defaultdict(list)
+        current: dict[int, list[float]] = defaultdict(list)
         for record in records:
             values = normalized_values(record)
             if values is not None:
@@ -235,7 +238,7 @@ class GrowthController:
         triggered_source: int | None = None
         velocities: list[float] = []
         for source, values in current.items():
-            gradient_norm = sum(value.norm().item() for value in values) / len(values)
+            gradient_norm = sum(values) / len(values)
             previous = self.previous_gradient_norm_ema.get(source)
             if previous is not None:
                 gradient_norm_ema = (
