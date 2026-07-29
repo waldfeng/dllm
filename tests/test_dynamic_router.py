@@ -269,27 +269,18 @@ def test_language_loss_reports_weighted_length_loss():
     targets = torch.randint(0, 32, (1, 8))
     expected = torch.tensor(3.0)
     total, metrics = language_model_loss(
-        logits, targets, expected, length_weight=0.25
+        logits, targets, expected, torch.tensor([5.0]), length_weight=0.25
     )
-    assert torch.isclose(metrics["length_loss"], torch.tensor(0.75))
+    assert torch.isclose(metrics["length_loss"], torch.tensor(0.5))
     assert torch.isclose(metrics["expected_length"], expected)
     assert torch.isclose(total, metrics["lm_loss"] + metrics["length_loss"])
-
-
-def test_language_loss_length_ratio_is_thirty_percent():
-    logits = torch.zeros(1, 8, 32)
-    targets = torch.zeros(1, 8, dtype=torch.long)
-    total, metrics = language_model_loss(
-        logits, targets, torch.tensor(8.0), length_weight=1e-3, length_ratio=0.30
-    )
-    assert torch.isclose(metrics["length_ratio"], torch.tensor(0.30))
-    assert torch.isclose(metrics["length_loss"] / total.detach(), torch.tensor(0.30))
 
 
 def test_training_cli_exposes_route_controls():
     source = Path("scripts/train_c4.py").read_text()
     assert '"--cooldown", type=int, default=32' in source
     assert '"--length-weight", type=float, default=1e-3' in source
+    assert "length_ratio" not in source
     assert '"--top-k", type=int, default=3' in source
     assert "controller = GrowthController(cooldown=args.cooldown)" in source
     assert "length_weight=args.length_weight" in source
@@ -321,7 +312,9 @@ def test_masked_loss_ignores_padding_targets():
     logits = torch.zeros(1, 8, 4)
     targets = torch.tensor([[0, 1, 2, 3, 3, 3, 3, 3]])
     mask = torch.tensor([[True, True, True, True, False, False, False, False]])
-    _, metrics = language_model_loss(logits, targets, torch.tensor(0.0), target_mask=mask)
+    _, metrics = language_model_loss(
+        logits, targets, torch.tensor(0.0), torch.tensor([2.0]), target_mask=mask
+    )
     expected = torch.nn.functional.cross_entropy(logits[:, :4].reshape(-1, 4), targets[:, :4].reshape(-1))
     assert torch.isclose(metrics["lm_loss"], expected)
 
@@ -334,9 +327,32 @@ def test_sample_mask_ignores_finished_lanes_for_length_loss():
         logits,
         targets,
         torch.tensor(2.0),
+        torch.tensor([2.0, 1.0]),
         sample_mask=sample_mask,
     )
     assert torch.isclose(metrics["expected_length"], torch.tensor(2.0))
+    assert torch.isclose(metrics["length_loss"], torch.tensor(0.0))
+
+
+def test_length_loss_only_penalizes_route_lengths_above_expected():
+    logits = torch.zeros(3, 2, 4)
+    targets = torch.zeros(3, 2, dtype=torch.long)
+    _, metrics = language_model_loss(
+        logits,
+        targets,
+        torch.full((3,), 2.0),
+        torch.tensor([1.0, 2.0, 5.0]),
+        length_weight=0.1,
+    )
+    assert torch.isclose(metrics["length_loss"], torch.tensor(0.1))
+
+
+def test_model_expected_length_is_fixed_at_two():
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    x = torch.randint(0, 32, (2, 8))
+    _, aux = model(x, top_k=2)
+    assert torch.equal(aux["expected_length_per_sample"], torch.full((2,), 2.0))
+    assert torch.isclose(aux["expected_length"], torch.tensor(2.0))
 
 
 def test_sequential_batches_use_offsets_and_finish_lanes(tmp_path: Path):

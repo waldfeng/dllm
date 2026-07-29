@@ -317,12 +317,10 @@ class DynamicRouterLM(nn.Module):
         for sample_index, sample in enumerate(x.unbind(0)):
             q = sample.unsqueeze(0)
             hidden_states = [memory_state[sample_index, i : i + 1].clone() for i in range(self.max_modules)]
-            expected_length = q.new_zeros(1)
             output_inputs: list[Tensor] = []
             route_length = 0
             termination = "output"
             invalid_reason = None
-            completed_lengths: list[int] = []
 
             # Input is the only externally-entered module.
             q, next_hidden = self.pool[self.input_id](q, hidden_states[self.input_id].unsqueeze(0))
@@ -390,7 +388,6 @@ class DynamicRouterLM(nn.Module):
                         if target == self.output_id:
                             output_inputs.append(gated_q)
                             completed_length = path_length + 1
-                            completed_lengths.append(completed_length)
                             route_length = max(route_length, completed_length)
                             branch_paths.append((sample_index, (*frontier_paths[branch_index], target)))
                         else:
@@ -439,12 +436,10 @@ class DynamicRouterLM(nn.Module):
                 valid_samples.append(False)
                 if invalid_reason is None:
                     invalid_reason = "no_valid_path"
-            if completed_lengths:
-                expected_length = q.new_tensor(completed_lengths, dtype=torch.float32).mean()
             next_memories.append(torch.cat(hidden_states, dim=0))
             observe_tensor("memory", next_memories[-1])
             route_lengths.append(route_length)
-            expected_lengths.append(expected_length.squeeze(0))
+            expected_lengths.append(q.new_tensor(2.0))
             terminations.append(termination)
             invalid_reasons.append(invalid_reason)
 
@@ -467,13 +462,15 @@ def language_model_loss(
     logits: Tensor,
     targets: Tensor,
     expected_length: Tensor,
+    route_lengths: Tensor,
     length_weight: float = 1e-3,
     target_mask: Tensor | None = None,
     sample_mask: Tensor | None = None,
-    length_ratio: float | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     if logits.shape[:2] != targets.shape:
         raise ValueError("targets must have shape [batch, block_size]")
+    if route_lengths.shape != (targets.shape[0],):
+        raise ValueError("route_lengths must have shape [batch]")
     if target_mask is None:
         lm = F.cross_entropy(logits.flatten(0, 1), targets.flatten())
     else:
@@ -492,22 +489,16 @@ def language_model_loss(
             raise ValueError("sample_mask must contain at least one active sample")
         if expected_length.ndim == 1:
             expected_length = expected_length[sample_mask].mean()
+        route_lengths = route_lengths[sample_mask]
     elif expected_length.ndim == 1:
         expected_length = expected_length.mean()
-    raw_length_loss = length_weight * expected_length
-    if length_ratio is not None:
-        if not 0 <= length_ratio < 1:
-            raise ValueError("length_ratio must be in [0, 1)")
-        length_loss = lm.detach() * length_ratio / max(1e-12, 1.0 - length_ratio)
-    else:
-        length_loss = raw_length_loss
+    excess_lengths = (route_lengths.float() - expected_length).clamp_min(0.0)
+    length_loss = length_weight * excess_lengths.mean()
     total = lm + length_loss
     return total, {
         "loss": total.detach(),
         "lm_loss": lm.detach(),
         "length_loss": length_loss.detach(),
-        "raw_length_loss": raw_length_loss.detach(),
-        "length_ratio": (length_loss / total).detach(),
         "expected_length": expected_length.detach(),
     }
 
