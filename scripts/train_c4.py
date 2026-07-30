@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from dynamic_router import DynamicRouterLM, GrowthController, train_step
+from dynamic_router import DynamicRouterLM, GrowthController, MiddleModuleUtilization, train_step
 
 
 class RollingLog:
@@ -192,7 +192,6 @@ def main() -> None:
     parser.add_argument("--max-depth", type=int, default=128)
     parser.add_argument("--cooldown", type=int, default=32)
     parser.add_argument("--length-weight", type=float, default=1e-3)
-    parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--vocab-size", type=int, default=151665)
     parser.add_argument("--device", default="cpu")
@@ -236,7 +235,6 @@ def main() -> None:
         or args.max_depth <= 0
         or args.cooldown < 0
         or args.length_weight < 0
-        or args.top_k <= 0
     ):
         raise ValueError(
             "epochs, steps, warmup_steps, max_depth, cooldown, and length_weight "
@@ -291,6 +289,7 @@ def main() -> None:
         model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1
     )
     controller = GrowthController(cooldown=args.cooldown)
+    middle_utilization = MiddleModuleUtilization(window_size=1000)
     memory = None
     start_step = 0
     resume_cursor = None
@@ -306,6 +305,7 @@ def main() -> None:
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         controller.load_state_dict(checkpoint.get("controller", {}))
+        middle_utilization.load_state_dict(checkpoint.get("middle_utilization", {}))
         if controller.remaining_cooldown:
             if controller.cooldown_source is not None and controller.cooldown_slot is not None:
                 model.set_cooldown_connection(
@@ -316,11 +316,11 @@ def main() -> None:
         global_step = start_step
         resume_cursor = checkpoint.get("data_cursor")
         saved_config = checkpoint.get("model_config", {})
+        batch_size_changed = saved_config.get("batch_size", args.batch_size) != args.batch_size
         for key, value in {
             "d_model": args.d_model,
             "vocab_size": args.vocab_size,
             "block_size": block_size,
-            "batch_size": args.batch_size,
             "max_modules": args.max_modules,
             "n_heads": args.n_heads,
             "max_depth": args.max_depth,
@@ -329,7 +329,10 @@ def main() -> None:
         }.items():
             if saved_config.get(key, value) != value:
                 raise ValueError(f"checkpoint {key} does not match current configuration")
-        if memory is not None:
+        if batch_size_changed:
+            # Memory state is aligned to the old batch lanes and cannot be reused.
+            memory = None
+        elif memory is not None:
             memory = memory.to(args.device)
     def save_checkpoint(step: int) -> None:
         if not args.checkpoint:
@@ -341,6 +344,7 @@ def main() -> None:
             "memory_state": memory,
             "metadata": metadata,
             "controller": controller.state_dict(),
+            "middle_utilization": middle_utilization.state_dict(),
             "data_cursor": data_cursor,
             "model_config": {
                 "d_model": args.d_model,
@@ -434,13 +438,22 @@ def main() -> None:
                     y.to(args.device),
                     controller,
                     length_weight=args.length_weight,
-                    top_k=args.top_k,
                     memory_state=memory,
                     target_mask=target_mask,
                     sample_mask=active_mask,
                 )
             memory = metrics.pop("memory_state")
-            if memory is not None:
+            middle_route_counts = metrics.pop("middle_route_counts", {})
+            excluded = torch.zeros_like(model.active)
+            excluded[model.input_id] = True
+            excluded[model.output_id] = True
+            metrics.update(
+                middle_utilization.update(
+                    middle_route_counts,
+                    model.active & ~excluded,
+                )
+            )
+            if memory is not None and not metrics.get("skipped_update"):
                 memory[~torch.tensor(active, dtype=torch.bool, device=memory.device)] = 0
             if batch_done:
                 memory = None

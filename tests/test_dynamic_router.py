@@ -4,7 +4,13 @@ import numpy as np
 from types import SimpleNamespace
 from pathlib import Path
 
-from dynamic_router import DynamicRouterLM, GrowthController, language_model_loss, train_step
+from dynamic_router import (
+    DynamicRouterLM,
+    GrowthController,
+    MiddleModuleUtilization,
+    language_model_loss,
+    train_step,
+)
 from scripts.train_c4 import TokenStore, sample_block_pairs, sequential_batches
 
 
@@ -67,21 +73,20 @@ def test_block_forward_and_fixed_memory_shapes():
     assert aux["valid_sample_mask"].tolist() == [True, True, True]
 
 
-def test_training_route_uses_unique_top_three_targets():
+def test_training_route_selects_one_target():
     model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
     _, aux = model(torch.randint(0, 32, (1, 8)))
     for _, targets, _, _ in aux["route_targets"]:
-        assert len(targets) <= 3
-        assert len(targets) == len(set(targets))
+        assert len(targets) == 1
 
 
-def test_forward_top_k_limits_route_targets_and_reports_frontier():
+def test_forward_top1_reports_batched_live_routes():
     model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=8, n_heads=4)
-    _, aux = model(torch.randint(0, 32, (1, 8)), top_k=2)
+    _, aux = model(torch.randint(0, 32, (3, 8)))
     assert aux["forward_diagnostics"]["max_frontier_count"] >= 1
     assert aux["forward_diagnostics"]["total_frontier_states"] >= 1
     for _, targets, _, _ in aux["route_targets"]:
-        assert len(targets) <= 2
+        assert len(targets) == 1
 
 
 def test_each_branch_path_has_unique_modules_and_bounded_length():
@@ -98,14 +103,14 @@ def test_each_branch_path_has_unique_modules_and_bounded_length():
         assert path[-1] == model.output_id
 
 
-def test_cooldown_source_includes_new_slot_in_top_three():
+def test_cooldown_source_selects_new_slot():
     model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
     slot = model.activate_next()
     model.set_cooldown_connection(0, slot)
     _, aux = model(torch.randint(0, 32, (1, 8)))
     source_targets = [targets for source, targets, _, _ in aux["route_targets"] if source == 0]
     assert source_targets
-    assert slot in source_targets[0]
+    assert source_targets[0] == [slot]
 
 
 def test_memory_state_is_per_sample_and_persistent():
@@ -177,7 +182,21 @@ def test_language_loss_reaches_route_logits():
     assert model.router.grad is not None
 
 
-def test_route_gradients_are_masked_outside_top_three():
+def test_top_one_route_gradient_reaches_selected_logit():
+    torch.manual_seed(5)
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    x = torch.randint(0, 32, (1, 8))
+    logits, aux = model(x)
+    torch.nn.functional.cross_entropy(logits.flatten(0, 1), x.flatten()).backward()
+    assert any(
+        record.gradient_norm is not None and record.gradient_norm > 0
+        for record in aux["route_records"]
+    )
+    assert model.router.grad is not None
+    assert model.router.grad.abs().sum() > 0
+
+
+def test_route_gradients_are_recorded_for_top1():
     torch.manual_seed(2)
     model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
     x = torch.randint(0, 32, (1, 8))
@@ -194,6 +213,24 @@ def test_route_gradients_are_masked_outside_top_three():
     assert routed
     for record, targets in routed:
         assert record.gradient_norm is not None
+
+
+def test_unselected_route_logits_can_receive_gradient():
+    torch.manual_seed(6)
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    logits, aux = model(torch.randint(0, 32, (1, 8)))
+    torch.nn.functional.cross_entropy(logits.flatten(0, 1), torch.randint(0, 32, (1, 8)).flatten()).backward()
+    unselected_gradients = []
+    for record, target_info in zip(aux["route_records"], aux["route_targets"]):
+        _, targets, _, _ = target_info
+        gradient = record.gradient
+        assert gradient is not None
+        assert len(targets) == 1
+        selected = targets[0]
+        legal = record.logits[0] > torch.finfo(record.logits.dtype).min / 2
+        legal[selected] = False
+        unselected_gradients.extend(gradient[legal].abs().tolist())
+    assert any(value > 0 for value in unselected_gradients)
 
 
 def test_target_visited_group_batch_matches_loop_forward_and_backward():
@@ -281,10 +318,17 @@ def test_training_cli_exposes_route_controls():
     assert '"--cooldown", type=int, default=32' in source
     assert '"--length-weight", type=float, default=1e-3' in source
     assert "length_ratio" not in source
-    assert '"--top-k", type=int, default=3' in source
+    assert "--top-k" not in source
     assert "controller = GrowthController(cooldown=args.cooldown)" in source
     assert "length_weight=args.length_weight" in source
-    assert "top_k=args.top_k" in source
+    assert "top_k" not in source
+
+
+def test_resume_allows_batch_size_change_and_resets_memory():
+    source = Path("scripts/train_c4.py").read_text()
+    assert 'batch_size_changed = saved_config.get("batch_size", args.batch_size) != args.batch_size' in source
+    assert "if batch_size_changed:" in source
+    assert "memory = None" in source
 
 
 def test_growth_ema_window_tracks_active_module_count():
@@ -350,7 +394,7 @@ def test_length_loss_only_penalizes_route_lengths_above_expected():
 def test_model_expected_length_is_fixed_at_two():
     model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
     x = torch.randint(0, 32, (2, 8))
-    _, aux = model(x, top_k=2)
+    _, aux = model(x)
     assert torch.equal(aux["expected_length_per_sample"], torch.full((2,), 2.0))
     assert torch.isclose(aux["expected_length"], torch.tensor(2.0))
 
@@ -437,6 +481,38 @@ def test_inactive_modules_do_not_receive_gradients_or_optimizer_updates():
     train_step(model, optimizer, x, y)
     assert model.pool[4].ffn[0].weight.grad is None
     assert torch.equal(model.pool[4].ffn[0].weight, inactive_before)
+
+
+def test_middle_module_utilization_uses_sliding_window():
+    tracker = MiddleModuleUtilization(window_size=2)
+    active = torch.tensor([False, True, True, True, False])
+    first = tracker.update({1: 2, 2: 1}, active)
+    second = tracker.update({2: 3}, active)
+    third = tracker.update({3: 1}, active)
+    assert first["middle_window_size"] == 1
+    assert second["middle_window_size"] == 2
+    assert third["middle_window_size"] == 2
+    assert third["middle_utilization_rate"] == 2 / 3
+    assert 0 <= third["middle_max_share"] <= 1
+
+
+def test_all_inactive_batch_is_skipped_without_error():
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    x = torch.randint(0, 32, (2, 8))
+    targets = torch.randint(0, 32, (2, 8))
+    memory = torch.ones(2, 6, 16)
+    metrics = train_step(
+        model,
+        optimizer,
+        x,
+        targets,
+        sample_mask=torch.zeros(2, dtype=torch.bool),
+        memory_state=memory,
+    )
+    assert metrics["skipped_update"] == 1
+    assert metrics["invalid_reasons"] == ["no_valid_active_sample"] * 2
+    assert torch.equal(metrics["memory_state"], memory)
 
 
 def test_growth_controller_state_round_trip():

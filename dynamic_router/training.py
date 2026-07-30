@@ -61,7 +61,7 @@ def _invalid_result(
     safe_memory = (
         torch.zeros_like(aux["memory_state"])
         if memory_state is None
-        else torch.zeros_like(memory_state)
+        else memory_state.detach().clone()
     )
     return {
         "loss": 0.0,
@@ -75,7 +75,65 @@ def _invalid_result(
         "skipped_update": 1,
         "memory_state": safe_memory.detach(),
         "diagnostics": diagnostics or aux.get("forward_diagnostics", {}),
+        "middle_route_counts": {},
     }
+
+
+class MiddleModuleUtilization:
+    """Track middle-module target usage over a sliding step window."""
+
+    def __init__(self, window_size: int = 1000) -> None:
+        self.window_size = window_size
+        self.window: deque[dict[int, int]] = deque()
+        self.counts: dict[int, int] = defaultdict(int)
+
+    def state_dict(self) -> dict:
+        return {
+            "window_size": self.window_size,
+            "window": list(self.window),
+            "counts": dict(self.counts),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.window_size = int(state.get("window_size", self.window_size))
+        self.window = deque(
+            ({int(key): int(value) for key, value in item.items()} for item in state.get("window", [])),
+        )
+        self.counts = defaultdict(int)
+        self.counts.update({int(key): int(value) for key, value in state.get("counts", {}).items()})
+
+    def update(self, counts: dict[int, int], active_middle: Tensor) -> dict[str, float | int]:
+        current = {int(key): int(value) for key, value in counts.items() if value}
+        self.window.append(current)
+        for key, value in current.items():
+            self.counts[key] += value
+        while len(self.window) > self.window_size:
+            expired = self.window.popleft()
+            for key, value in expired.items():
+                self.counts[key] -= value
+                if self.counts[key] <= 0:
+                    self.counts.pop(key, None)
+        module_ids = [int(key) for key in torch.where(active_middle)[0].tolist()]
+        values = torch.tensor(
+            [float(self.counts.get(key, 0)) for key in module_ids], dtype=torch.float64
+        )
+        total = float(values.sum())
+        used = int((values > 0).sum())
+        module_count = len(module_ids)
+        if module_count == 0 or total == 0:
+            rate = cv = max_share = 0.0
+        else:
+            mean = float(values.mean())
+            std = float(values.std(unbiased=False))
+            rate = used / module_count
+            cv = std / mean if mean else 0.0
+            max_share = float(values.max()) / total
+        return {
+            "middle_window_size": len(self.window),
+            "middle_utilization_rate": rate,
+            "middle_utilization_cv": cv,
+            "middle_max_share": max_share,
+        }
 
 
 class GrowthController:
@@ -333,7 +391,6 @@ def train_step(
     targets: Tensor,
     controller: GrowthController | None = None,
     tau: float = 1.0,
-    top_k: int = 3,
     length_weight: float = 1e-3,
     memory_state: Tensor | None = None,
     grad_clip: float | None = 1.0,
@@ -345,16 +402,34 @@ def train_step(
         memory_state = memory_state.detach().clone()
         finite_memory = torch.isfinite(memory_state).all(dim=(1, 2))
         memory_state[~finite_memory] = 0
-    logits, aux = model(x, tau=tau, memory_state=memory_state, top_k=top_k)
+    logits, aux = model(x, tau=tau, memory_state=memory_state)
     if not torch.isfinite(aux["memory_state"]).all():
         return _invalid_result(aux, memory_state, "nonfinite_memory")
     valid_sample_mask = aux.get("valid_sample_mask")
-    if valid_sample_mask is None or not bool(valid_sample_mask.any()):
+    if valid_sample_mask is None:
         reason = next(
             (item for item in aux["invalid_reasons"] if item is not None),
             "no_valid_path",
         )
         return _invalid_result(aux, memory_state, reason)
+    effective_sample_mask = valid_sample_mask
+    if sample_mask is not None:
+        effective_sample_mask = sample_mask.to(valid_sample_mask.device) & valid_sample_mask
+    if not bool(effective_sample_mask.any()):
+        reason = next(
+            (item for item in aux["invalid_reasons"] if item is not None),
+            "no_valid_active_sample",
+        )
+        result = _invalid_result(aux, memory_state, reason)
+        result["middle_route_counts"] = {}
+        return result
+    middle_route_counts: dict[int, int] = defaultdict(int)
+    for _, targets_for_route, sample_index, _ in aux["route_targets"]:
+        if not bool(effective_sample_mask[sample_index]):
+            continue
+        for target in targets_for_route:
+            if target != model.input_id and target != model.output_id and bool(model.active[target]):
+                middle_route_counts[target] += 1
     loss, metrics = language_model_loss(
         logits,
         targets,
@@ -362,9 +437,7 @@ def train_step(
         aux["route_lengths"],
         length_weight,
         target_mask,
-        valid_sample_mask
-        if sample_mask is None
-        else (sample_mask.to(valid_sample_mask.device) & valid_sample_mask),
+        effective_sample_mask,
     )
     if not torch.isfinite(loss):
         return _invalid_result(aux, memory_state, "nonfinite_loss")
@@ -437,6 +510,7 @@ def train_step(
             "skipped_update": 0,
             "growth_diagnostics": controller.last_diagnostics if controller else {},
             "memory_state": aux["memory_state"].detach(),
+            "middle_route_counts": dict(middle_route_counts),
         }
     )
     return result

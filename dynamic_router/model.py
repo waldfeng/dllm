@@ -20,6 +20,7 @@ class RouteRecord:
     depth: int = 0
     path_length: int = 0
     gradient_norm: float | None = None
+    gradient: Tensor | None = None
 
 
 class MemoryModule(nn.Module):
@@ -265,12 +266,9 @@ class DynamicRouterLM(nn.Module):
         x: Tensor,
         tau: float = 1.0,
         memory_state: Tensor | None = None,
-        top_k: int = 3,
     ) -> tuple[Tensor, dict[str, Any]]:
         if tau <= 0:
             raise ValueError("tau must be positive")
-        if top_k <= 0:
-            raise ValueError("top_k must be positive")
         x = self._prepare_input(x)
         x = x + self.position_embedding.unsqueeze(0)
         batch_size = x.shape[0]
@@ -280,16 +278,18 @@ class DynamicRouterLM(nn.Module):
         elif tuple(memory_state.shape) != expected_shape:
             raise ValueError(f"memory_state must have shape {expected_shape}")
 
-        outputs: list[Tensor] = []
-        next_memories: list[Tensor] = []
+        outputs = torch.zeros(
+            (batch_size, self.block_size, self.vocab_size), device=x.device, dtype=x.dtype
+        )
+        memories = [memory_state[:, module_id, :].clone() for module_id in range(self.max_modules)]
         records: list[RouteRecord] = []
         route_targets: list[tuple[int, list[int], int, int]] = []
         branch_paths: list[tuple[int, tuple[int, ...]]] = []
         route_lengths: list[int] = []
-        valid_samples: list[bool] = []
-        expected_lengths: list[Tensor] = []
-        terminations: list[str] = []
-        invalid_reasons: list[str | None] = []
+        valid_samples = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
+        expected_lengths = x.new_full((batch_size,), 2.0)
+        terminations = ["output"] * batch_size
+        invalid_reasons: list[str | None] = [None] * batch_size
         forward_diagnostics = {
             "max_query_abs": 0.0,
             "max_route_logits_abs": 0.0,
@@ -314,146 +314,145 @@ class DynamicRouterLM(nn.Module):
                     float(value.detach().abs().amax()),
                 )
 
-        for sample_index, sample in enumerate(x.unbind(0)):
-            q = sample.unsqueeze(0)
-            hidden_states = [memory_state[sample_index, i : i + 1].clone() for i in range(self.max_modules)]
-            output_inputs: list[Tensor] = []
-            route_length = 0
-            termination = "output"
-            invalid_reason = None
-
-            # Input is the only externally-entered module.
-            q, next_hidden = self.pool[self.input_id](q, hidden_states[self.input_id].unsqueeze(0))
-            hidden_states[self.input_id] = next_hidden.squeeze(0)
-            frontier_q = q
-            frontier_hidden = hidden_states[self.input_id]
-            frontier_modules = torch.tensor([self.input_id], device=x.device, dtype=torch.long)
-            frontier_visited = torch.zeros(
-                (1, self.max_modules), device=x.device, dtype=torch.bool
+        # Input is the only externally-entered module. All samples are processed together.
+        q, next_hidden = self.pool[self.input_id](x, memories[self.input_id].unsqueeze(0))
+        memories[self.input_id] = next_hidden.squeeze(0)
+        live_ids = torch.arange(batch_size, device=x.device)
+        frontier_q = q
+        frontier_hidden = memories[self.input_id]
+        frontier_modules = torch.full((batch_size,), self.input_id, device=x.device, dtype=torch.long)
+        frontier_visited = torch.zeros((batch_size, self.max_modules), device=x.device, dtype=torch.bool)
+        frontier_visited[:, self.input_id] = True
+        frontier_lengths = torch.zeros(batch_size, device=x.device, dtype=torch.long)
+        frontier_paths: list[tuple[int, ...]] = [(self.input_id,) for _ in range(batch_size)]
+        output_q_parts: list[Tensor] = []
+        output_ids: list[Tensor] = []
+        for depth in range(self.max_depth):
+            forward_diagnostics["max_route_depth"] = max(forward_diagnostics["max_route_depth"], depth)
+            if frontier_q.shape[0] == 0:
+                break
+            forward_diagnostics["max_frontier_count"] = max(
+                forward_diagnostics["max_frontier_count"], frontier_q.shape[0]
             )
-            frontier_visited[0, self.input_id] = True
-            frontier_lengths = torch.zeros(1, device=x.device, dtype=torch.long)
-            frontier_paths: list[tuple[int, ...]] = [(self.input_id,)]
-            for depth in range(self.max_depth):
-                forward_diagnostics["max_route_depth"] = max(
-                    forward_diagnostics["max_route_depth"], depth
+            forward_diagnostics["total_frontier_states"] += frontier_q.shape[0]
+            observe_tensor("query", frontier_q)
+            logits_batch = self._route_logits_batch(frontier_q, frontier_visited)
+            if not torch.isfinite(logits_batch).all():
+                invalid = ~torch.isfinite(logits_batch).all(dim=1)
+                for sample_id in live_ids[invalid].tolist():
+                    invalid_reasons[sample_id] = "nonfinite_logits"
+                    terminations[sample_id] = "nonfinite_logits"
+                break
+            router_probs = F.softmax(logits_batch.float() / tau, dim=-1)
+            targets = router_probs.argmax(dim=-1)
+            for row, target in enumerate(targets.tolist()):
+                source_id = int(frontier_modules[row])
+                forced = self.cooldown_slot if (
+                    source_id == self.cooldown_source
+                    and self.cooldown_slot is not None
+                    and not bool(frontier_visited[row, self.cooldown_slot])
+                ) else None
+                if forced is not None:
+                    targets[row] = forced
+            selected_probs = router_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+            routing_weights = selected_probs
+            next_groups: dict[int, list[int]] = defaultdict(list)
+            depth_records: list[RouteRecord] = []
+            for row, target in enumerate(targets.tolist()):
+                source_id = int(frontier_modules[row])
+                next_groups[target].append(row)
+                record_logits = logits_batch[row : row + 1]
+                record = RouteRecord(source_id, record_logits, int(live_ids[row]), depth, int(frontier_lengths[row]))
+                depth_records.append(record)
+                records.append(record)
+                route_targets.append((source_id, [target], int(live_ids[row]), depth))
+                observe_tensor("route_logits", record_logits)
+                path = (*frontier_paths[row], target)
+                length = int(frontier_lengths[row]) + 1
+                if target == self.output_id:
+                    output_q_parts.append(frontier_q[row : row + 1] * routing_weights[row].view(1, 1, 1))
+                    output_ids.append(live_ids[row : row + 1])
+                    sample_id = int(live_ids[row])
+                    valid_samples[sample_id] = True
+                    route_lengths.append(length)
+                    branch_paths.append((sample_id, path))
+                else:
+                    frontier_paths[row] = path
+            if logits_batch.requires_grad:
+                def capture_gradient(gradient: Tensor, depth_records: list[RouteRecord] = depth_records) -> Tensor:
+                    for row, record in enumerate(depth_records):
+                        row_gradient = gradient[row].detach()
+                        record.gradient = row_gradient
+                        record.gradient_norm = float(row_gradient.float().norm().cpu())
+                    return gradient
+                logits_batch.register_hook(capture_gradient)
+            next_q_parts: list[Tensor] = []
+            next_h_parts: list[Tensor] = []
+            next_modules: list[int] = []
+            next_visited_parts: list[Tensor] = []
+            next_lengths: list[int] = []
+            next_ids: list[int] = []
+            for target, rows in next_groups.items():
+                rows_tensor = torch.tensor(rows, device=x.device, dtype=torch.long)
+                non_output = target != self.output_id
+                if not non_output:
+                    continue
+                target_q, target_h = self.pool[target](
+                    torch.cat([frontier_q[row : row + 1] * routing_weights[row].view(1, 1, 1) for row in rows], dim=0),
+                    frontier_hidden[rows_tensor].unsqueeze(0),
                 )
-                if frontier_q.shape[0] == 0:
-                    break
-                forward_diagnostics["max_frontier_count"] = max(
-                    forward_diagnostics["max_frontier_count"], frontier_q.shape[0]
-                )
-                forward_diagnostics["total_frontier_states"] += frontier_q.shape[0]
-                observe_tensor("query", frontier_q)
-                logits_batch = self._route_logits_batch(frontier_q, frontier_visited)
-                if not torch.isfinite(logits_batch).all():
-                    invalid_reason = "nonfinite_logits"
-                    termination = invalid_reason
-                    break
-                next_groups: dict[int, list[tuple[int, Tensor, Tensor, tuple[int, ...], int]]] = defaultdict(list)
-                next_q_parts: list[Tensor] = []
-                next_h_parts: list[Tensor] = []
-                next_modules: list[int] = []
-                next_visited_parts: list[Tensor] = []
-                next_lengths: list[int] = []
-                for branch_index in range(frontier_q.shape[0]):
-                    logits = logits_batch[branch_index : branch_index + 1]
-                    source_id = int(frontier_modules[branch_index])
-                    path_length = int(frontier_lengths[branch_index])
-                    record = RouteRecord(source_id, logits, sample_index, depth, path_length)
-                    if logits.requires_grad:
-                        def capture_gradient(gradient: Tensor, record: RouteRecord = record) -> Tensor:
-                            record.gradient_norm = float(gradient.detach().float().norm().cpu())
-                            return gradient
-                        logits.register_hook(capture_gradient)
-                    records.append(record)
-                    observe_tensor("route_logits", logits)
-                    legal = torch.where(logits[0] > torch.finfo(logits.dtype).min / 2)[0].tolist()
-                    if not legal:
-                        invalid_reason = "no_legal_candidate"
-                        termination = invalid_reason
-                        continue
-                    ranked = torch.topk(logits[0], k=min(top_k, len(legal))).indices.tolist()
-                    ranked = [target for target in ranked if target in legal]
-                    forced = self.cooldown_slot if source_id == self.cooldown_source else None
-                    if forced is not None and forced in legal:
-                        ranked = [forced] + [target for target in ranked if target != forced]
-                    targets = ranked[:top_k]
-                    route_targets.append((source_id, targets, sample_index, depth))
-                    target_tensor = torch.tensor(targets, device=x.device, dtype=torch.long)
-                    topk_probs = (logits[:, target_tensor].float() / tau).softmax(dim=-1)
-                    for target_index, target in enumerate(targets):
-                        gate = 1.0 + topk_probs[:, target_index] - topk_probs[:, target_index].detach()
-                        gated_q = frontier_q[branch_index : branch_index + 1] * gate.view(1, 1, 1)
-                        if target == self.output_id:
-                            output_inputs.append(gated_q)
-                            completed_length = path_length + 1
-                            route_length = max(route_length, completed_length)
-                            branch_paths.append((sample_index, (*frontier_paths[branch_index], target)))
-                        else:
-                            next_visited = frontier_visited[branch_index].clone()
-                            next_visited[target] = True
-                            next_groups[target].append(
-                                (branch_index, gated_q, frontier_hidden[branch_index : branch_index + 1],
-                                 (*frontier_paths[branch_index], target), path_length + 1)
-                            )
-                if not next_groups:
-                    break
-                for target, group in next_groups.items():
-                    q_mean = torch.cat([item[1] for item in group], dim=0).mean(dim=0, keepdim=True)
-                    h_mean = torch.cat([item[2] for item in group], dim=0).mean(
-                        dim=0, keepdim=True
-                    ).unsqueeze(0)
-                    target_q, target_h = self.pool[target](q_mean, h_mean)
-                    observe_tensor("candidate_output", target_q)
-                    observe_tensor("memory", target_h)
-                    for _, _, _, path, length in group:
-                        next_q_parts.append(target_q)
-                        next_h_parts.append(target_h.squeeze(0))
-                        next_modules.append(target)
-                        next_visited = torch.zeros(self.max_modules, device=x.device, dtype=torch.bool)
-                        next_visited[list(path)] = True
-                        next_visited_parts.append(next_visited)
-                        next_lengths.append(length)
-                        frontier_paths_next = path
-                frontier_q = torch.cat(next_q_parts, dim=0)
-                frontier_hidden = torch.cat(next_h_parts, dim=0)
-                frontier_modules = torch.tensor(next_modules, device=x.device, dtype=torch.long)
-                frontier_visited = torch.stack(next_visited_parts)
-                frontier_lengths = torch.tensor(next_lengths, device=x.device, dtype=torch.long)
-                frontier_paths = [item[3] for group in next_groups.values() for item in group]
-            if output_inputs:
-                output_input = torch.stack(output_inputs).mean(dim=0)
-                output_hidden = hidden_states[self.output_id]
-                output_q, output_hidden_next = self.pool[self.output_id](
-                    output_input, output_hidden.unsqueeze(0)
-                )
-                hidden_states[self.output_id] = output_hidden_next.squeeze(0)
-                outputs.append(self.head(output_q))
-                valid_samples.append(True)
-            else:
-                outputs.append(torch.zeros_like(self.head(q)))
-                valid_samples.append(False)
-                if invalid_reason is None:
-                    invalid_reason = "no_valid_path"
-            next_memories.append(torch.cat(hidden_states, dim=0))
-            observe_tensor("memory", next_memories[-1])
-            route_lengths.append(route_length)
-            expected_lengths.append(q.new_tensor(2.0))
-            terminations.append(termination)
-            invalid_reasons.append(invalid_reason)
+                observe_tensor("candidate_output", target_q)
+                observe_tensor("memory", target_h)
+                memories[target] = memories[target].index_copy(0, live_ids[rows_tensor], target_h.squeeze(0))
+                for index, row in enumerate(rows):
+                    next_q_parts.append(target_q[index : index + 1])
+                    next_h_parts.append(target_h[:, index, :])
+                    next_modules.append(target)
+                    visited = frontier_visited[row].clone()
+                    visited[target] = True
+                    next_visited_parts.append(visited)
+                    next_lengths.append(int(frontier_lengths[row]) + 1)
+                    next_ids.append(int(live_ids[row]))
+            frontier_q = torch.cat(next_q_parts, dim=0) if next_q_parts else frontier_q[:0]
+            frontier_hidden = torch.cat(next_h_parts, dim=0) if next_h_parts else frontier_hidden[:0]
+            frontier_modules = torch.tensor(next_modules, device=x.device, dtype=torch.long)
+            frontier_visited = torch.stack(next_visited_parts) if next_visited_parts else frontier_visited[:0]
+            frontier_lengths = torch.tensor(next_lengths, device=x.device, dtype=torch.long)
+            live_ids = torch.tensor(next_ids, device=x.device, dtype=torch.long)
+            frontier_paths = [frontier_paths[row] for target, rows in next_groups.items() if target != self.output_id for row in rows]
 
-        return torch.cat(outputs, dim=0), {
+        if output_q_parts:
+            output_ids_tensor = torch.cat(output_ids)
+            output_input = torch.cat(output_q_parts, dim=0)
+            output_hidden = memories[self.output_id][output_ids_tensor].unsqueeze(0)
+            output_q, output_hidden_next = self.pool[self.output_id](output_input, output_hidden)
+            memories[self.output_id] = memories[self.output_id].index_copy(
+                0, output_ids_tensor, output_hidden_next.squeeze(0)
+            )
+            outputs.index_copy_(0, output_ids_tensor, self.head(output_q).to(outputs.dtype))
+            observe_tensor("candidate_output", output_q)
+            observe_tensor("memory", output_hidden_next)
+        route_length_by_sample = torch.zeros(batch_size, dtype=torch.long, device=x.device)
+        for sample_id, length in zip([item[0] for item in branch_paths], route_lengths):
+            route_length_by_sample[sample_id] = length
+        route_lengths = route_length_by_sample.tolist()
+        for sample_id in range(batch_size):
+            if not valid_samples[sample_id]:
+                invalid_reasons[sample_id] = invalid_reasons[sample_id] or "no_valid_path"
+        next_memories = torch.stack(memories, dim=1)
+        observe_tensor("memory", next_memories)
+
+        return outputs, {
             "route_records": records,
             "route_targets": route_targets,
             "branch_paths": branch_paths,
-            "expected_length_per_sample": torch.stack(expected_lengths),
-            "expected_length": torch.stack(expected_lengths).mean(),
+            "expected_length_per_sample": expected_lengths,
+            "expected_length": expected_lengths.mean(),
             "route_lengths": torch.tensor(route_lengths, device=x.device),
-            "valid_sample_mask": torch.tensor(valid_samples, dtype=torch.bool, device=x.device),
+            "valid_sample_mask": valid_samples,
             "terminations": terminations,
             "invalid_reasons": invalid_reasons,
-            "memory_state": torch.stack(next_memories),
+            "memory_state": next_memories,
             "forward_diagnostics": forward_diagnostics,
         }
 
