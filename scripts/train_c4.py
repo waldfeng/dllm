@@ -13,8 +13,16 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
-from dynamic_router import DynamicRouterLM, GrowthController, MiddleModuleUtilization, train_step
+from dynamic_router import (
+    DynamicRouterLM,
+    GrowthController,
+    MiddleModuleUtilization,
+    route_gradient_diagnostics,
+    train_step,
+)
 
 
 class RollingLog:
@@ -120,10 +128,14 @@ def sequential_batches(
     limit: int,
     start_sample: int = 0,
     start_block: int = 0,
+    rank: int = 0,
+    world_size: int = 1,
 ):
     sample_count = len(sample_offsets) - 1
     emitted = 0
-    for batch_start in range(start_sample, sample_count, batch_size):
+    for batch_start in range(
+        start_sample + rank * batch_size, sample_count, batch_size * world_size
+    ):
         lengths = [
             int(sample_offsets[index + 1] - sample_offsets[index])
             for index in range(batch_start, min(batch_start + batch_size, sample_count))
@@ -183,7 +195,7 @@ def count_epoch_steps(sample_offsets: np.ndarray, batch_size: int, block_size: i
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset-dir", default="datasets/c4_2b")
+    parser.add_argument("--dataset-dir", default="datasets/c4_qwen2.5")
     parser.add_argument("--steps", type=int, default=0, help="steps per epoch; 0 means all pairs")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -195,21 +207,39 @@ def main() -> None:
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--vocab-size", type=int, default=151665)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--distributed", action="store_true",
+        help="use torchrun multi-GPU training; batch-size is per GPU",
+    )
+    parser.add_argument(
+        "--reset-data-cursor", action="store_true",
+        help="resume weights/optimizer but start at the beginning of this dataset",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument(
         "--warmup-steps", type=int, default=0,
-        help="0 means 5% of total steps capped at 10000 steps",
+        help="0 means five percent of total steps capped at 10000 steps",
     )
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
-    parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument(
-        "--log-file", default=None,
+        "--checkpoint",
+        default="datasets/checkpoints/qwen10b-epoch1-b8-c32-top1-batched-w1e-4.pt",
+        help="checkpoint output path; defaults to datasets/checkpoints",
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        default="datasets/checkpoints/qwen10b-epoch1-b8-c32-top1-batched-w1e-4.pt",
+        help="checkpoint to resume from; pass an explicit path to override",
+    )
+    parser.add_argument(
+        "--log-file",
+        default="datasets/logs/qwen10b-epoch1-b8-c32-top1-batched-w1e-4.log",
         help="write only the newest 1000 output lines to this file",
     )
     parser.add_argument(
-        "--nan-log-file", default=None,
+        "--nan-log-file",
+        default="datasets/logs/qwen10b-epoch1-b8-c32-top1-batched-w1e-4-nan.log",
         help="write the newest 1000 NaN/Inf diagnostic lines to this file",
     )
     parser.add_argument(
@@ -217,7 +247,17 @@ def main() -> None:
         help="overwrite the single checkpoint at this wall-clock interval; 0 disables periodic saves",
     )
     args = parser.parse_args()
-    if args.log_file:
+    distributed = args.distributed or int(os.environ.get("WORLD_SIZE", "1")) > 1
+    rank = int(os.environ.get("RANK", "0")) if distributed else 0
+    local_rank = int(os.environ.get("LOCAL_RANK", "0")) if distributed else 0
+    world_size = int(os.environ.get("WORLD_SIZE", "1")) if distributed else 1
+    if distributed:
+        if world_size < 2:
+            raise ValueError("--distributed requires torchrun with at least two processes")
+        torch.cuda.set_device(local_rank)
+        args.device = f"cuda:{local_rank}"
+        dist.init_process_group(backend="nccl")
+    if args.log_file and rank == 0:
         nan_path = (
             Path(args.nan_log_file)
             if args.nan_log_file
@@ -290,6 +330,8 @@ def main() -> None:
     )
     controller = GrowthController(cooldown=args.cooldown)
     middle_utilization = MiddleModuleUtilization(window_size=1000)
+    previous_route_gradient: dict[int, float] = {}
+    previous_route_velocity: dict[int, float] = {}
     memory = None
     start_step = 0
     resume_cursor = None
@@ -312,9 +354,9 @@ def main() -> None:
                     controller.cooldown_source, controller.cooldown_slot
                 )
         memory = checkpoint.get("memory_state")
-        start_step = int(checkpoint.get("step", 0))
+        start_step = 0 if args.reset_data_cursor else int(checkpoint.get("step", 0))
         global_step = start_step
-        resume_cursor = checkpoint.get("data_cursor")
+        resume_cursor = None if args.reset_data_cursor else checkpoint.get("data_cursor")
         saved_config = checkpoint.get("model_config", {})
         batch_size_changed = saved_config.get("batch_size", args.batch_size) != args.batch_size
         for key, value in {
@@ -325,7 +367,6 @@ def main() -> None:
             "n_heads": args.n_heads,
             "max_depth": args.max_depth,
             "epochs": args.epochs,
-            "warmup_steps": args.warmup_steps,
         }.items():
             if saved_config.get(key, value) != value:
                 raise ValueError(f"checkpoint {key} does not match current configuration")
@@ -334,12 +375,20 @@ def main() -> None:
             memory = None
         elif memory is not None:
             memory = memory.to(args.device)
+    if distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            broadcast_buffers=True,
+            find_unused_parameters=True,
+        )
+    base_model = model.module if distributed else model
     def save_checkpoint(step: int) -> None:
-        if not args.checkpoint:
+        if not args.checkpoint or rank != 0:
             return
         checkpoint = {
             "step": step,
-            "model": model.state_dict(),
+            "model": base_model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "memory_state": memory,
             "metadata": metadata,
@@ -376,7 +425,10 @@ def main() -> None:
     cursor_seen = False
     has_cursor = resume_cursor is not None
     if resume_cursor is not None and resume_cursor.get("completed", False):
-        print("checkpoint is already complete", file=log_stream)
+        if rank == 0:
+            print("checkpoint is already complete", file=log_stream)
+        if distributed:
+            dist.destroy_process_group()
         return
     pairs_per_epoch = count_epoch_steps(sample_offsets, args.batch_size, 8)
     if pairs_per_epoch <= 0:
@@ -392,6 +444,8 @@ def main() -> None:
                 epoch_limit,
                 int(resume_cursor.get("sample_index", 0)) if resume_cursor and epoch == 0 else 0,
                 int(resume_cursor.get("block_index", 0)) if resume_cursor and epoch == 0 else 0,
+                rank,
+                world_size,
             ), 1
         ):
             if not has_cursor and step <= start_step and epoch == 0:
@@ -436,21 +490,90 @@ def main() -> None:
                     optimizer,
                     x.to(args.device),
                     y.to(args.device),
-                    controller,
+                    controller if (not distributed or rank == 0) else None,
                     length_weight=args.length_weight,
                     memory_state=memory,
                     target_mask=target_mask,
                     sample_mask=active_mask,
                 )
+            if distributed:
+                # All ranks must execute the same growth decision. Rank 0
+                # owns the controller; broadcast the decision and the full
+                # model state only when a new slot is activated.
+                growth_signal = torch.tensor(
+                    [metrics.get("new_slot", -1) if rank == 0 else -1],
+                    device=args.device, dtype=torch.int64,
+                )
+                dist.broadcast(growth_signal, src=0)
+                new_slot = int(growth_signal.item())
+                if new_slot >= 0:
+                    for parameter in base_model.parameters():
+                        dist.broadcast(parameter.data, src=0)
+                    for buffer in base_model.buffers():
+                        dist.broadcast(buffer, src=0)
+                    metrics["new_slot"] = new_slot
             memory = metrics.pop("memory_state")
             middle_route_counts = metrics.pop("middle_route_counts", {})
-            excluded = torch.zeros_like(model.active)
-            excluded[model.input_id] = True
-            excluded[model.output_id] = True
+            # Batch-level status lists are useful for model logic but too large
+            # to serialize in every training record.
+            metrics.pop("terminations", None)
+            metrics.pop("invalid_reasons", None)
+            route_stats = route_gradient_diagnostics(
+                metrics.pop("route_records", []),
+                metrics.pop("route_lengths", None),
+                previous_route_gradient,
+                previous_route_velocity,
+            )
+            if distributed:
+                stats = torch.tensor(
+                    [
+                        route_stats["route_gradient_norm_sum"],
+                        route_stats["route_gradient_norm_count"],
+                        route_stats["route_gradient_norm_max"],
+                        route_stats["route_velocity_sum"],
+                        route_stats["route_velocity_count"],
+                        route_stats["route_velocity_min"],
+                        route_stats["route_velocity_max"],
+                        route_stats["route_observed_sources"],
+                    ], device=args.device, dtype=torch.float64,
+                )
+                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                extrema = torch.tensor(
+                    [route_stats["route_gradient_norm_max"], route_stats["route_velocity_min"], route_stats["route_velocity_max"]],
+                    device=args.device, dtype=torch.float64,
+                )
+                dist.all_reduce(extrema[0:1], op=dist.ReduceOp.MAX)
+                dist.all_reduce(extrema[1:2], op=dist.ReduceOp.MIN)
+                dist.all_reduce(extrema[2:3], op=dist.ReduceOp.MAX)
+                route_stats = {
+                    "route_gradient_norm_sum": float(stats[0]),
+                    "route_gradient_norm_count": int(stats[1]),
+                    "route_gradient_norm_max": float(extrema[0]),
+                    "route_velocity_sum": float(stats[3]),
+                    "route_velocity_count": int(stats[4]),
+                    "route_velocity_min": float(extrema[1]),
+                    "route_velocity_max": float(extrema[2]),
+                    "route_observed_sources": int(stats[7]),
+                }
+            gradient_count = max(1, route_stats["route_gradient_norm_count"])
+            velocity_count = max(1, route_stats["route_velocity_count"])
+            metrics.update(
+                {
+                    "route_gradient_norm_mean": route_stats["route_gradient_norm_sum"] / gradient_count,
+                    "route_gradient_norm_max": route_stats["route_gradient_norm_max"],
+                    "route_velocity_min": route_stats["route_velocity_min"],
+                    "route_velocity_median": route_stats["route_velocity_sum"] / velocity_count,
+                    "route_velocity_max": route_stats["route_velocity_max"],
+                    "route_observed_sources": route_stats["route_observed_sources"],
+                }
+            )
+            excluded = torch.zeros_like(base_model.active)
+            excluded[base_model.input_id] = True
+            excluded[base_model.output_id] = True
             metrics.update(
                 middle_utilization.update(
                     middle_route_counts,
-                    model.active & ~excluded,
+                    base_model.active & ~excluded,
                 )
             )
             if memory is not None and not metrics.get("skipped_update"):
@@ -459,19 +582,19 @@ def main() -> None:
                 memory = None
             global_step += 1
             metrics["lr"] = args.lr * lr_scale
-            metrics["active_modules"] = model.active_count
-            print(epoch, step, metrics, file=log_stream)
+            metrics["active_modules"] = base_model.active_count
+            if rank == 0:
+                print(epoch, step, metrics, file=log_stream)
             if metrics.get("skipped_update"):
                 exception = (
                     f"epoch={epoch}\n"
                     f"step={step}\n"
-                    f"active_modules={model.active_count}\n"
-                    f"terminations={metrics['terminations']}\n"
-                    f"invalid_reasons={metrics['invalid_reasons']}\n"
+                    f"active_modules={base_model.active_count}\n"
+                    f"skipped_update={metrics.get('skipped_update')}\n"
                     f"diagnostics={metrics.get('diagnostics', {})}\n"
                     "skipped_update=true\n"
                 )
-                if isinstance(log_stream, DualRollingLog):
+                if rank == 0 and isinstance(log_stream, DualRollingLog):
                     log_stream.write_exception(exception)
             if (
                 args.checkpoint
@@ -483,7 +606,10 @@ def main() -> None:
     if resume_cursor is not None and not resume_cursor.get("completed", False) and not cursor_seen:
         raise ValueError("checkpoint data cursor does not exist in the current dataset")
     save_checkpoint(global_step)
-    print("dataset", metadata, file=log_stream)
+    if rank == 0:
+        print("dataset", metadata, file=log_stream)
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

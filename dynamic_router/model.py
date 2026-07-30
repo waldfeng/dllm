@@ -379,7 +379,9 @@ class DynamicRouterLM(nn.Module):
                 else:
                     frontier_paths[row] = path
             if logits_batch.requires_grad:
-                def capture_gradient(gradient: Tensor, depth_records: list[RouteRecord] = depth_records) -> Tensor:
+                def capture_gradient(gradient: Tensor | None, depth_records: list[RouteRecord] = depth_records) -> Tensor | None:
+                    if gradient is None:
+                        return None
                     for row, record in enumerate(depth_records):
                         row_gradient = gradient[row].detach()
                         record.gradient = row_gradient

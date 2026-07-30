@@ -35,7 +35,7 @@ def main() -> None:
         "--tokenizer", default="Qwen/Qwen2.5-0.5B-Instruct",
         help="Hugging Face tokenizer identifier",
     )
-    parser.add_argument("--dataset-dir", default="datasets/c4_2b")
+    parser.add_argument("--dataset-dir", default="datasets/c4_qwen2.5")
     parser.add_argument("--cache-dir", default="datasets/.hf-mirror")
     parser.add_argument("--chunk-tokens", type=int, default=4_000_000)
     parser.add_argument(

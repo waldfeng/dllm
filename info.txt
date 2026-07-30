@@ -72,11 +72,11 @@ GrowthController 观察 route logits 梯度的连续归一化差分，作为二�
 六、C4 与 checkpoint
 --------------------
 
-C4 数据脚本输出 uint32 token shard、`samples.offsets`、metadata.json 和 progress.json，并校验 metadata.tokens 等于实际 shard token 数。`samples.offsets` 是 uint64 mmap 文件，保存每个文本样本的起止 token offset，训练据此禁止跨文本边界。当前 datasets/c4_2b 已验证为 1,191,536,181 tokens，但它是旧格式，必须重新准备才能进行新的 Qwen/offsets 训练。
+C4 数据脚本输出 uint32 token shard、`samples.offsets`、metadata.json 和 progress.json，并校验 metadata.tokens 等于实际 shard token 数。`samples.offsets` 是 uint64 mmap 文件，保存每个文本样本的起止 token offset，训练据此禁止跨文本边界。当前训练数据位于 `datasets/c4_qwen2.5`，使用 Qwen tokenizer 和 offsets 格式。
 
 训练按样本内 block 顺序执行。样本 `[x0...x99]` 被补齐为 13 个 8-token block，产生 12 个训练步骤：`[x0...x7] -> [x8...x15]`，然后 `[x8...x15] -> [x16...x23]`，依次推进。每一步输出 `[B, 8, vocab_size]`，八个 logits 分别对齐下一个 block 的八个目标位置；最后 target block 的 padding 位置不计入 loss。样本结束后对应 batch lane 的 GRU state 清零。
 
-train_c4.py 是 smoke trainer，支持 GPU、GRU hidden state、GrowthController 和 checkpoint。checkpoint 使用同目录唯一临时文件原子替换，并保存模型、optimizer、controller、hidden state、data cursor、metadata 和模型配置。resume 会校验模型配置和 batch size，并使用 data cursor 恢复 shard/batch 位置。
+train_c4.py 是 smoke trainer，支持 GPU、GRU hidden state、GrowthController 和 checkpoint。默认从 `datasets/checkpoints/qwen10b-epoch1-b8-c32-top1-batched-w1e-4.pt` 恢复，并将 checkpoint 写回 `datasets/checkpoints/`；日志和 NaN/Inf 诊断默认写入 `datasets/logs/`。checkpoint 使用同目录唯一临时文件原子替换，并保存模型、optimizer、controller、hidden state、data cursor、metadata 和模型配置。resume 会校验模型配置和 batch size，并使用 data cursor 恢复 shard/batch 位置。
 
 训练是 truncation length 1 的 truncated BPTT：下一个 block 使用上一个 block 的 detached hidden state 数值，但梯度不会跨 block 反传。eval/inference 使用确定性的 argmax 路由，并且只执行 hard-selected 模块；训练模式才使用 Gumbel-Softmax 和全部合法候选。
 

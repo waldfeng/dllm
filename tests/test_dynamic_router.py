@@ -324,6 +324,14 @@ def test_training_cli_exposes_route_controls():
     assert "top_k" not in source
 
 
+def test_training_cli_uses_dataset_checkpoint_and_log_directories():
+    source = Path("scripts/train_c4.py").read_text()
+    assert 'default="datasets/c4_qwen2.5"' in source
+    assert 'default="datasets/checkpoints/qwen10b-epoch1-b8-c32-top1-batched-w1e-4.pt"' in source
+    assert 'default="datasets/logs/qwen10b-epoch1-b8-c32-top1-batched-w1e-4.log"' in source
+    assert 'default="datasets/logs/qwen10b-epoch1-b8-c32-top1-batched-w1e-4-nan.log"' in source
+
+
 def test_resume_allows_batch_size_change_and_resets_memory():
     source = Path("scripts/train_c4.py").read_text()
     assert 'batch_size_changed = saved_config.get("batch_size", args.batch_size) != args.batch_size' in source
@@ -331,15 +339,12 @@ def test_resume_allows_batch_size_change_and_resets_memory():
     assert "memory = None" in source
 
 
-def test_growth_ema_window_tracks_active_module_count():
+def test_growth_ema_window_is_fixed_at_eight():
     model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=8, n_heads=4)
     controller = GrowthController(gradient_window=48, cooldown=32)
     controller.observe_and_maybe_grow(model, [])
-    assert controller.gradient_window == model.active_count * 3
-    assert controller.gradient_beta == 1.0 - 1.0 / (model.active_count * 3)
     model.activate_next()
     controller.observe_and_maybe_grow(model, [])
-    assert controller.gradient_window == model.active_count * 3
 
 
 def test_sample_pairs_are_next_blocks_with_padding_mask():
@@ -519,14 +524,12 @@ def test_growth_controller_state_round_trip():
     controller = GrowthController(gradient_window=48, cooldown=3)
     controller.remaining_cooldown = 2
     controller.previous_gradient_norm_ema[1] = 1.0
-    controller.previous_velocity_ema[1] = -0.25
-    controller.velocity_history[1].append(-0.5)
+    controller.previous_velocity_ema[1] = -0.5
     restored = GrowthController(gradient_window=48, cooldown=3)
     restored.load_state_dict(controller.state_dict())
     assert restored.remaining_cooldown == 2
     assert restored.previous_gradient_norm_ema[1] == 1.0
-    assert restored.previous_velocity_ema[1] == -0.25
-    assert list(restored.velocity_history[1]) == [-0.5]
+    assert restored.previous_velocity_ema[1] == -0.5
 
 
 def test_cooldown_reports_velocity_without_affecting_growth_state():
@@ -546,13 +549,13 @@ def test_cooldown_reports_velocity_without_affecting_growth_state():
     controller.observe_and_maybe_grow(
         model, [SimpleNamespace(source_id=0, logits=second_logits)]
     )
-    expected = -(6**0.5) / 18.0
+    expected = -(6**0.5) / 2.0 * 0.0625
     assert torch.isclose(
         torch.tensor(controller.last_diagnostics["velocity_min"]),
         torch.tensor(expected),
     )
     assert controller.previous_gradient_norm_ema == {}
-    assert controller.velocity_history == {}
+    assert controller.previous_velocity_ema == {}
 
 
 def test_velocity_ema_is_used_for_growth_signal():
@@ -560,7 +563,7 @@ def test_velocity_ema_is_used_for_growth_signal():
     assert controller.previous_velocity_ema == {}
 
 
-def test_growth_signal_uses_route_length_normalization_and_dynamic_ema():
+def test_growth_signal_uses_route_length_normalization_and_fixed_ema():
     controller = GrowthController(gradient_window=1)
     controller.previous_gradient_norm_ema[0] = 10.0
     logits = torch.zeros(1, 6, requires_grad=True)
@@ -571,23 +574,20 @@ def test_growth_signal_uses_route_length_normalization_and_dynamic_ema():
         [SimpleNamespace(source_id=0, logits=logits, sample_index=0)],
         torch.tensor([2]),
     )
-    # The normalized norm is 4 * sqrt(6) / 2 and the active-module EMA window
-    # is 9, so the smoothed velocity is blended with the previous EMA.
+    # The normalized norm is 4 * sqrt(6) / 2 and the fixed EMA window is 16.
     current = 4 * (6**0.5) / 2
-    expected = (8.0 / 9.0) * 10.0 + (1.0 / 9.0) * current - 10.0
+    expected = (15.0 / 16.0) * 10.0 + (1.0 / 16.0) * current - 10.0
     assert torch.isclose(
         torch.tensor(controller.last_diagnostics["velocity_min"]),
         torch.tensor(expected),
     )
     controller.previous_gradient_norm_ema[0] = 1.0
-    controller.previous_velocity_ema[0] = -1.0
-    controller.velocity_history[0].extend([-1.0, -1.0])
+    controller.previous_velocity_ema[0] = 0.0
     logits = torch.zeros(1, 6, requires_grad=True)
-    logits.grad = torch.ones_like(logits) * 100.0
+    logits.grad = torch.ones_like(logits) * (1.0 / (6**0.5))
     model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
     slot = controller.observe_and_maybe_grow(
         model, [SimpleNamespace(source_id=0, logits=logits)]
     )
     assert slot == 3
     assert controller.previous_gradient_norm_ema == {}
-    assert controller.previous_velocity_ema == {}

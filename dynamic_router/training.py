@@ -17,6 +17,57 @@ def _finite_gradients(model: DynamicRouterLM) -> bool:
     )
 
 
+def route_gradient_diagnostics(
+    records: list,
+    route_lengths: Tensor | None,
+    previous_ema: dict[int, float],
+    previous_velocity_ema: dict[int, float],
+    beta: float = 0.9375,
+) -> dict[str, float | int]:
+    """Return compact route-gradient and velocity statistics.
+
+    The returned values are aggregate scalars, so logging remains independent
+    of batch size. Gradient and velocity both use fixed-window EMAs of 16.
+    """
+    source_values: dict[int, list[float]] = defaultdict(list)
+    all_norms: list[float] = []
+    for record in records:
+        norm = getattr(record, "gradient_norm", None)
+        if norm is None:
+            continue
+        sample_index = getattr(record, "sample_index", 0)
+        path_length = getattr(record, "path_length", None)
+        if path_length is None and route_lengths is not None and sample_index < len(route_lengths):
+            path_length = max(1.0, float(route_lengths[sample_index]))
+        normalized = float(norm) / max(1.0, float(path_length or 1.0))
+        source_values[record.source_id].append(normalized)
+        all_norms.append(normalized)
+
+    velocities: list[float] = []
+    for source, values in source_values.items():
+        current = sum(values) / len(values)
+        previous = previous_ema.get(source)
+        ema = current if previous is None else beta * previous + (1.0 - beta) * current
+        if previous is not None:
+            velocity = ema - previous
+            old_velocity = previous_velocity_ema.get(source)
+            velocity_ema = velocity if old_velocity is None else beta * old_velocity + (1.0 - beta) * velocity
+            previous_velocity_ema[source] = velocity_ema
+            velocities.append(velocity_ema)
+        previous_ema[source] = ema
+
+    return {
+        "route_gradient_norm_sum": sum(all_norms),
+        "route_gradient_norm_count": len(all_norms),
+        "route_gradient_norm_max": max(all_norms, default=0.0),
+        "route_velocity_sum": sum(velocities),
+        "route_velocity_count": len(velocities),
+        "route_velocity_min": min(velocities, default=0.0),
+        "route_velocity_max": max(velocities, default=0.0),
+        "route_observed_sources": len(source_values),
+    }
+
+
 def _gradient_diagnostics(model: DynamicRouterLM) -> dict:
     bad = []
     largest = []
@@ -153,17 +204,13 @@ class GrowthController:
             raise ValueError("invalid growth controller configuration")
         self.gradient_window = gradient_window
         self.cooldown = cooldown
-        self.gradient_beta = 1.0 - 1.0 / gradient_window
         self.remaining_cooldown = 0
         self.cooldown_source: int | None = None
         self.cooldown_slot: int | None = None
         self.previous_gradient_norm_ema: dict[int, float] = {}
-        self.previous_velocity_ema: dict[int, float] = {}
         self.diagnostic_previous_gradient_norm_ema: dict[int, float] = {}
+        self.previous_velocity_ema: dict[int, float] = {}
         self.diagnostic_previous_velocity_ema: dict[int, float] = {}
-        self.velocity_history: dict[int, deque[float]] = defaultdict(
-            lambda: deque(maxlen=3)
-        )
         self.last_diagnostics: dict[str, float | int | None] = {}
 
     def state_dict(self) -> dict:
@@ -172,15 +219,10 @@ class GrowthController:
             "cooldown_source": self.cooldown_source,
             "cooldown_slot": self.cooldown_slot,
             "previous_gradient_norm_ema": dict(self.previous_gradient_norm_ema),
+            "diagnostic_previous_gradient_norm_ema": dict(self.diagnostic_previous_gradient_norm_ema),
+            "gradient_window": 16,
             "previous_velocity_ema": dict(self.previous_velocity_ema),
-            "diagnostic_previous_gradient_norm_ema": dict(
-                self.diagnostic_previous_gradient_norm_ema
-            ),
-            "diagnostic_previous_velocity_ema": dict(
-                self.diagnostic_previous_velocity_ema
-            ),
-            "gradient_window": self.gradient_window,
-            "velocity_history": {key: list(value) for key, value in self.velocity_history.items()},
+            "diagnostic_previous_velocity_ema": dict(self.diagnostic_previous_velocity_ema),
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -191,33 +233,22 @@ class GrowthController:
             int(key): float(value)
             for key, value in state.get("previous_gradient_norm_ema", {}).items()
         }
+        self.diagnostic_previous_gradient_norm_ema = {
+            int(key): float(value)
+            for key, value in state.get("diagnostic_previous_gradient_norm_ema", {}).items()
+        }
         self.previous_velocity_ema = {
             int(key): float(value)
             for key, value in state.get("previous_velocity_ema", {}).items()
         }
-        self.diagnostic_previous_gradient_norm_ema = {
-            int(key): float(value)
-            for key, value in state.get(
-                "diagnostic_previous_gradient_norm_ema", {}
-            ).items()
-        }
         self.diagnostic_previous_velocity_ema = {
             int(key): float(value)
-            for key, value in state.get(
-                "diagnostic_previous_velocity_ema", {}
-            ).items()
+            for key, value in state.get("diagnostic_previous_velocity_ema", {}).items()
         }
-        self.velocity_history = defaultdict(lambda: deque(maxlen=3))
-        for key, values in state.get("velocity_history", {}).items():
-            self.velocity_history[int(key)].extend(float(value) for value in values)
-        self.gradient_window = max(1, int(state.get("gradient_window", self.gradient_window)))
-        self.gradient_beta = 1.0 - 1.0 / self.gradient_window
 
     def observe_and_maybe_grow(
         self, model: DynamicRouterLM, records: list, route_lengths: Tensor | None = None
     ) -> int | None:
-        self.gradient_window = max(1, model.active_count * 3)
-        self.gradient_beta = 1.0 - 1.0 / self.gradient_window
 
         def normalized_values(record) -> float | None:
             gradient_norm = getattr(record, "gradient_norm", None)
@@ -249,20 +280,13 @@ class GrowthController:
             for source, values in current.items():
                 gradient_norm = sum(values) / len(values)
                 previous = self.diagnostic_previous_gradient_norm_ema.get(source)
-                gradient_norm_ema = gradient_norm
+                gradient_norm_ema = gradient_norm if previous is None else 0.9375 * previous + 0.0625 * gradient_norm
                 if previous is not None:
-                    gradient_norm_ema = (
-                        self.gradient_beta * previous
-                        + (1.0 - self.gradient_beta) * gradient_norm
-                    )
-                    raw_velocity = gradient_norm_ema - previous
-                    previous_velocity = self.diagnostic_previous_velocity_ema.get(source)
-                    velocity = raw_velocity if previous_velocity is None else (
-                        self.gradient_beta * previous_velocity
-                        + (1.0 - self.gradient_beta) * raw_velocity
-                    )
-                    velocities.append(velocity)
-                    self.diagnostic_previous_velocity_ema[source] = velocity
+                    velocity = gradient_norm_ema - previous
+                    old_velocity = self.diagnostic_previous_velocity_ema.get(source)
+                    velocity_ema = velocity if old_velocity is None else 0.9375 * old_velocity + 0.0625 * velocity
+                    self.diagnostic_previous_velocity_ema[source] = velocity_ema
+                    velocities.append(velocity_ema)
                 self.diagnostic_previous_gradient_norm_ema[source] = gradient_norm_ema
             sorted_velocities = sorted(velocities)
             self.last_diagnostics = {
@@ -275,8 +299,6 @@ class GrowthController:
                 ),
                 "velocity_max": max(velocities) if velocities else None,
                 "cooldown": self.remaining_cooldown,
-                "gradient_window": self.gradient_window,
-                "gradient_beta": self.gradient_beta,
                 "growth_triggered": False,
                 "diagnostic_only": True,
             }
@@ -302,25 +324,13 @@ class GrowthController:
             gradient_norm = sum(values) / len(values)
             previous = self.previous_gradient_norm_ema.get(source)
             if previous is not None:
-                gradient_norm_ema = (
-                    self.gradient_beta * previous
-                    + (1.0 - self.gradient_beta) * gradient_norm
-                )
+                gradient_norm_ema = 0.9375 * previous + 0.0625 * gradient_norm
                 velocity = gradient_norm_ema - previous
-                previous_velocity = self.previous_velocity_ema.get(source)
-                velocity_ema = velocity if previous_velocity is None else (
-                    self.gradient_beta * previous_velocity
-                    + (1.0 - self.gradient_beta) * velocity
-                )
+                old_velocity = self.previous_velocity_ema.get(source)
+                velocity_ema = velocity if old_velocity is None else 0.9375 * old_velocity + 0.0625 * velocity
                 self.previous_velocity_ema[source] = velocity_ema
-                self.velocity_history[source].append(velocity_ema)
                 velocities.append(velocity_ema)
-                if (
-                    len(self.velocity_history[source]) == 3
-                    and self.velocity_history[source][-3] < 0
-                    and self.velocity_history[source][-2] < 0
-                    and self.velocity_history[source][-1] >= 0
-                ):
+                if abs(velocity_ema) < 1e-8:
                     growth_triggered = True
                     triggered_source = source
                 self.previous_gradient_norm_ema[source] = gradient_norm_ema
@@ -339,8 +349,6 @@ class GrowthController:
             "velocity_median": median_velocity,
             "velocity_max": max(velocities) if velocities else None,
             "cooldown": 0,
-            "gradient_window": self.gradient_window,
-            "gradient_beta": self.gradient_beta,
             "growth_triggered": growth_triggered,
             "diagnostic_only": False,
         }
@@ -353,11 +361,10 @@ class GrowthController:
             self.cooldown_source = triggered_source
             self.cooldown_slot = slot
             self.remaining_cooldown = self.cooldown
-            self.velocity_history.clear()
             self.previous_gradient_norm_ema.clear()
             self.previous_velocity_ema.clear()
-            self.diagnostic_previous_gradient_norm_ema.clear()
-            self.diagnostic_previous_velocity_ema.clear()
+        self.diagnostic_previous_gradient_norm_ema.clear()
+        self.diagnostic_previous_velocity_ema.clear()
         return slot
 
 
@@ -397,6 +404,7 @@ def train_step(
     target_mask: Tensor | None = None,
     sample_mask: Tensor | None = None,
 ) -> dict[str, float | int | Tensor | list[str]]:
+    base_model = model.module if hasattr(model, "module") else model
     optimizer.zero_grad(set_to_none=True)
     if memory_state is not None:
         memory_state = memory_state.detach().clone()
@@ -428,7 +436,7 @@ def train_step(
         if not bool(effective_sample_mask[sample_index]):
             continue
         for target in targets_for_route:
-            if target != model.input_id and target != model.output_id and bool(model.active[target]):
+            if target != base_model.input_id and target != base_model.output_id and bool(base_model.active[target]):
                 middle_route_counts[target] += 1
     loss, metrics = language_model_loss(
         logits,
@@ -448,17 +456,17 @@ def train_step(
             aux, memory_state, "nonfinite_gradient", _gradient_diagnostics(model)
         )
 
-    router_snapshot = model.router.detach().clone()
+    router_snapshot = base_model.router.detach().clone()
     new_slot = (
         controller.observe_and_maybe_grow(
-            model, aux["route_records"], aux["route_lengths"]
+            base_model, aux["route_records"], aux["route_lengths"]
         )
         if controller
         else None
     )
 
-    if model.router.grad is not None:
-        model.router.grad[~model.active] = 0
+    if base_model.router.grad is not None:
+        base_model.router.grad[~base_model.active] = 0
     if grad_clip is not None:
         total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         if not torch.isfinite(total_norm):
@@ -483,18 +491,18 @@ def train_step(
     with torch.no_grad():
         # Preserve inactive route rows against AdamW decay. A newly activated
         # row is intentionally not restored and starts from its zero seed.
-        inactive_rows = ~model.active
-        model.router[inactive_rows].copy_(router_snapshot[inactive_rows])
-    _protect_inactive_optimizer_state(optimizer, model)
+        inactive_rows = ~base_model.active
+        base_model.router[inactive_rows].copy_(router_snapshot[inactive_rows])
+    _protect_inactive_optimizer_state(optimizer, base_model)
     if new_slot is not None:
         # The newly activated row must not inherit a preallocated slot's state.
-        state = optimizer.state.get(model.router)
+        state = optimizer.state.get(base_model.router)
         if state is not None:
             for value in state.values():
-                if torch.is_tensor(value) and value.ndim and value.shape[0] == model.max_modules:
+                if torch.is_tensor(value) and value.ndim and value.shape[0] == base_model.max_modules:
                     value[new_slot] = 0
 
-    model.decay_exploration()
+    base_model.decay_exploration()
     result: dict[str, float | int | Tensor | list[str]] = {
         key: float(value) for key, value in metrics.items()
     }
@@ -511,6 +519,8 @@ def train_step(
             "growth_diagnostics": controller.last_diagnostics if controller else {},
             "memory_state": aux["memory_state"].detach(),
             "middle_route_counts": dict(middle_route_counts),
+            "route_records": aux["route_records"],
+            "route_lengths": aux["route_lengths"],
         }
     )
     return result

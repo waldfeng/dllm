@@ -48,6 +48,23 @@ stable.
 
 ## Minimal use
 
+The C4 trainer reads the prepared dataset from `datasets/c4_qwen2.5` by
+default. It resumes from
+`datasets/checkpoints/qwen10b-epoch1-b8-c32-top1-batched-w1e-4.pt`, writes the
+updated checkpoint to `datasets/checkpoints/`, and writes normal and NaN/Inf
+logs to `datasets/logs/`. Override these locations with `--dataset-dir`,
+`--resume-checkpoint`, `--checkpoint`, `--log-file`, or `--nan-log-file` when
+needed.
+
+Install and run through the project virtual environment with the Tsinghua
+package index:
+
+```bash
+uv pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e .
+.venv/bin/python -m pytest
+uv run --no-sync train-c4 --device cuda
+```
+
 ```python
 import torch
 from dynamic_router import DynamicRouterLM, GrowthController, train_step

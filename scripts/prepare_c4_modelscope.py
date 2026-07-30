@@ -2,7 +2,7 @@
 
 The full C4 corpus is far larger than this workspace. This utility downloads
 only enough compressed C4 shards to produce the requested token budget, then
-writes compact uint32 token shards under ``datasets/c4_2b``.
+writes compact uint32 token shards under ``datasets/c4_qwen2.5``.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def main() -> None:
         "--tokenizer", default="Qwen/Qwen2.5-0.5B-Instruct",
         help="Hugging Face tokenizer identifier",
     )
-    parser.add_argument("--dataset-dir", default="datasets/c4_2b")
+    parser.add_argument("--dataset-dir", default="datasets/c4_qwen2.5")
     parser.add_argument("--modelscope-cache", default="datasets/.modelscope")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--source-index", type=int, default=-1)
