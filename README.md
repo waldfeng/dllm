@@ -28,8 +28,9 @@ stable.
 - Top-3 routing is hard in the forward pass and uses a softmax straight-through
   gradient for route logits. Only paths that reach output, or reach max depth and
   are then forced to output, are valid for training.
-- During cooldown, the newly activated module occupies one of the triggering source's
-  three temporary successors; the connection is removed when cooldown ends.
+- During cooldown, the newly activated module runs in parallel with the triggering
+  source on the same input; its residual output is weighted by an alpha that decays
+  linearly from one to zero, after which normal routing resumes.
 - During evaluation, the current implementation still uses the same candidate
   route semantics but uses deterministic argmax routing and evaluates only the
   selected candidate; inference is sparse over the active module graph.
@@ -44,7 +45,8 @@ stable.
   uint64 sidecar rather than a large JSON length array.
 - The differentiable route cost uses the expected survival length.
 - Growth monitors normalized time differences of route-logit gradients, a cheap
-  second-order proxy rather than a full Hessian.
+  second-order proxy rather than a full Hessian. A source must remain below the
+  configurable velocity threshold for the configured patience before growth.
 
 ## Minimal use
 

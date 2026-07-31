@@ -106,11 +106,70 @@ def test_each_branch_path_has_unique_modules_and_bounded_length():
 def test_cooldown_source_selects_new_slot():
     model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
     slot = model.activate_next()
-    model.set_cooldown_connection(0, slot)
+    model.exploration_bias[slot] = -100.0
+    model.set_cooldown_connection(0, slot, alpha=1.0)
     _, aux = model(torch.randint(0, 32, (1, 8)))
     source_targets = [targets for source, targets, _, _ in aux["route_targets"] if source == 0]
     assert source_targets
-    assert source_targets[0] == [slot]
+    assert source_targets[0] != [slot]
+    assert aux["forward_diagnostics"]["cooldown_parallel_uses"] == 1
+    assert aux["parallel_module_uses"] == [(slot, 0, 0)]
+
+
+def test_cooldown_alpha_decays_to_zero():
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    slot = model.activate_next()
+    controller = GrowthController(cooldown=3, patience=1)
+    controller.remaining_cooldown = 3
+    controller.cooldown_source = 0
+    controller.cooldown_slot = slot
+    diagnostics = []
+    for _ in range(3):
+        controller.observe_and_maybe_grow(model, [])
+        diagnostics.append(controller.last_diagnostics["cooldown_alpha"])
+    assert diagnostics == [1.0, 2 / 3, 1 / 3]
+    assert model.cooldown_alpha == 0.0
+    assert model.cooldown_source is None
+    assert model.cooldown_slot is None
+
+
+def test_middle_cooldown_branch_preserves_hard_route():
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    slot = model.activate_next()
+    original_route_logits = model._route_logits_batch
+
+    def deterministic_route_logits(q, visited):
+        logits = original_route_logits(q, visited)
+        first_hop = ~visited[:, 1]
+        logits[first_hop, 1] = 100.0
+        logits[first_hop, model.output_id] = -100.0
+        later_hop = visited[:, 1]
+        logits[later_hop, model.output_id] = 100.0
+        return logits
+
+    model._route_logits_batch = deterministic_route_logits
+    model.set_cooldown_connection(1, slot, alpha=1.0)
+    _, aux = model(torch.randint(0, 32, (1, 8)))
+    assert aux["route_targets"] == [(0, [1], 0, 0), (1, [2], 0, 1)]
+    assert aux["parallel_module_uses"] == [(slot, 0, 0)]
+    assert aux["branch_paths"] == [(0, (0, 1, 2))]
+
+
+def test_growth_requires_velocity_patience():
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, n_heads=4)
+    controller = GrowthController(cooldown=0, velocity_threshold=1e-6, patience=2)
+    gradient = torch.ones(1, 6)
+    for _ in range(2):
+        logits = torch.zeros(1, 6, requires_grad=True)
+        logits.grad = gradient
+        assert controller.observe_and_maybe_grow(
+            model, [SimpleNamespace(source_id=0, logits=logits)]
+        ) is None
+    logits = torch.zeros(1, 6, requires_grad=True)
+    logits.grad = gradient
+    assert controller.observe_and_maybe_grow(
+        model, [SimpleNamespace(source_id=0, logits=logits)]
+    ) == 3
 
 
 def test_memory_state_is_per_sample_and_persistent():
@@ -319,7 +378,8 @@ def test_training_cli_exposes_route_controls():
     assert '"--length-weight", type=float, default=1e-3' in source
     assert "length_ratio" not in source
     assert "--top-k" not in source
-    assert "controller = GrowthController(cooldown=args.cooldown)" in source
+    assert "velocity_threshold=args.velocity_threshold" in source
+    assert "patience=args.growth_patience" in source
     assert "length_weight=args.length_weight" in source
     assert "top_k" not in source
 
@@ -617,7 +677,7 @@ def test_velocity_ema_is_used_for_growth_signal():
 
 
 def test_growth_signal_uses_route_length_normalization_and_fixed_ema():
-    controller = GrowthController(gradient_window=1)
+    controller = GrowthController(gradient_window=1, patience=1)
     controller.previous_gradient_norm_ema[0] = 10.0
     logits = torch.zeros(1, 6, requires_grad=True)
     logits.grad = torch.ones_like(logits) * 4.0

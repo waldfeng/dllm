@@ -148,6 +148,7 @@ class DynamicRouterLM(nn.Module):
         self.register_buffer("bias_age", torch.zeros(max_modules, dtype=torch.long))
         self.cooldown_source: int | None = None
         self.cooldown_slot: int | None = None
+        self.cooldown_alpha = 0.0
         with torch.no_grad():
             self.active[[self.input_id, 1, self.output_id]] = True
         nn.init.xavier_uniform_(self.head.weight)
@@ -170,13 +171,19 @@ class DynamicRouterLM(nn.Module):
             self.bias_age[slot] = 0
         return slot
 
-    def set_cooldown_connection(self, source_id: int, slot: int) -> None:
+    def set_cooldown_connection(
+        self, source_id: int, slot: int, alpha: float = 1.0
+    ) -> None:
+        if not math.isfinite(float(alpha)) or not 0.0 <= float(alpha) <= 1.0:
+            raise ValueError("cooldown alpha must be finite and in [0, 1]")
         self.cooldown_source = source_id
         self.cooldown_slot = slot
+        self.cooldown_alpha = float(alpha)
 
     def clear_cooldown_connection(self) -> None:
         self.cooldown_source = None
         self.cooldown_slot = None
+        self.cooldown_alpha = 0.0
 
     def decay_exploration(self, amount: float = 0.99) -> None:
         with torch.no_grad():
@@ -285,6 +292,7 @@ class DynamicRouterLM(nn.Module):
         memories = [memory_state[:, module_id, :].clone() for module_id in range(self.max_modules)]
         records: list[RouteRecord] = []
         route_targets: list[tuple[int, list[int], int, int]] = []
+        parallel_module_uses: list[tuple[int, int, int]] = []
         branch_paths: list[tuple[int, tuple[int, ...]]] = []
         route_lengths: list[int] = []
         valid_samples = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
@@ -299,6 +307,8 @@ class DynamicRouterLM(nn.Module):
             "max_route_depth": 0,
             "max_frontier_count": 0,
             "total_frontier_states": 0,
+            "cooldown_alpha": self.cooldown_alpha,
+            "cooldown_parallel_uses": 0,
             "nonfinite_query": False,
             "nonfinite_route_logits": False,
             "nonfinite_candidate_output": False,
@@ -318,12 +328,36 @@ class DynamicRouterLM(nn.Module):
         # Input is the only externally-entered module. All samples are processed together.
         q, next_hidden = self.pool[self.input_id](x, memories[self.input_id].unsqueeze(0))
         memories[self.input_id] = next_hidden.squeeze(0)
+        input_parallel_slot = (
+            self.cooldown_slot
+            if (
+                self.cooldown_source == self.input_id
+                and self.cooldown_slot is not None
+                and self.cooldown_slot != self.input_id
+                and self.cooldown_alpha > 0.0
+            )
+            else None
+        )
+        if input_parallel_slot is not None:
+            parallel_q, parallel_hidden = self.pool[input_parallel_slot](
+                x, memories[input_parallel_slot].unsqueeze(0)
+            )
+            memories[input_parallel_slot] = parallel_hidden.squeeze(0)
+            q = q + self.cooldown_alpha * parallel_q
+            observe_tensor("candidate_output", parallel_q)
+            forward_diagnostics["cooldown_parallel_uses"] += batch_size
+            parallel_module_uses.extend(
+                (input_parallel_slot, sample_id, 0)
+                for sample_id in range(batch_size)
+            )
         live_ids = torch.arange(batch_size, device=x.device)
         frontier_q = q
         frontier_hidden = memories[self.input_id]
         frontier_modules = torch.full((batch_size,), self.input_id, device=x.device, dtype=torch.long)
         frontier_visited = torch.zeros((batch_size, self.max_modules), device=x.device, dtype=torch.bool)
         frontier_visited[:, self.input_id] = True
+        if input_parallel_slot is not None:
+            frontier_visited[:, input_parallel_slot] = True
         frontier_lengths = torch.zeros(batch_size, device=x.device, dtype=torch.long)
         frontier_paths: list[tuple[int, ...]] = [(self.input_id,) for _ in range(batch_size)]
         output_q_parts: list[Tensor] = []
@@ -373,15 +407,6 @@ class DynamicRouterLM(nn.Module):
                 logits_batch = logits_batch[finite_rows]
             router_probs = F.softmax(logits_batch.float() / tau, dim=-1)
             targets = router_probs.argmax(dim=-1)
-            for row, target in enumerate(targets.tolist()):
-                source_id = int(frontier_modules[row])
-                forced = self.cooldown_slot if (
-                    source_id == self.cooldown_source
-                    and self.cooldown_slot is not None
-                    and not bool(frontier_visited[row, self.cooldown_slot])
-                ) else None
-                if forced is not None:
-                    targets[row] = forced
             selected_probs = router_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
             # Keep hard routing in the forward pass while retaining the
             # selected-probability gradient for the router.
@@ -429,19 +454,64 @@ class DynamicRouterLM(nn.Module):
                 non_output = target != self.output_id
                 if not non_output:
                     continue
+                target_input = torch.cat(
+                    [
+                        frontier_q[row : row + 1]
+                        * routing_weights[row].view(1, 1, 1)
+                        for row in rows
+                    ],
+                    dim=0,
+                )
                 target_q, target_h = self.pool[target](
-                    torch.cat([frontier_q[row : row + 1] * routing_weights[row].view(1, 1, 1) for row in rows], dim=0),
+                    target_input,
                     frontier_hidden[rows_tensor].unsqueeze(0),
                 )
+                parallel_rows = [
+                    index
+                    for index, row in enumerate(rows)
+                    if (
+                        target == self.cooldown_source
+                        and self.cooldown_slot is not None
+                        and self.cooldown_slot != target
+                        and self.cooldown_alpha > 0.0
+                        and not bool(frontier_visited[row, self.cooldown_slot])
+                    )
+                ]
+                if parallel_rows:
+                    parallel_index = torch.tensor(
+                        parallel_rows, device=x.device, dtype=torch.long
+                    )
+                    parallel_slot = int(self.cooldown_slot)
+                    parallel_live_ids = live_ids[rows_tensor[parallel_index]]
+                    parallel_q, parallel_h = self.pool[parallel_slot](
+                        target_input[parallel_index],
+                        memories[parallel_slot][parallel_live_ids].unsqueeze(0),
+                    )
+                    mixed_q = target_q.index_select(0, parallel_index) + (
+                        self.cooldown_alpha * parallel_q
+                    )
+                    target_q = target_q.index_copy(0, parallel_index, mixed_q)
+                    memories[parallel_slot] = memories[parallel_slot].index_copy(
+                        0, parallel_live_ids, parallel_h.squeeze(0)
+                    )
+                    observe_tensor("candidate_output", parallel_q)
+                    forward_diagnostics["cooldown_parallel_uses"] += len(parallel_rows)
+                    parallel_module_uses.extend(
+                        (parallel_slot, int(live_ids[rows[row_index]]), depth)
+                        for row_index in parallel_rows
+                    )
                 observe_tensor("candidate_output", target_q)
                 observe_tensor("memory", target_h)
                 memories[target] = memories[target].index_copy(0, live_ids[rows_tensor], target_h.squeeze(0))
+                parallel_row_set = set(parallel_rows)
                 for index, row in enumerate(rows):
                     next_q_parts.append(target_q[index : index + 1])
                     next_h_parts.append(target_h[:, index, :])
                     next_modules.append(target)
                     visited = frontier_visited[row].clone()
                     visited[target] = True
+                    if index in parallel_row_set:
+                        visited[int(self.cooldown_slot)] = True
                     next_visited_parts.append(visited)
                     next_lengths.append(int(frontier_lengths[row]) + 1)
                     next_ids.append(int(live_ids[row]))
@@ -478,6 +548,7 @@ class DynamicRouterLM(nn.Module):
             "route_records": records,
             "route_hook_handles": route_hook_handles,
             "route_targets": route_targets,
+            "parallel_module_uses": parallel_module_uses,
             "branch_paths": branch_paths,
             "expected_length_per_sample": expected_lengths,
             "expected_length": expected_lengths.mean(),

@@ -41,7 +41,7 @@ GRU 的输入与 q_proj 的输入完全相同，都是原始 x。Attention 不�
 
     logits = mean(Y) @ router.T + exploration_bias
 
-未激活、input、current 和 visited 模块被 mask；output 始终合法。对合法候选使用 hard Gumbel-Softmax。所有合法 active 候选都会执行，以构造 straight-through soft mixture；前向使用 hard-selected 输出，反向通过 soft 分支训练共享 router。只有 hard-selected 候选的 GRU hidden state 写回正式 memory_state。
+未激活、input、current 和 visited 模块被 mask；output 始终合法。对合法候选使用 hard Gumbel-Softmax。所有合法 active 候选都会执行，以构造 straight-through soft mixture；前向使用 hard-selected 输出，反向通过 soft 分支训练共享 router。只有 hard-selected 候选的 GRU hidden state 写回正式 memory_state。新模块增长期间不再强制改写 source 的硬路由，而是在触发 source 的输入端并联执行；新模块输出按 cooldown alpha 以残差形式加入 source 输出，alpha 从 1 线性衰减到 0。
 
 四、跨 block hidden state
 ------------------------
@@ -65,7 +65,7 @@ Input 模块每个 block 都会执行并提交自己的 state。路由候选的 
 
 `route_lengths` 统计 hard 路径的路由决策次数，包括跳转到 output。`expected_length` 是沿实际 hard sampled path 累积的 soft survival cost，不是完全展开全部可能路由树的全局期望。
 
-GrowthController 观察 route logits 梯度的连续归一化差分，作为二阶信号的低成本代理。满足 patience 和 threshold 条件时激活新槽位。source 只用于梯度统计，不代表固定物理边。
+GrowthController 观察 route logits 梯度的连续归一化差分，作为二阶信号的低成本代理。source 的 velocity 连续低于可配置 threshold 达到 patience 后才激活新槽位。source 只用于梯度统计，不代表固定物理边。
 
 未激活模块参数的梯度和 AdamW 状态受到保护；激活槽位会重新初始化，router 行置零，探索偏置设置为初始值，相关 optimizer state 清零。
 

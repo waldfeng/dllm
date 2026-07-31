@@ -223,6 +223,8 @@ def main() -> None:
     parser.add_argument("--max-modules", type=int, default=1024)
     parser.add_argument("--max-depth", type=int, default=128)
     parser.add_argument("--cooldown", type=int, default=32)
+    parser.add_argument("--velocity-threshold", type=float, default=1e-6)
+    parser.add_argument("--growth-patience", type=int, default=8)
     parser.add_argument("--length-weight", type=float, default=1e-3)
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--vocab-size", type=int, default=151665)
@@ -310,10 +312,13 @@ def main() -> None:
         or args.warmup_steps < 0
         or args.max_depth <= 0
         or args.cooldown < 0
+        or args.velocity_threshold <= 0
+        or args.growth_patience <= 0
         or args.length_weight < 0
     ):
         raise ValueError(
-            "epochs, steps, warmup_steps, max_depth, cooldown, and length_weight "
+            "epochs, steps, warmup_steps, max_depth, cooldown, velocity_threshold, "
+            "growth_patience, and length_weight "
             "must be non-negative/positive"
         )
     if not 0 < args.min_lr_ratio <= 1:
@@ -366,7 +371,11 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1
     )
-    controller = GrowthController(cooldown=args.cooldown)
+    controller = GrowthController(
+        cooldown=args.cooldown,
+        velocity_threshold=args.velocity_threshold,
+        patience=args.growth_patience,
+    )
     middle_utilization = MiddleModuleUtilization(window_size=1000)
     previous_route_gradient: dict[int, float] = {}
     previous_route_velocity: dict[int, float] = {}
@@ -392,7 +401,9 @@ def main() -> None:
         if controller.remaining_cooldown:
             if controller.cooldown_source is not None and controller.cooldown_slot is not None:
                 model.set_cooldown_connection(
-                    controller.cooldown_source, controller.cooldown_slot
+                    controller.cooldown_source,
+                    controller.cooldown_slot,
+                    controller.cooldown_alpha,
                 )
         memory = checkpoint.get("memory_state")
         start_step = 0 if args.reset_data_cursor else int(checkpoint.get("step", 0))
@@ -412,6 +423,9 @@ def main() -> None:
             "n_heads": args.n_heads,
             "max_depth": args.max_depth,
             "epochs": args.epochs,
+            "cooldown": args.cooldown,
+            "velocity_threshold": args.velocity_threshold,
+            "growth_patience": args.growth_patience,
         }.items():
             if saved_config.get(key, value) != value:
                 raise ValueError(f"checkpoint {key} does not match current configuration")
@@ -468,6 +482,8 @@ def main() -> None:
                 "warmup_steps": args.warmup_steps,
                 "length_weight": args.length_weight,
                 "cooldown": args.cooldown,
+                "velocity_threshold": args.velocity_threshold,
+                "growth_patience": args.growth_patience,
             },
         }
         target = Path(args.checkpoint)
@@ -656,10 +672,18 @@ def main() -> None:
                     dtype=torch.int64,
                 )
                 dist.broadcast(cooldown_signal, src=0)
+                cooldown_alpha_signal = torch.tensor(
+                    [base_model.cooldown_alpha if rank == 0 else 0.0],
+                    device=args.device,
+                    dtype=torch.float32,
+                )
+                dist.broadcast(cooldown_alpha_signal, src=0)
                 if rank != 0:
                     if int(cooldown_signal[1]) >= 0 and int(cooldown_signal[2]) >= 0:
                         base_model.set_cooldown_connection(
-                            int(cooldown_signal[1]), int(cooldown_signal[2])
+                            int(cooldown_signal[1]),
+                            int(cooldown_signal[2]),
+                            float(cooldown_alpha_signal.item()),
                         )
                     else:
                         base_model.clear_cooldown_connection()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict, deque
 
 import torch
@@ -207,14 +208,25 @@ class GrowthController:
         self,
         gradient_window: int = 48,
         cooldown: int = 100,
+        velocity_threshold: float = 1e-6,
+        patience: int = 8,
     ) -> None:
-        if gradient_window <= 0 or cooldown < 0:
+        if (
+            gradient_window <= 0
+            or cooldown < 0
+            or not math.isfinite(float(velocity_threshold))
+            or velocity_threshold <= 0
+            or patience <= 0
+        ):
             raise ValueError("invalid growth controller configuration")
         self.gradient_window = gradient_window
         self.cooldown = cooldown
+        self.velocity_threshold = float(velocity_threshold)
+        self.patience = int(patience)
         self.remaining_cooldown = 0
         self.cooldown_source: int | None = None
         self.cooldown_slot: int | None = None
+        self.stagnant_steps: dict[int, int] = {}
         self.previous_gradient_norm_ema: dict[int, float] = {}
         self.diagnostic_previous_gradient_norm_ema: dict[int, float] = {}
         self.previous_velocity_ema: dict[int, float] = {}
@@ -226,6 +238,10 @@ class GrowthController:
             "remaining_cooldown": self.remaining_cooldown,
             "cooldown_source": self.cooldown_source,
             "cooldown_slot": self.cooldown_slot,
+            "cooldown": self.cooldown,
+            "velocity_threshold": self.velocity_threshold,
+            "patience": self.patience,
+            "stagnant_steps": dict(self.stagnant_steps),
             "previous_gradient_norm_ema": dict(self.previous_gradient_norm_ema),
             "diagnostic_previous_gradient_norm_ema": dict(self.diagnostic_previous_gradient_norm_ema),
             "gradient_window": 16,
@@ -237,6 +253,14 @@ class GrowthController:
         self.remaining_cooldown = int(state.get("remaining_cooldown", 0))
         self.cooldown_source = state.get("cooldown_source")
         self.cooldown_slot = state.get("cooldown_slot")
+        self.velocity_threshold = float(
+            state.get("velocity_threshold", self.velocity_threshold)
+        )
+        self.patience = int(state.get("patience", self.patience))
+        self.stagnant_steps = {
+            int(key): int(value)
+            for key, value in state.get("stagnant_steps", {}).items()
+        }
         self.previous_gradient_norm_ema = {
             int(key): float(value)
             for key, value in state.get("previous_gradient_norm_ema", {}).items()
@@ -254,10 +278,21 @@ class GrowthController:
             for key, value in state.get("diagnostic_previous_velocity_ema", {}).items()
         }
 
+    @property
+    def cooldown_alpha(self) -> float:
+        if self.remaining_cooldown <= 0 or self.cooldown <= 0:
+            return 0.0
+        return min(1.0, self.remaining_cooldown / self.cooldown)
+
     def _observe_current(self, model: DynamicRouterLM, current: dict[int, float]) -> int | None:
         if self.remaining_cooldown:
             if self.cooldown_source is not None and self.cooldown_slot is not None:
-                model.set_cooldown_connection(self.cooldown_source, self.cooldown_slot)
+                current_alpha = self.cooldown_alpha
+                model.set_cooldown_connection(
+                    self.cooldown_source, self.cooldown_slot, current_alpha
+                )
+            else:
+                current_alpha = 0.0
             velocities: list[float] = []
             for source, gradient_norm in current.items():
                 previous = self.diagnostic_previous_gradient_norm_ema.get(source)
@@ -280,6 +315,7 @@ class GrowthController:
                 ),
                 "velocity_max": max(velocities) if velocities else None,
                 "cooldown": self.remaining_cooldown,
+                "cooldown_alpha": current_alpha,
                 "growth_triggered": False,
                 "diagnostic_only": True,
             }
@@ -290,10 +326,17 @@ class GrowthController:
                 model.clear_cooldown_connection()
                 self.cooldown_source = None
                 self.cooldown_slot = None
+            elif self.cooldown_source is not None and self.cooldown_slot is not None:
+                model.set_cooldown_connection(
+                    self.cooldown_source,
+                    self.cooldown_slot,
+                    self.cooldown_alpha,
+                )
             return None
 
         growth_triggered = False
         triggered_source: int | None = None
+        stagnant_candidates: list[int] = []
         velocities: list[float] = []
         for source, gradient_norm in current.items():
             previous = self.previous_gradient_norm_ema.get(source)
@@ -304,9 +347,12 @@ class GrowthController:
                 velocity_ema = velocity if old_velocity is None else 0.9375 * old_velocity + 0.0625 * velocity
                 self.previous_velocity_ema[source] = velocity_ema
                 velocities.append(velocity_ema)
-                if abs(velocity_ema) < 1e-9:
-                    growth_triggered = True
-                    triggered_source = source
+                if abs(velocity_ema) < self.velocity_threshold:
+                    self.stagnant_steps[source] = self.stagnant_steps.get(source, 0) + 1
+                else:
+                    self.stagnant_steps[source] = 0
+                if self.stagnant_steps[source] >= self.patience:
+                    stagnant_candidates.append(source)
                 self.previous_gradient_norm_ema[source] = gradient_norm_ema
             else:
                 self.previous_gradient_norm_ema[source] = gradient_norm
@@ -323,15 +369,33 @@ class GrowthController:
             "velocity_median": median_velocity,
             "velocity_max": max(velocities) if velocities else None,
             "cooldown": 0,
-            "growth_triggered": growth_triggered,
+            "cooldown_alpha": 0.0,
+            "velocity_threshold": self.velocity_threshold,
+            "patience": self.patience,
+            "stagnant_steps_max": max(
+                (self.stagnant_steps.get(source, 0) for source in current),
+                default=0,
+            ),
+            "growth_triggered": False,
             "diagnostic_only": False,
         }
 
+        if stagnant_candidates:
+            growth_triggered = True
+            triggered_source = max(
+                stagnant_candidates,
+                key=lambda source: (
+                    self.stagnant_steps[source],
+                    -abs(self.previous_velocity_ema[source]),
+                ),
+            )
+            self.last_diagnostics["growth_triggered"] = True
+            self.last_diagnostics["triggered_source"] = triggered_source
         if not growth_triggered:
             return None
         slot = model.activate_next()
         if slot is not None:
-            model.set_cooldown_connection(triggered_source, slot)
+            model.set_cooldown_connection(triggered_source, slot, 1.0)
             self.cooldown_source = triggered_source
             self.cooldown_slot = slot
             self.remaining_cooldown = self.cooldown
@@ -341,6 +405,7 @@ class GrowthController:
                 self.cooldown_slot = None
             self.previous_gradient_norm_ema.clear()
             self.previous_velocity_ema.clear()
+            self.stagnant_steps.clear()
         self.diagnostic_previous_gradient_norm_ema.clear()
         self.diagnostic_previous_velocity_ema.clear()
         return slot
@@ -491,6 +556,9 @@ def train_step(
             for target in targets_for_route:
                 if target != base_model.input_id and target != base_model.output_id and bool(base_model.active[target]):
                     middle_route_counts[target] += 1
+        for module_id, sample_index, _ in aux.get("parallel_module_uses", []):
+            if bool(effective_sample_mask[sample_index]):
+                middle_route_counts[module_id] += 1
         loss, metrics = language_model_loss(
             logits,
             targets,
@@ -601,6 +669,8 @@ def train_step(
             "mean_route_length": float(aux["route_lengths"].float().mean()),
             "max_frontier_count": aux["forward_diagnostics"]["max_frontier_count"],
             "total_frontier_states": aux["forward_diagnostics"]["total_frontier_states"],
+            "cooldown_alpha": aux["forward_diagnostics"]["cooldown_alpha"],
+            "cooldown_parallel_uses": aux["forward_diagnostics"]["cooldown_parallel_uses"],
             "new_slot": new_slot if new_slot is not None else -1,
             "terminations": aux["terminations"],
             "invalid_reasons": aux["invalid_reasons"],
