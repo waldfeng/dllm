@@ -8,6 +8,7 @@ LOG_FILE="$ROOT_DIR/datasets/logs/lastest_weight-training.log"
 NAN_LOG_FILE="$ROOT_DIR/datasets/logs/lastest_weight-training-nan.log"
 READY_FILE="$ROOT_DIR/datasets/logs/lastest_weight-training.ready"
 BATCH_SIZE="${BATCH_SIZE:-1136}"
+LENGTH_WEIGHT="${LENGTH_WEIGHT:-1e-3}"
 MEMORY_LIMIT_PERCENT="${MEMORY_LIMIT_PERCENT:-90}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-20}"
 MIN_BATCH_SIZE="${MIN_BATCH_SIZE:-1}"
@@ -69,6 +70,7 @@ while true; do
         --distributed --device cuda \
         --dataset-dir datasets/c4_qwen2.5 \
         --epochs 1 --batch-size "$BATCH_SIZE" \
+        --length-weight "$LENGTH_WEIGHT" \
         --lr 7.5e-5 --warmup-steps 128 \
         --checkpoint "$CHECKPOINT" \
         --resume-checkpoint "$CHECKPOINT" \
