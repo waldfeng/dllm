@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from collections import defaultdict
 from typing import Any
@@ -267,7 +268,7 @@ class DynamicRouterLM(nn.Module):
         tau: float = 1.0,
         memory_state: Tensor | None = None,
     ) -> tuple[Tensor, dict[str, Any]]:
-        if tau <= 0:
+        if not math.isfinite(float(tau)) or tau <= 0:
             raise ValueError("tau must be positive")
         x = self._prepare_input(x)
         x = x + self.position_embedding.unsqueeze(0)
@@ -335,15 +336,41 @@ class DynamicRouterLM(nn.Module):
             forward_diagnostics["max_frontier_count"] = max(
                 forward_diagnostics["max_frontier_count"], frontier_q.shape[0]
             )
+            if depth == self.max_depth - 1:
+                for row in range(frontier_q.shape[0]):
+                    sample_id = int(live_ids[row])
+                    path = (*frontier_paths[row], self.output_id)
+                    output_q_parts.append(frontier_q[row : row + 1])
+                    output_ids.append(live_ids[row : row + 1])
+                    valid_samples[sample_id] = True
+                    route_lengths.append(int(frontier_lengths[row]) + 1)
+                    branch_paths.append((sample_id, path))
+                    terminations[sample_id] = "max_depth"
+                frontier_q = frontier_q[:0]
+                break
             forward_diagnostics["total_frontier_states"] += frontier_q.shape[0]
             observe_tensor("query", frontier_q)
             logits_batch = self._route_logits_batch(frontier_q, frontier_visited)
-            if not torch.isfinite(logits_batch).all():
-                invalid = ~torch.isfinite(logits_batch).all(dim=1)
+            observe_tensor("route_logits", logits_batch)
+            finite_rows = torch.isfinite(logits_batch).all(dim=1)
+            if not bool(finite_rows.all()):
+                invalid = ~finite_rows
                 for sample_id in live_ids[invalid].tolist():
                     invalid_reasons[sample_id] = "nonfinite_logits"
                     terminations[sample_id] = "nonfinite_logits"
-                break
+                if not bool(finite_rows.any()):
+                    frontier_q = frontier_q[:0]
+                    break
+                frontier_q = frontier_q[finite_rows]
+                frontier_hidden = frontier_hidden[finite_rows]
+                frontier_modules = frontier_modules[finite_rows]
+                frontier_visited = frontier_visited[finite_rows]
+                frontier_lengths = frontier_lengths[finite_rows]
+                live_ids = live_ids[finite_rows]
+                frontier_paths = [
+                    path for path, keep in zip(frontier_paths, finite_rows.tolist()) if keep
+                ]
+                logits_batch = logits_batch[finite_rows]
             router_probs = F.softmax(logits_batch.float() / tau, dim=-1)
             targets = router_probs.argmax(dim=-1)
             for row, target in enumerate(targets.tolist()):
@@ -356,7 +383,9 @@ class DynamicRouterLM(nn.Module):
                 if forced is not None:
                     targets[row] = forced
             selected_probs = router_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-            routing_weights = selected_probs
+            # Keep hard routing in the forward pass while retaining the
+            # selected-probability gradient for the router.
+            routing_weights = selected_probs + (1.0 - selected_probs).detach()
             next_groups: dict[int, list[int]] = defaultdict(list)
             depth_records: list[RouteRecord] = []
             for row, target in enumerate(targets.tolist()):
@@ -474,20 +503,10 @@ def language_model_loss(
         raise ValueError("targets must have shape [batch, block_size]")
     if route_lengths.shape != (targets.shape[0],):
         raise ValueError("route_lengths must have shape [batch]")
-    if target_mask is None:
-        lm = F.cross_entropy(logits.flatten(0, 1), targets.flatten())
-    else:
-        if target_mask.shape != targets.shape or target_mask.dtype != torch.bool:
-            raise ValueError("target_mask must be bool with shape [batch, block_size]")
-        target_mask = target_mask.to(logits.device)
-        flat_mask = target_mask.flatten()
-        if not bool(flat_mask.any()):
-            raise ValueError("target_mask must contain at least one valid target")
-        lm = F.cross_entropy(logits.flatten(0, 1)[flat_mask], targets.flatten()[flat_mask])
     if sample_mask is not None:
         if sample_mask.shape != (targets.shape[0],) or sample_mask.dtype != torch.bool:
             raise ValueError("sample_mask must be bool with shape [batch]")
-        sample_mask = sample_mask.to(expected_length.device)
+        sample_mask = sample_mask.to(logits.device)
         if not bool(sample_mask.any()):
             raise ValueError("sample_mask must contain at least one active sample")
         if expected_length.ndim == 1:
@@ -495,6 +514,25 @@ def language_model_loss(
         route_lengths = route_lengths[sample_mask]
     elif expected_length.ndim == 1:
         expected_length = expected_length.mean()
+    if target_mask is None:
+        flat_mask = (
+            sample_mask[:, None].expand_as(targets).flatten()
+            if sample_mask is not None
+            else None
+        )
+    else:
+        if target_mask.shape != targets.shape or target_mask.dtype != torch.bool:
+            raise ValueError("target_mask must be bool with shape [batch, block_size]")
+        target_mask = target_mask.to(logits.device)
+        flat_mask = target_mask.flatten()
+        if sample_mask is not None:
+            flat_mask &= sample_mask[:, None].expand_as(targets).flatten()
+    if flat_mask is None:
+        lm = F.cross_entropy(logits.flatten(0, 1), targets.flatten())
+    else:
+        if not bool(flat_mask.any()):
+            raise ValueError("target_mask must contain at least one valid target")
+        lm = F.cross_entropy(logits.flatten(0, 1)[flat_mask], targets.flatten()[flat_mask])
     excess_lengths = (route_lengths.float() - expected_length).clamp_min(0.0)
     length_loss = length_weight * excess_lengths.mean()
     total = lm + length_loss

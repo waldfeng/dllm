@@ -11,7 +11,7 @@ from dynamic_router import (
     language_model_loss,
     train_step,
 )
-from scripts.train_c4 import TokenStore, global_pair_batches, sample_block_pairs, sequential_batches
+from scripts.train_c4 import TokenStore, sample_block_pairs, sequential_batches
 
 
 def test_module_uses_gru_qkv_and_bidirectional_attention():
@@ -335,7 +335,7 @@ def test_training_cli_uses_dataset_checkpoint_and_log_directories():
 def test_resume_allows_batch_size_change_and_resets_memory():
     source = Path("scripts/train_c4.py").read_text()
     assert 'batch_size_changed = saved_config.get("batch_size", args.batch_size) != args.batch_size' in source
-    assert "if batch_size_changed:" in source
+    assert "if args.reset_data_cursor or batch_size_changed or scheduler_changed:" in source
     assert "memory = None" in source
 
 
@@ -426,26 +426,57 @@ def test_sequential_batches_use_offsets_and_finish_lanes(tmp_path: Path):
     assert batches[1][1].tolist() == [list(range(16, 20)) + [31] * 4]
 
 
-def test_global_pair_batches_split_real_pairs_across_ranks(tmp_path: Path):
-    tokens = np.arange(40, dtype=np.uint32)
+def test_sequential_batches_keep_distributed_group_step_counts_equal(tmp_path: Path):
+    tokens = np.arange(60, dtype=np.uint32)
     tokens.tofile(tmp_path / "train-00000.bin")
-    offsets = np.asarray([0, 20, 40], dtype=np.uint64)
+    offsets = np.asarray([0, 20, 60], dtype=np.uint64)
     offsets.tofile(tmp_path / "samples.offsets")
+    mapped_offsets = np.memmap(tmp_path / "samples.offsets", dtype=np.uint64, mode="r")
     batches = [
-        list(global_pair_batches(
-            TokenStore([tmp_path / "train-00000.bin"]),
-            np.memmap(tmp_path / "samples.offsets", dtype=np.uint64, mode="r"),
-            batch_size=1,
-            block_size=8,
-            pad_token_id=31,
-            limit=10,
-            rank=rank,
-            world_size=2,
-        ))
+        list(
+            sequential_batches(
+                TokenStore([tmp_path / "train-00000.bin"]),
+                mapped_offsets,
+                batch_size=1,
+                block_size=8,
+                pad_token_id=31,
+                limit=20,
+                rank=rank,
+                world_size=2,
+            )
+        )
         for rank in (0, 1)
     ]
-    assert all(batch[0][3] == [True] for batch in batches)
-    assert batches[0][0][0].tolist() != batches[1][0][0].tolist()
+    assert len(batches[0]) == len(batches[1])
+    assert [item[7] for item in batches[0]] == [item[7] for item in batches[1]]
+    assert any(not item[3][0] for item in batches[0]) or any(
+        not item[3][0] for item in batches[1]
+    )
+
+
+def test_max_depth_forces_a_valid_output_path():
+    model = DynamicRouterLM(d_model=16, vocab_size=32, max_modules=6, max_depth=1, n_heads=4)
+    _, aux = model(torch.randint(0, 32, (2, 8)))
+    assert aux["valid_sample_mask"].all()
+    assert aux["route_lengths"].tolist() == [1, 1]
+    assert aux["terminations"] == ["max_depth", "max_depth"]
+
+
+def test_language_loss_masks_inactive_samples_from_cross_entropy():
+    logits = torch.zeros(2, 2, 4)
+    targets = torch.tensor([[0, 1], [2, 3]])
+    expected = torch.tensor([1.0, 1.0])
+    route_lengths = torch.tensor([1, 1])
+    _, metrics = language_model_loss(
+        logits,
+        targets,
+        expected,
+        route_lengths,
+        length_weight=0.0,
+        target_mask=torch.ones(2, 2, dtype=torch.bool),
+        sample_mask=torch.tensor([True, False]),
+    )
+    assert torch.isclose(metrics["lm_loss"], torch.log(torch.tensor(4.0)))
 
 
 def test_invalid_model_dimensions_are_rejected():

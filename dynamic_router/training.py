@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 
 from .model import DynamicRouterLM, language_model_loss
@@ -253,39 +254,12 @@ class GrowthController:
             for key, value in state.get("diagnostic_previous_velocity_ema", {}).items()
         }
 
-    def observe_and_maybe_grow(
-        self, model: DynamicRouterLM, records: list, route_lengths: Tensor | None = None
-    ) -> int | None:
-
-        def normalized_values(record) -> float | None:
-            gradient_norm = getattr(record, "gradient_norm", None)
-            if gradient_norm is None and record.logits.grad is not None:
-                gradient_norm = float(record.logits.grad.detach().float().norm().cpu())
-            if gradient_norm is None:
-                return None
-            sample_index = getattr(record, "sample_index", 0)
-            path_length = getattr(record, "path_length", None)
-            if (
-                path_length is None
-                and route_lengths is not None
-                and sample_index < len(route_lengths)
-            ):
-                path_length = max(1.0, float(route_lengths[sample_index]))
-            if path_length is None:
-                path_length = 1.0
-            return gradient_norm / max(1.0, float(path_length))
-
+    def _observe_current(self, model: DynamicRouterLM, current: dict[int, float]) -> int | None:
         if self.remaining_cooldown:
             if self.cooldown_source is not None and self.cooldown_slot is not None:
                 model.set_cooldown_connection(self.cooldown_source, self.cooldown_slot)
-            current: dict[int, list[float]] = defaultdict(list)
-            for record in records:
-                values = normalized_values(record)
-                if values is not None:
-                    current[record.source_id].append(values)
             velocities: list[float] = []
-            for source, values in current.items():
-                gradient_norm = sum(values) / len(values)
+            for source, gradient_norm in current.items():
                 previous = self.diagnostic_previous_gradient_norm_ema.get(source)
                 gradient_norm_ema = gradient_norm if previous is None else 0.9375 * previous + 0.0625 * gradient_norm
                 if previous is not None:
@@ -318,17 +292,10 @@ class GrowthController:
                 self.cooldown_slot = None
             return None
 
-        current: dict[int, list[float]] = defaultdict(list)
-        for record in records:
-            values = normalized_values(record)
-            if values is not None:
-                current[record.source_id].append(values)
-
         growth_triggered = False
         triggered_source: int | None = None
         velocities: list[float] = []
-        for source, values in current.items():
-            gradient_norm = sum(values) / len(values)
+        for source, gradient_norm in current.items():
             previous = self.previous_gradient_norm_ema.get(source)
             if previous is not None:
                 gradient_norm_ema = 0.9375 * previous + 0.0625 * gradient_norm
@@ -368,11 +335,51 @@ class GrowthController:
             self.cooldown_source = triggered_source
             self.cooldown_slot = slot
             self.remaining_cooldown = self.cooldown
+            if self.remaining_cooldown == 0:
+                model.clear_cooldown_connection()
+                self.cooldown_source = None
+                self.cooldown_slot = None
             self.previous_gradient_norm_ema.clear()
             self.previous_velocity_ema.clear()
         self.diagnostic_previous_gradient_norm_ema.clear()
         self.diagnostic_previous_velocity_ema.clear()
         return slot
+
+    def observe_and_maybe_grow(
+        self, model: DynamicRouterLM, records: list, route_lengths: Tensor | None = None
+    ) -> int | None:
+        def normalized_values(record) -> float | None:
+            gradient_norm = getattr(record, "gradient_norm", None)
+            if gradient_norm is None and record.logits.grad is not None:
+                gradient_norm = float(record.logits.grad.detach().float().norm().cpu())
+            if gradient_norm is None:
+                return None
+            sample_index = getattr(record, "sample_index", 0)
+            path_length = getattr(record, "path_length", None)
+            if (
+                path_length is None
+                and route_lengths is not None
+                and sample_index < len(route_lengths)
+            ):
+                path_length = max(1.0, float(route_lengths[sample_index]))
+            if path_length is None:
+                path_length = 1.0
+            return gradient_norm / max(1.0, float(path_length))
+
+        current: dict[int, list[float]] = defaultdict(list)
+        for record in records:
+            values = normalized_values(record)
+            if values is not None:
+                current[record.source_id].append(values)
+        return self._observe_current(
+            model,
+            {source: sum(values) / len(values) for source, values in current.items()},
+        )
+
+    def observe_aggregated_and_maybe_grow(
+        self, model: DynamicRouterLM, current: dict[int, float]
+    ) -> int | None:
+        return self._observe_current(model, current)
 
 
 def _clear_optimizer_state(optimizer: torch.optim.Optimizer, parameter: Tensor) -> None:
@@ -424,10 +431,7 @@ def train_step(
         if hasattr(model, "module"):
             # Empty/padded rank-local batches still must participate in DDP's
             # reducer, otherwise other ranks wait forever in backward().
-            zero = sum(
-                (parameter.sum() * 0.0 for parameter in model.parameters()),
-                torch.zeros((), device=x.device, dtype=x.dtype),
-            )
+            zero = base_model.router.sum() * 0.0
             zero.backward()
         return result
 
@@ -449,42 +453,57 @@ def train_step(
     effective_sample_mask = valid_sample_mask
     if sample_mask is not None:
         effective_sample_mask = sample_mask.to(valid_sample_mask.device) & valid_sample_mask
+    middle_route_counts: dict[int, int] = defaultdict(int)
+    skipped_update = False
+    skip_reason = ""
+    skipped_memory = None
     if not bool(effective_sample_mask.any()):
         reason = next(
             (item for item in aux["invalid_reasons"] if item is not None),
             "no_valid_active_sample",
         )
-        result = invalid_result(aux, memory_state, reason)
-        result["middle_route_counts"] = {}
-        return result
-    middle_route_counts: dict[int, int] = defaultdict(int)
-    for _, targets_for_route, sample_index, _ in aux["route_targets"]:
-        if not bool(effective_sample_mask[sample_index]):
-            continue
-        for target in targets_for_route:
-            if target != base_model.input_id and target != base_model.output_id and bool(base_model.active[target]):
-                middle_route_counts[target] += 1
-    loss, metrics = language_model_loss(
-        logits,
-        targets,
-        aux.get("expected_length_per_sample", aux["expected_length"]),
-        aux["route_lengths"],
-        length_weight,
-        target_mask,
-        effective_sample_mask,
-    )
-    if not torch.isfinite(loss):
-        return invalid_result(aux, memory_state, "nonfinite_loss")
-    if hasattr(model, "module"):
-        # Dynamic routing can use different module subsets on different ranks.
-        # Keep every parameter in the autograd graph so DDP observes the same
-        # reducer participation on every rank.
-        loss = loss + sum(
-            (parameter.sum() * 0.0 for parameter in model.parameters()),
-            torch.zeros((), device=loss.device, dtype=loss.dtype),
+        if not hasattr(model, "module"):
+            result = invalid_result(aux, memory_state, reason)
+            result["middle_route_counts"] = {}
+            return result
+        # A padded rank still has to enter the DDP reducer and optimizer step.
+        # find_unused_parameters=True handles the parameters unused by this
+        # rank without manufacturing gradients for the entire model.
+        _remove_route_hooks(aux)
+        skipped_update = True
+        skip_reason = reason
+        skipped_memory = (
+            torch.zeros_like(aux["memory_state"])
+            if memory_state is None
+            else memory_state.detach().clone()
         )
-    loss.backward()
-    _remove_route_hooks(aux)
+        loss = base_model.router.sum() * 0.0
+        metrics = {
+            "loss": loss.detach(),
+            "lm_loss": loss.detach(),
+            "length_loss": loss.detach(),
+        }
+        loss.backward()
+    else:
+        for _, targets_for_route, sample_index, _ in aux["route_targets"]:
+            if not bool(effective_sample_mask[sample_index]):
+                continue
+            for target in targets_for_route:
+                if target != base_model.input_id and target != base_model.output_id and bool(base_model.active[target]):
+                    middle_route_counts[target] += 1
+        loss, metrics = language_model_loss(
+            logits,
+            targets,
+            aux.get("expected_length_per_sample", aux["expected_length"]),
+            aux["route_lengths"],
+            length_weight,
+            target_mask,
+            effective_sample_mask,
+        )
+        if not torch.isfinite(loss):
+            return invalid_result(aux, memory_state, "nonfinite_loss")
+        loss.backward()
+        _remove_route_hooks(aux)
 
     if not _finite_gradients(model):
         return invalid_result(
@@ -492,13 +511,33 @@ def train_step(
         )
 
     router_snapshot = base_model.router.detach().clone()
-    new_slot = (
-        controller.observe_and_maybe_grow(
+    new_slot = None
+    if hasattr(model, "module") and dist.is_initialized():
+        gradient_sums = torch.zeros(base_model.max_modules, device=x.device, dtype=torch.float64)
+        gradient_counts = torch.zeros(base_model.max_modules, device=x.device, dtype=torch.float64)
+        for record in aux["route_records"]:
+            gradient_norm = getattr(record, "gradient_norm", None)
+            if gradient_norm is None:
+                continue
+            path_length = getattr(record, "path_length", None)
+            if path_length is None:
+                sample_index = getattr(record, "sample_index", 0)
+                path_length = max(1.0, float(aux["route_lengths"][sample_index]))
+            source = int(record.source_id)
+            gradient_sums[source] += float(gradient_norm) / max(1.0, float(path_length))
+            gradient_counts[source] += 1.0
+        dist.all_reduce(gradient_sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(gradient_counts, op=dist.ReduceOp.SUM)
+        if controller and bool(gradient_counts.sum()):
+            aggregated = {
+                source: float(gradient_sums[source] / gradient_counts[source])
+                for source in torch.where(gradient_counts > 0)[0].tolist()
+            }
+            new_slot = controller.observe_aggregated_and_maybe_grow(base_model, aggregated)
+    elif controller and not skipped_update:
+        new_slot = controller.observe_and_maybe_grow(
             base_model, aux["route_records"], aux["route_lengths"]
         )
-        if controller
-        else None
-    )
 
     if base_model.router.grad is not None:
         base_model.router.grad[~base_model.active] = 0
@@ -508,10 +547,25 @@ def train_step(
             return invalid_result(
                 aux, memory_state, "nonfinite_gradient", _gradient_diagnostics(model)
             )
+    active_parameters = {
+        parameter
+        for parameter in (
+            list(base_model.embedding.parameters())
+            + [base_model.position_embedding]
+            + list(base_model.head.parameters())
+            + [base_model.router]
+        )
+    }
+    active_parameters.update(
+        parameter
+        for index, module in enumerate(base_model.pool)
+        if bool(base_model.active[index])
+        for parameter in module.parameters()
+    )
     parameter_snapshot = {
         parameter: parameter.detach().clone()
         for parameter in model.parameters()
-        if parameter.grad is not None
+        if parameter.grad is not None and parameter in active_parameters
     }
     optimizer.step()
 
@@ -550,11 +604,13 @@ def train_step(
             "new_slot": new_slot if new_slot is not None else -1,
             "terminations": aux["terminations"],
             "invalid_reasons": aux["invalid_reasons"],
-            "skipped_update": 0,
-            "skip_reason": "",
+            "skipped_update": int(skipped_update),
+            "skip_reason": skip_reason,
             "valid_sample_count": int(valid_sample_mask.sum()),
             "growth_diagnostics": controller.last_diagnostics if controller else {},
-            "memory_state": aux["memory_state"].detach(),
+            "memory_state": (
+                skipped_memory if skipped_update else aux["memory_state"].detach()
+            ),
             "middle_route_counts": dict(middle_route_counts),
             "route_records": aux["route_records"],
             "route_lengths": aux["route_lengths"],

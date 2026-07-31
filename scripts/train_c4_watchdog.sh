@@ -2,6 +2,7 @@
 set -u
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR" || exit 1
 TORCHRUN="${TORCHRUN:-$ROOT_DIR/.venv/bin/torchrun}"
 CHECKPOINT="$ROOT_DIR/datasets/checkpoints/lastest_weight.pt"
 LOG_FILE="$ROOT_DIR/datasets/logs/lastest_weight-training.log"
@@ -16,23 +17,27 @@ RESTART_DELAY="${RESTART_DELAY:-5}"
 
 mkdir -p "$(dirname "$CHECKPOINT")" "$(dirname "$LOG_FILE")"
 if [[ ! -f "$CHECKPOINT" ]]; then
-    printf 'checkpoint does not exist: %s\n' "$CHECKPOINT" >&2
-    exit 1
+    printf 'checkpoint does not exist; starting a fresh run: %s\n' "$CHECKPOINT" >&2
 fi
 
 TRAIN_PID=""
 STOP_REQUESTED=0
 
 cleanup() {
+    trap - EXIT INT TERM
     if [[ -n "$TRAIN_PID" ]] && kill -0 "$TRAIN_PID" 2>/dev/null; then
         request_graceful_stop
         wait "$TRAIN_PID" 2>/dev/null || true
     fi
+    exit 0
 }
 trap cleanup EXIT INT TERM
 
 request_graceful_stop() {
     local rank_pid
+    if [[ -n "$TRAIN_PID" ]]; then
+        kill -USR1 -- "-$TRAIN_PID" 2>/dev/null || true
+    fi
     for rank_pid in $(pgrep -P "$TRAIN_PID" 2>/dev/null || true); do
         kill -USR1 "$rank_pid" 2>/dev/null || true
     done
@@ -65,6 +70,10 @@ wait_for_gpu_release() {
 while true; do
     STOP_REQUESTED=0
     rm -f "$READY_FILE"
+    RESUME_ARGS=()
+    if [[ -f "$CHECKPOINT" ]]; then
+        RESUME_ARGS=(--resume-checkpoint "$CHECKPOINT")
+    fi
     setsid "$TORCHRUN" --standalone --nproc_per_node=2 \
         scripts/train_c4.py \
         --distributed --device cuda \
@@ -73,7 +82,7 @@ while true; do
         --length-weight "$LENGTH_WEIGHT" \
         --lr 7.5e-5 --warmup-steps 128 \
         --checkpoint "$CHECKPOINT" \
-        --resume-checkpoint "$CHECKPOINT" \
+        "${RESUME_ARGS[@]}" \
         --log-file "$LOG_FILE" \
         --nan-log-file "$NAN_LOG_FILE" \
         --ready-file "$READY_FILE" \
