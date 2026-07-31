@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import os
 import tempfile
 import contextlib
+import signal
+import sys
 import time
+from datetime import timedelta
 from collections import deque
 from pathlib import Path
 
@@ -133,9 +137,8 @@ def sequential_batches(
 ):
     sample_count = len(sample_offsets) - 1
     emitted = 0
-    for batch_start in range(
-        start_sample + rank * batch_size, sample_count, batch_size * world_size
-    ):
+    for group_start in range(start_sample, sample_count, batch_size * world_size):
+        batch_start = group_start + rank * batch_size
         lengths = [
             int(sample_offsets[index + 1] - sample_offsets[index])
             for index in range(batch_start, min(batch_start + batch_size, sample_count))
@@ -144,8 +147,22 @@ def sequential_batches(
         for index, length in enumerate(lengths, batch_start):
             samples.append(store.sample(int(sample_offsets[index]), length))
         pairs = [list(sample_block_pairs(sample, block_size, pad_token_id)) for sample in samples]
-        max_pairs = max((len(items) for items in pairs), default=0)
-        first_block = start_block if batch_start == start_sample else 0
+        # All ranks must execute the same number of DDP collectives. Samples
+        # are sharded by rank, so compute the group maximum from offsets rather
+        # than allowing a shorter rank-local shard to end the iterator early.
+        group_max_pairs = 0
+        for index in range(group_start, min(group_start + batch_size * world_size, sample_count)):
+            length = int(sample_offsets[index + 1] - sample_offsets[index])
+            group_max_pairs = max(
+                group_max_pairs,
+                max(0, (length + block_size - 1) // block_size - 1),
+            )
+        max_pairs = group_max_pairs
+        first_block = (
+            start_block
+            if start_sample <= batch_start < start_sample + batch_size * world_size
+            else 0
+        )
         for block_index in range(first_block, max_pairs):
             if emitted >= limit:
                 return
@@ -172,6 +189,79 @@ def sequential_batches(
                 block_index == max_pairs - 1,
             )
             emitted += 1
+
+
+def global_pair_batches(
+    store: TokenStore,
+    sample_offsets: np.ndarray,
+    batch_size: int,
+    block_size: int,
+    pad_token_id: int,
+    limit: int,
+    rank: int = 0,
+    world_size: int = 1,
+    start_pair_index: int = 0,
+):
+    """Batch real sample/block pairs globally before splitting them by rank."""
+    pairs_per_global_batch = batch_size * world_size
+    pending: list[tuple[list[int], list[int], list[bool], int, int]] = []
+    emitted = 0
+    global_pair_index = 0
+    for sample_index in range(len(sample_offsets) - 1):
+        length = int(sample_offsets[sample_index + 1] - sample_offsets[sample_index])
+        pairs = sample_block_pairs(
+            store.sample(int(sample_offsets[sample_index]), length),
+            block_size,
+            pad_token_id,
+        )
+        for block_index, (x, y, mask) in enumerate(pairs):
+            pending.append((x, y, mask, sample_index, block_index))
+            if len(pending) < pairs_per_global_batch:
+                continue
+            if global_pair_index + pairs_per_global_batch <= start_pair_index:
+                global_pair_index += len(pending)
+                pending.clear()
+                continue
+            yield from _split_global_pair_batch(pending, global_pair_index, batch_size, rank, world_size)
+            emitted += 1
+            global_pair_index += len(pending)
+            pending.clear()
+            if emitted >= limit:
+                return
+    if pending and global_pair_index + len(pending) > start_pair_index:
+        yield from _split_global_pair_batch(pending, global_pair_index, batch_size, rank, world_size)
+
+
+def _split_global_pair_batch(
+    pending: list[tuple[list[int], list[int], list[bool], int, int]],
+    global_pair_index: int,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+):
+    """Return one rank's equally sized slice of a global pair batch."""
+    total = batch_size * world_size
+    padded = pending + [
+        ([0] * len(pending[0][0]), [0] * len(pending[0][1]), [False] * len(pending[0][2]), -1, -1)
+    ] * (total - len(pending))
+    local = padded[rank * batch_size : (rank + 1) * batch_size]
+    yield (
+        torch.tensor([item[0] for item in local], dtype=torch.long),
+        torch.tensor([item[1] for item in local], dtype=torch.long),
+        torch.tensor([item[2] for item in local], dtype=torch.bool),
+        [item[3] >= 0 for item in local],
+        local[0][3],
+        local[0][4],
+        global_pair_index + total,
+    )
+
+
+def count_total_pairs(sample_offsets: np.ndarray, block_size: int) -> int:
+    total = 0
+    for index in range(len(sample_offsets) - 1):
+        length = int(sample_offsets[index + 1] - sample_offsets[index])
+        total += max(0, (length + block_size - 1) // block_size - 1)
+    return total
 
 
 def count_epoch_steps(sample_offsets: np.ndarray, batch_size: int, block_size: int) -> int:
@@ -224,12 +314,12 @@ def main() -> None:
     parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument(
         "--checkpoint",
-        default="datasets/checkpoints/qwen10b-epoch1-b8-c32-top1-batched-w1e-4.pt",
+        default="datasets/checkpoints/lastest_weight.pt",
         help="checkpoint output path; defaults to datasets/checkpoints",
     )
     parser.add_argument(
         "--resume-checkpoint",
-        default="datasets/checkpoints/qwen10b-epoch1-b8-c32-top1-batched-w1e-4.pt",
+        default="datasets/checkpoints/lastest_weight.pt",
         help="checkpoint to resume from; pass an explicit path to override",
     )
     parser.add_argument(
@@ -246,6 +336,7 @@ def main() -> None:
         "--checkpoint-hours", type=float, default=1.0,
         help="overwrite the single checkpoint at this wall-clock interval; 0 disables periodic saves",
     )
+    parser.add_argument("--ready-file", default="")
     args = parser.parse_args()
     distributed = args.distributed or int(os.environ.get("WORLD_SIZE", "1")) > 1
     rank = int(os.environ.get("RANK", "0")) if distributed else 0
@@ -256,7 +347,9 @@ def main() -> None:
             raise ValueError("--distributed requires torchrun with at least two processes")
         torch.cuda.set_device(local_rank)
         args.device = f"cuda:{local_rank}"
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(
+            backend="nccl", timeout=timedelta(seconds=900), device_id=local_rank
+        )
     if args.log_file and rank == 0:
         nan_path = (
             Path(args.nan_log_file)
@@ -268,6 +361,19 @@ def main() -> None:
         log_stream = DualRollingLog(Path(args.log_file), nan_path)
     else:
         log_stream = None
+
+    diagnostic_started = time.monotonic()
+
+    def diagnostic(message: str) -> None:
+        value = f"[rank={rank} t={time.monotonic() - diagnostic_started:.1f}s] {message}"
+        print(value, file=sys.stderr, flush=True)
+        if rank == 0 and log_stream is not None:
+            print(value, file=log_stream, flush=True)
+
+    # A stalled CUDA/NCCL operation does not produce a Python exception. Keep
+    # periodic Python stack snapshots in the watchdog log to identify it.
+    faulthandler.dump_traceback_later(300, repeat=True, file=sys.stderr)
+    diagnostic(f"process_group_ready distributed={distributed} device={args.device}")
     if (
         args.epochs <= 0
         or args.steps < 0
@@ -285,6 +391,7 @@ def main() -> None:
     if args.precision == "bf16" and args.device.startswith("cuda") and not torch.cuda.is_bf16_supported():
         raise ValueError("BF16 is not supported by the selected CUDA device")
     root = Path(args.dataset_dir)
+    diagnostic("dataset_validation_start")
     metadata = json.loads((root / "metadata.json").read_text())
     files = sorted(root.glob("train-*.bin"))
     if not files:
@@ -317,6 +424,7 @@ def main() -> None:
     if len(sample_offsets) < 2 or int(sample_offsets[-1]) != actual_tokens:
         raise ValueError("samples.offsets does not match the token shards")
     pad_token_id = int(metadata.get("tokenizer_pad_id", 151643))
+    diagnostic(f"dataset_validation_done samples={len(sample_offsets) - 1} batch_size={args.batch_size}")
     model = DynamicRouterLM(
         d_model=args.d_model,
         vocab_size=args.vocab_size,
@@ -337,6 +445,7 @@ def main() -> None:
     resume_cursor = None
     global_step = 0
     if args.resume_checkpoint:
+        diagnostic(f"checkpoint_load_start path={args.resume_checkpoint}")
         # Stage the large model and optimizer checkpoint in host memory first;
         # loading directly into CUDA can cause severe paging on large restores.
         checkpoint = torch.load(
@@ -375,13 +484,25 @@ def main() -> None:
             memory = None
         elif memory is not None:
             memory = memory.to(args.device)
+        diagnostic(
+            f"checkpoint_load_done step={global_step} cursor={resume_cursor} "
+            f"batch_size_changed={batch_size_changed}"
+        )
     if distributed:
+        # Do not let a rank enter DDP forward while another rank is still
+        # restoring the large host-memory checkpoint.
+        diagnostic("ddp_barrier_before_init")
+        dist.barrier()
+        diagnostic("ddp_init_start")
         model = DistributedDataParallel(
             model,
             device_ids=[local_rank],
-            broadcast_buffers=True,
-            find_unused_parameters=True,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
         )
+        diagnostic("ddp_init_done")
+        dist.barrier()
+        diagnostic("ddp_barrier_after_init")
     base_model = model.module if distributed else model
     def save_checkpoint(step: int) -> None:
         if not args.checkpoint or rank != 0:
@@ -417,56 +538,84 @@ def main() -> None:
         finally:
             temporary.unlink(missing_ok=True)
 
+    stop_requested = False
+
+    def request_stop(_signum, _frame) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGUSR1, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+
     if args.checkpoint_hours < 0:
         raise ValueError("checkpoint-hours must be non-negative")
+    legacy_cursor = resume_cursor if resume_cursor and "global_pair_index" not in resume_cursor else None
+    if legacy_cursor is not None:
+        # Option A: old rank-local cursors cannot be converted safely after a
+        # batch-size change, so restart data traversal from pair zero.
+        resume_cursor = None
+        diagnostic(f"legacy_cursor_reset old_cursor={legacy_cursor}")
     data_cursor = resume_cursor
     last_checkpoint_time = time.monotonic()
-    cursor_pending = resume_cursor is not None and not resume_cursor.get("completed", False)
+    cursor_pending = (
+        resume_cursor is not None
+        and not resume_cursor.get("completed", False)
+        and (not distributed or rank == 0)
+    )
     cursor_seen = False
-    has_cursor = resume_cursor is not None
+    # A legacy cursor was deliberately reset to pair zero (option A), so do
+    # not apply the old global-step skip to the newly scheduled data stream.
+    has_cursor = resume_cursor is not None or legacy_cursor is not None
     if resume_cursor is not None and resume_cursor.get("completed", False):
         if rank == 0:
             print("checkpoint is already complete", file=log_stream)
         if distributed:
             dist.destroy_process_group()
         return
-    pairs_per_epoch = count_epoch_steps(sample_offsets, args.batch_size, 8)
+    total_pairs = count_total_pairs(sample_offsets, 8)
+    pairs_per_epoch = (total_pairs + args.batch_size * world_size - 1) // (args.batch_size * world_size)
     if pairs_per_epoch <= 0:
         raise ValueError("dataset contains no complete input/target block pairs")
     steps_per_epoch = args.steps or pairs_per_epoch
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = args.warmup_steps or min(10_000, max(100, int(0.05 * total_steps)))
+    if args.ready_file and rank == 0:
+        Path(args.ready_file).write_text(f"{global_step}\n")
+    diagnostic(f"training_loop_start global_step={global_step} pairs_per_epoch={pairs_per_epoch}")
+
+    def cuda_memory_metrics() -> dict[str, float]:
+        if not args.device.startswith("cuda"):
+            return {}
+        return {
+            "cuda_allocated_mib": torch.cuda.memory_allocated() / 2**20,
+            "cuda_reserved_mib": torch.cuda.memory_reserved() / 2**20,
+            "cuda_peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
+            "cuda_peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
+        }
+
     for epoch in range(args.epochs):
         epoch_limit = steps_per_epoch
-        for step, (x, y, target_mask, active, sample_index, block_index, batch_done) in enumerate(
-            sequential_batches(
+        for step, (x, y, target_mask, active, sample_index, block_index, pair_cursor) in enumerate(
+            global_pair_batches(
                 TokenStore(files), sample_offsets, args.batch_size, 8, pad_token_id,
                 epoch_limit,
-                int(resume_cursor.get("sample_index", 0)) if resume_cursor and epoch == 0 else 0,
-                int(resume_cursor.get("block_index", 0)) if resume_cursor and epoch == 0 else 0,
-                rank,
-                world_size,
+                rank, world_size,
+                int(resume_cursor.get("global_pair_index", 0)) if resume_cursor and epoch == 0 else 0,
             ), 1
         ):
+            batch_done = pair_cursor >= total_pairs
+            if step == 1:
+                diagnostic(
+                    f"first_batch_ready sample_index={sample_index} block_index={block_index} "
+                    f"batch_done={batch_done} active_samples={sum(active)}"
+                )
             if not has_cursor and step <= start_step and epoch == 0:
                 continue
-            if cursor_pending:
-                if sample_index == int(resume_cursor.get("sample_index", -1)):
-                    if block_index < int(resume_cursor.get("block_index", 0)):
-                        continue
-                    cursor_pending = False
-                    cursor_seen = True
-                else:
-                    continue
-            if batch_done:
-                next_sample = sample_index + len(active)
-                data_cursor = (
-                    {"completed": True}
-                    if next_sample >= len(sample_offsets) - 1
-                    else {"sample_index": next_sample, "block_index": 0}
-                )
-            else:
-                data_cursor = {"sample_index": sample_index, "block_index": block_index + 1}
+            data_cursor = (
+                {"completed": True, "global_pair_index": pair_cursor}
+                if batch_done
+                else {"global_pair_index": pair_cursor}
+            )
             active_mask = torch.tensor(active, dtype=torch.bool)
             if global_step < warmup_steps:
                 lr_scale = (global_step + 1) / max(1, warmup_steps)
@@ -485,6 +634,8 @@ def main() -> None:
                 else contextlib.nullcontext()
             )
             with autocast:
+                if step == 1:
+                    diagnostic("first_train_step_start")
                 metrics = train_step(
                     model,
                     optimizer,
@@ -496,6 +647,9 @@ def main() -> None:
                     target_mask=target_mask,
                     sample_mask=active_mask,
                 )
+            metrics.update(cuda_memory_metrics())
+            if step == 1:
+                diagnostic("first_train_step_done")
             if distributed:
                 # All ranks must execute the same growth decision. Rank 0
                 # owns the controller; broadcast the decision and the full
@@ -518,6 +672,7 @@ def main() -> None:
             # to serialize in every training record.
             metrics.pop("terminations", None)
             metrics.pop("invalid_reasons", None)
+            metrics["active_sample_count"] = int(active_mask.sum())
             route_stats = route_gradient_diagnostics(
                 metrics.pop("route_records", []),
                 metrics.pop("route_lengths", None),
@@ -603,12 +758,26 @@ def main() -> None:
             ):
                 save_checkpoint(global_step)
                 last_checkpoint_time = time.monotonic()
-    if resume_cursor is not None and not resume_cursor.get("completed", False) and not cursor_seen:
+            if stop_requested:
+                save_checkpoint(global_step)
+                if args.ready_file and rank == 0:
+                    Path(args.ready_file).unlink(missing_ok=True)
+                if distributed:
+                    dist.barrier()
+                    dist.destroy_process_group()
+                return 0
+    if (
+        rank == 0
+        and resume_cursor is not None
+        and not resume_cursor.get("completed", False)
+        and not cursor_seen
+    ):
         raise ValueError("checkpoint data cursor does not exist in the current dataset")
     save_checkpoint(global_step)
     if rank == 0:
         print("dataset", metadata, file=log_stream)
     if distributed:
+        dist.barrier()
         dist.destroy_process_group()
 
 

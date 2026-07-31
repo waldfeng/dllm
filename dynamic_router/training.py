@@ -124,10 +124,17 @@ def _invalid_result(
         "terminations": aux["terminations"],
         "invalid_reasons": invalid_reasons,
         "skipped_update": 1,
+        "skip_reason": reason or next((item for item in invalid_reasons if item), "unknown"),
+        "valid_sample_count": int(aux["valid_sample_mask"].sum()),
         "memory_state": safe_memory.detach(),
         "diagnostics": diagnostics or aux.get("forward_diagnostics", {}),
         "middle_route_counts": {},
     }
+
+
+def _remove_route_hooks(aux: dict) -> None:
+    for handle in aux.pop("route_hook_handles", []):
+        handle.remove()
 
 
 class MiddleModuleUtilization:
@@ -330,7 +337,7 @@ class GrowthController:
                 velocity_ema = velocity if old_velocity is None else 0.9375 * old_velocity + 0.0625 * velocity
                 self.previous_velocity_ema[source] = velocity_ema
                 velocities.append(velocity_ema)
-                if abs(velocity_ema) < 1e-8:
+                if abs(velocity_ema) < 1e-9:
                     growth_triggered = True
                     triggered_source = source
                 self.previous_gradient_norm_ema[source] = gradient_norm_ema
@@ -405,6 +412,25 @@ def train_step(
     sample_mask: Tensor | None = None,
 ) -> dict[str, float | int | Tensor | list[str]]:
     base_model = model.module if hasattr(model, "module") else model
+
+    def invalid_result(
+        aux: dict,
+        state: Tensor | None,
+        reason: str | None = None,
+        diagnostics: dict | None = None,
+    ) -> dict[str, float | int | Tensor | list[str]]:
+        _remove_route_hooks(aux)
+        result = _invalid_result(aux, state, reason, diagnostics)
+        if hasattr(model, "module"):
+            # Empty/padded rank-local batches still must participate in DDP's
+            # reducer, otherwise other ranks wait forever in backward().
+            zero = sum(
+                (parameter.sum() * 0.0 for parameter in model.parameters()),
+                torch.zeros((), device=x.device, dtype=x.dtype),
+            )
+            zero.backward()
+        return result
+
     optimizer.zero_grad(set_to_none=True)
     if memory_state is not None:
         memory_state = memory_state.detach().clone()
@@ -412,14 +438,14 @@ def train_step(
         memory_state[~finite_memory] = 0
     logits, aux = model(x, tau=tau, memory_state=memory_state)
     if not torch.isfinite(aux["memory_state"]).all():
-        return _invalid_result(aux, memory_state, "nonfinite_memory")
+        return invalid_result(aux, memory_state, "nonfinite_memory")
     valid_sample_mask = aux.get("valid_sample_mask")
     if valid_sample_mask is None:
         reason = next(
             (item for item in aux["invalid_reasons"] if item is not None),
             "no_valid_path",
         )
-        return _invalid_result(aux, memory_state, reason)
+        return invalid_result(aux, memory_state, reason)
     effective_sample_mask = valid_sample_mask
     if sample_mask is not None:
         effective_sample_mask = sample_mask.to(valid_sample_mask.device) & valid_sample_mask
@@ -428,7 +454,7 @@ def train_step(
             (item for item in aux["invalid_reasons"] if item is not None),
             "no_valid_active_sample",
         )
-        result = _invalid_result(aux, memory_state, reason)
+        result = invalid_result(aux, memory_state, reason)
         result["middle_route_counts"] = {}
         return result
     middle_route_counts: dict[int, int] = defaultdict(int)
@@ -448,11 +474,20 @@ def train_step(
         effective_sample_mask,
     )
     if not torch.isfinite(loss):
-        return _invalid_result(aux, memory_state, "nonfinite_loss")
+        return invalid_result(aux, memory_state, "nonfinite_loss")
+    if hasattr(model, "module"):
+        # Dynamic routing can use different module subsets on different ranks.
+        # Keep every parameter in the autograd graph so DDP observes the same
+        # reducer participation on every rank.
+        loss = loss + sum(
+            (parameter.sum() * 0.0 for parameter in model.parameters()),
+            torch.zeros((), device=loss.device, dtype=loss.dtype),
+        )
     loss.backward()
+    _remove_route_hooks(aux)
 
     if not _finite_gradients(model):
-        return _invalid_result(
+        return invalid_result(
             aux, memory_state, "nonfinite_gradient", _gradient_diagnostics(model)
         )
 
@@ -470,7 +505,7 @@ def train_step(
     if grad_clip is not None:
         total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         if not torch.isfinite(total_norm):
-            return _invalid_result(
+            return invalid_result(
                 aux, memory_state, "nonfinite_gradient", _gradient_diagnostics(model)
             )
     parameter_snapshot = {
@@ -486,7 +521,7 @@ def train_step(
                 if not torch.isfinite(parameter).all():
                     parameter.copy_(value)
         optimizer.state.clear()
-        return _invalid_result(aux, memory_state, "nonfinite_parameter")
+        return invalid_result(aux, memory_state, "nonfinite_parameter")
 
     with torch.no_grad():
         # Preserve inactive route rows against AdamW decay. A newly activated
@@ -516,6 +551,8 @@ def train_step(
             "terminations": aux["terminations"],
             "invalid_reasons": aux["invalid_reasons"],
             "skipped_update": 0,
+            "skip_reason": "",
+            "valid_sample_count": int(valid_sample_mask.sum()),
             "growth_diagnostics": controller.last_diagnostics if controller else {},
             "memory_state": aux["memory_state"].detach(),
             "middle_route_counts": dict(middle_route_counts),

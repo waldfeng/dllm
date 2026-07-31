@@ -11,7 +11,7 @@ from dynamic_router import (
     language_model_loss,
     train_step,
 )
-from scripts.train_c4 import TokenStore, sample_block_pairs, sequential_batches
+from scripts.train_c4 import TokenStore, global_pair_batches, sample_block_pairs, sequential_batches
 
 
 def test_module_uses_gru_qkv_and_bidirectional_attention():
@@ -327,7 +327,7 @@ def test_training_cli_exposes_route_controls():
 def test_training_cli_uses_dataset_checkpoint_and_log_directories():
     source = Path("scripts/train_c4.py").read_text()
     assert 'default="datasets/c4_qwen2.5"' in source
-    assert 'default="datasets/checkpoints/qwen10b-epoch1-b8-c32-top1-batched-w1e-4.pt"' in source
+    assert 'default="datasets/checkpoints/lastest_weight.pt"' in source
     assert 'default="datasets/logs/qwen10b-epoch1-b8-c32-top1-batched-w1e-4.log"' in source
     assert 'default="datasets/logs/qwen10b-epoch1-b8-c32-top1-batched-w1e-4-nan.log"' in source
 
@@ -424,6 +424,28 @@ def test_sequential_batches_use_offsets_and_finish_lanes(tmp_path: Path):
     assert batches[0][1].tolist() == [list(range(8, 16))]
     assert batches[1][0].tolist() == [list(range(8, 16))]
     assert batches[1][1].tolist() == [list(range(16, 20)) + [31] * 4]
+
+
+def test_global_pair_batches_split_real_pairs_across_ranks(tmp_path: Path):
+    tokens = np.arange(40, dtype=np.uint32)
+    tokens.tofile(tmp_path / "train-00000.bin")
+    offsets = np.asarray([0, 20, 40], dtype=np.uint64)
+    offsets.tofile(tmp_path / "samples.offsets")
+    batches = [
+        list(global_pair_batches(
+            TokenStore([tmp_path / "train-00000.bin"]),
+            np.memmap(tmp_path / "samples.offsets", dtype=np.uint64, mode="r"),
+            batch_size=1,
+            block_size=8,
+            pad_token_id=31,
+            limit=10,
+            rank=rank,
+            world_size=2,
+        ))
+        for rank in (0, 1)
+    ]
+    assert all(batch[0][3] == [True] for batch in batches)
+    assert batches[0][0][0].tolist() != batches[1][0][0].tolist()
 
 
 def test_invalid_model_dimensions_are_rejected():

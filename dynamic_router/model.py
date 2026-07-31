@@ -327,6 +327,7 @@ class DynamicRouterLM(nn.Module):
         frontier_paths: list[tuple[int, ...]] = [(self.input_id,) for _ in range(batch_size)]
         output_q_parts: list[Tensor] = []
         output_ids: list[Tensor] = []
+        route_hook_handles = []
         for depth in range(self.max_depth):
             forward_diagnostics["max_route_depth"] = max(forward_diagnostics["max_route_depth"], depth)
             if frontier_q.shape[0] == 0:
@@ -387,7 +388,7 @@ class DynamicRouterLM(nn.Module):
                         record.gradient = row_gradient
                         record.gradient_norm = float(row_gradient.float().norm().cpu())
                     return gradient
-                logits_batch.register_hook(capture_gradient)
+                route_hook_handles.append(logits_batch.register_hook(capture_gradient))
             next_q_parts: list[Tensor] = []
             next_h_parts: list[Tensor] = []
             next_modules: list[int] = []
@@ -446,6 +447,7 @@ class DynamicRouterLM(nn.Module):
 
         return outputs, {
             "route_records": records,
+            "route_hook_handles": route_hook_handles,
             "route_targets": route_targets,
             "branch_paths": branch_paths,
             "expected_length_per_sample": expected_lengths,
