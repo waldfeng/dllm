@@ -1,32 +1,427 @@
-"""Minimal causal-LM training entry point. Use Qwen2.5 tokenizer when available."""
+"""Two-GPU FSDP training entry point for the shared-memory language model."""
+
+from __future__ import annotations
 
 import argparse
+import contextlib
+import os
+import random
+import tempfile
+from dataclasses import asdict
+from pathlib import Path
+from typing import Iterator
 
+import numpy as np
 import torch
-from transformers import AutoTokenizer
+import torch.distributed as dist
+from torch import Tensor
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-from memory_transformer import QWEN25_TOKENIZER, MemoryTransformerConfig, MemoryTransformerForCausalLM
+from memory_transformer import (
+    MemoryReasoner,
+    MemoryTransformerConfig,
+    MemoryTransformerForCausalLM,
+    SharedMemory,
+)
+from pretrain_data import TokenStore, load_tokenizer, token_batches
+
+try:
+    from torch.distributed.fsdp import (
+        FullOptimStateDictConfig,
+        FullStateDictConfig,
+        FullyShardedDataParallel as FSDP,
+        MixedPrecision,
+        StateDictType,
+    )
+    from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+except ImportError:  # pragma: no cover - only old torch versions take this path
+    FSDP = None
+    ModuleWrapPolicy = None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset-dir", type=Path, default=Path("datasets/tokens"))
+    parser.add_argument("--tokenizer", default="temp/qwen-tokenizer")
+    parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument("--sequence-length", "--seq-len", type=int, default=2048)
+    parser.add_argument("--batch-size", type=int, default=1, help="per-GPU batch size")
+    parser.add_argument("--gradient-accumulation", type=int, default=8)
+    parser.add_argument("--num-layers", type=int, default=24)
+    parser.add_argument("--hidden-size", type=int, default=1536)
+    parser.add_argument("--intermediate-size", type=int, default=4096)
+    parser.add_argument("--num-attention-heads", type=int, default=16)
+    parser.add_argument("--num-key-value-heads", type=int, default=8)
+    parser.add_argument("--num-memory-blocks", type=int, default=24)
+    parser.add_argument("--top-k", type=int, default=3)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1)
+    parser.add_argument("--router-weight", type=float, default=0.01)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
+    parser.add_argument("--no-fsdp", action="store_true")
+    parser.add_argument("--checkpoint", type=Path, default=Path("datasets/checkpoints/last.pt"))
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument("--save-steps", type=int, default=1000)
+    parser.add_argument("--log-steps", type=int, default=10)
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    return parser.parse_args()
+
+
+def setup_distributed(device_choice: str) -> tuple[int, int, int, torch.device, bool]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    use_cuda = device_choice != "cpu" and torch.cuda.is_available()
+    if device_choice == "cuda" and not use_cuda:
+        raise RuntimeError("--device cuda was requested but CUDA is unavailable")
+    if world_size > 1:
+        backend = "nccl" if use_cuda else "gloo"
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    if use_cuda:
+        if world_size > 1:
+            torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank if world_size > 1 else 0)
+    else:
+        device = torch.device("cpu")
+    return rank, world_size, local_rank, device, world_size > 1
+
+
+def seed_everything(seed: int, rank: int) -> None:
+    value = seed + rank
+    random.seed(value)
+    np.random.seed(value)
+    torch.manual_seed(value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(value)
+
+
+def build_config(args: argparse.Namespace, vocab_size: int) -> MemoryTransformerConfig:
+    return MemoryTransformerConfig(
+        vocab_size=vocab_size,
+        hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate_size,
+        num_layers=args.num_layers,
+        num_attention_heads=args.num_attention_heads,
+        num_key_value_heads=args.num_key_value_heads,
+        num_memory_blocks=args.num_memory_blocks,
+        top_k=args.top_k,
+    )
+
+
+def wrap_model(
+    model: MemoryTransformerForCausalLM,
+    args: argparse.Namespace,
+    device: torch.device,
+    distributed: bool,
+    local_rank: int,
+) -> tuple[torch.nn.Module, bool]:
+    use_fsdp = distributed and not args.no_fsdp
+    if use_fsdp and FSDP is None:
+        raise RuntimeError("this torch build does not provide FSDP")
+    if args.precision == "bf16" and device.type == "cuda":
+        mixed_precision = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        )
+    else:
+        mixed_precision = None
+    if use_fsdp:
+        policy = ModuleWrapPolicy({SharedMemory, MemoryReasoner})
+        wrapped = FSDP(
+            model,
+            auto_wrap_policy=policy,
+            mixed_precision=mixed_precision,
+            device_id=device,
+            use_orig_params=True,
+        )
+        return wrapped, True
+
+    dtype = torch.bfloat16 if args.precision == "bf16" and device.type == "cuda" else None
+    model.to(device=device, dtype=dtype)
+    if distributed:
+        return DDP(model, device_ids=[local_rank] if device.type == "cuda" else None), False
+    return model, False
+
+
+def unwrap_model(model: torch.nn.Module) -> MemoryTransformerForCausalLM:
+    if isinstance(model, DDP) or (FSDP is not None and isinstance(model, FSDP)):
+        return model.module  # type: ignore[return-value]
+    return model  # type: ignore[return-value]
+
+
+def autocast_context(device: torch.device, precision: str):
+    if device.type == "cuda" and precision == "bf16":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
+def reduce_mean(value: Tensor, distributed: bool) -> Tensor:
+    if not distributed:
+        return value.detach()
+    reduced = value.detach().clone()
+    dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+    reduced /= dist.get_world_size()
+    return reduced
+
+
+def scheduler_for(
+    optimizer: torch.optim.Optimizer,
+    steps: int,
+    warmup_steps: int,
+    min_lr_ratio: float,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    if steps <= 0:
+        raise ValueError("steps must be positive")
+    if warmup_steps < 0 or not 0 <= min_lr_ratio <= 1:
+        raise ValueError("invalid scheduler settings")
+
+    def scale(step: int) -> float:
+        if step < warmup_steps:
+            return max(1e-8, (step + 1) / max(1, warmup_steps))
+        progress = (step - warmup_steps) / max(1, steps - warmup_steps)
+        cosine = 0.5 * (1.0 + np.cos(np.pi * min(1.0, progress)))
+        return float(min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, scale)
+
+
+def save_checkpoint(
+    path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    step: int,
+    config: MemoryTransformerConfig,
+    rank: int,
+    distributed: bool,
+    use_fsdp: bool,
+) -> None:
+    if use_fsdp:
+        state_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        optim_config = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(
+            model, StateDictType.FULL_STATE_DICT, state_config, optim_config
+        ):
+            model_state = model.state_dict()
+            optimizer_state = FSDP.optim_state_dict(model, optimizer)
+    else:
+        base = unwrap_model(model)
+        model_state = base.state_dict()
+        optimizer_state = optimizer.state_dict()
+    local_rng = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+    }
+    if distributed:
+        rng_states: list[dict | None] | None = [None] * dist.get_world_size()
+        dist.gather_object(local_rng, rng_states if rank == 0 else None, dst=0)
+    else:
+        rng_states = [local_rng]
+    if rank == 0:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "step": step,
+            "model": model_state,
+            "optimizer": optimizer_state,
+            "scheduler": scheduler.state_dict(),
+            "config": asdict(config),
+            "rng_states": rng_states,
+        }
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+        try:
+            torch.save(payload, temporary)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    if distributed:
+        dist.barrier()
+
+
+def load_checkpoint(
+    path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    distributed: bool,
+    use_fsdp: bool,
+    device: torch.device,
+) -> int:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if use_fsdp:
+        state_config = FullStateDictConfig(offload_to_cpu=False, rank0_only=False)
+        optim_config = FullOptimStateDictConfig(offload_to_cpu=False, rank0_only=False)
+        with FSDP.state_dict_type(
+            model, StateDictType.FULL_STATE_DICT, state_config, optim_config
+        ):
+            model.load_state_dict(payload["model"])
+            optimizer_state = FSDP.optim_state_dict_to_load(
+                model, optimizer, payload["optimizer"]
+            )
+            optimizer.load_state_dict(optimizer_state)
+    else:
+        unwrap_model(model).load_state_dict(payload["model"])
+        optimizer.load_state_dict(payload["optimizer"])
+    scheduler.load_state_dict(payload["scheduler"])
+    rng_states = payload.get("rng_states") or []
+    if rng_states:
+        state = rng_states[dist.get_rank() if distributed else 0]
+        if state is not None:
+            random.setstate(state["python"])
+            np.random.set_state(state["numpy"])
+            torch.set_rng_state(state["torch"])
+            if state["cuda"] is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state(state["cuda"])
+    if distributed:
+        dist.barrier()
+    return int(payload["step"])
+
+
+def batch_iterator(
+    store: TokenStore,
+    args: argparse.Namespace,
+    rank: int,
+    world_size: int,
+    start_step: int,
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    return token_batches(
+        store,
+        sequence_length=args.sequence_length,
+        batch_size=args.batch_size,
+        steps=args.steps * args.gradient_accumulation,
+        rank=rank,
+        world_size=world_size,
+        start_step=start_step * args.gradient_accumulation,
+        seed=args.seed,
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--steps", type=int, default=10)
-    parser.add_argument("--seq-len", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--recurrent-steps", type=int, default=1)
-    args = parser.parse_args()
-    tokenizer = AutoTokenizer.from_pretrained(QWEN25_TOKENIZER)
-    config = MemoryTransformerConfig(vocab_size=len(tokenizer))
+    args = parse_args()
+    if args.steps <= 0 or args.gradient_accumulation <= 0:
+        raise ValueError("steps and gradient-accumulation must be positive")
+    if args.log_steps <= 0:
+        raise ValueError("log-steps must be positive")
+    rank, world_size, local_rank, device, distributed = setup_distributed(args.device)
+    seed_everything(args.seed, rank)
+    store = TokenStore(args.dataset_dir)
+    vocab_size = int(store.manifest["vocab_size"])
+    tokenizer = load_tokenizer(args.tokenizer)
+    if len(tokenizer) != vocab_size:
+        raise ValueError(
+            f"tokenizer length {len(tokenizer)} does not match token manifest vocab "
+            f"size {vocab_size}"
+        )
+    config = build_config(args, vocab_size)
     model = MemoryTransformerForCausalLM(config)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
+    model, use_fsdp = wrap_model(model, args, device, distributed, local_rank)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+    scheduler = scheduler_for(
+        optimizer, args.steps, args.warmup_steps, args.min_lr_ratio
+    )
+    start_step = 0
+    if args.resume is not None:
+        start_step = load_checkpoint(
+            args.resume,
+            model,
+            optimizer,
+            scheduler,
+            distributed,
+            use_fsdp,
+            device,
+        )
+        if start_step > args.steps:
+            raise ValueError("checkpoint step is greater than requested --steps")
+    iterator = batch_iterator(store, args, rank, world_size, start_step)
     model.train()
-    for step in range(args.steps):
-        ids = torch.randint(tokenizer.vocab_size, (args.batch_size, args.seq_len))
-        out = model(ids, labels=ids, recurrent_steps=args.recurrent_steps)
-        (out["loss"] + 0.01 * out["router_loss"]).backward()
+    optimizer.zero_grad(set_to_none=True)
+    for step in range(start_step, args.steps):
+        loss_value = torch.zeros((), device=device)
+        router_value = torch.zeros((), device=device)
+        for micro_step in range(args.gradient_accumulation):
+            inputs, labels = next(iterator)
+            input_tensor = torch.from_numpy(inputs).to(device=device, non_blocking=True)
+            label_tensor = torch.from_numpy(labels).to(device=device, non_blocking=True)
+            if micro_step + 1 == args.gradient_accumulation or not hasattr(
+                model, "no_sync"
+            ):
+                sync_context = contextlib.nullcontext()
+            else:
+                sync_context = model.no_sync()
+            with sync_context:
+                with autocast_context(device, args.precision):
+                    output = model(input_tensor, labels=label_tensor)
+                    loss = output["loss"] + args.router_weight * output["router_loss"]
+                    scaled_loss = loss / args.gradient_accumulation
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"non-finite loss at step {step}")
+                scaled_loss.backward()
+            loss_value += output["loss"].detach()
+            router_value += output["router_loss"].detach()
+        if use_fsdp:
+            grad_norm = model.clip_grad_norm_(args.max_grad_norm)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), args.max_grad_norm
+            )
         optimizer.step()
+        scheduler.step()
         optimizer.zero_grad(set_to_none=True)
-        print(f"step={step} loss={out['loss'].item():.4f} router={out['router_loss'].item():.4f}")
+        completed_step = step + 1
+        if completed_step % args.log_steps == 0 or completed_step == 1:
+            metrics = torch.stack(
+                [
+                    loss_value / args.gradient_accumulation,
+                    router_value / args.gradient_accumulation,
+                    torch.as_tensor(grad_norm, device=device),
+                ]
+            )
+            metrics = reduce_mean(metrics, distributed)
+            if rank == 0:
+                print(
+                    f"step={completed_step} loss={metrics[0].item():.5f} "
+                    f"router={metrics[1].item():.5f} grad={metrics[2].item():.5f} "
+                    f"lr={scheduler.get_last_lr()[0]:.3e}",
+                    flush=True,
+                )
+        if args.save_steps > 0 and completed_step % args.save_steps == 0:
+            save_checkpoint(
+                args.checkpoint,
+                model,
+                optimizer,
+                scheduler,
+                completed_step,
+                config,
+                rank,
+                distributed,
+                use_fsdp,
+            )
+    save_checkpoint(
+        args.checkpoint,
+        model,
+        optimizer,
+        scheduler,
+        args.steps,
+        config,
+        rank,
+        distributed,
+        use_fsdp,
+    )
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
