@@ -56,11 +56,20 @@ def files_for(repo_id: str, pattern: str) -> list[dict]:
     return files
 
 
-def select_files() -> list[dict]:
+def select_files(
+    target_bytes: int = TARGET_BYTES,
+    excluded: set[tuple[str, str]] | None = None,
+    source_filter: set[str] | None = None,
+) -> list[dict]:
+    excluded = excluded or set()
     selected: list[dict] = []
     candidates: dict[str, list[dict]] = {}
     for repo_id, name, pattern in DATASETS:
+        if source_filter is not None and name not in source_filter:
+            continue
         for item in files_for(repo_id, pattern):
+            if (repo_id, item["path"]) in excluded:
+                continue
             item.update(repo_id=repo_id, source=name)
             candidates.setdefault(name, []).append(item)
     for source in candidates:
@@ -68,7 +77,7 @@ def select_files() -> list[dict]:
     total = 0
     source_names = sorted(candidates)
     positions = {source: 0 for source in source_names}
-    while total < TARGET_BYTES and source_names:
+    while total < target_bytes and source_names:
         made_progress = False
         for source in source_names:
             position = positions[source]
@@ -79,7 +88,7 @@ def select_files() -> list[dict]:
             selected.append(item)
             total += item["size"]
             made_progress = True
-            if total >= TARGET_BYTES:
+            if total >= target_bytes:
                 break
         if not made_progress:
             break
@@ -117,17 +126,49 @@ def main() -> None:
     parser.add_argument("--count-tokens", action="store_true")
     parser.add_argument("--tokenizer", default="temp/qwen-tokenizer")
     parser.add_argument("--max-tokens", type=int)
+    parser.add_argument("--target-bytes", type=int, default=TARGET_BYTES)
+    parser.add_argument(
+        "--supplement-bytes",
+        type=int,
+        help="add this many bytes not already listed in output/manifest.json",
+    )
+    parser.add_argument(
+        "--sources",
+        nargs="+",
+        choices=[name for _, name, _ in DATASETS],
+        help="restrict selection to named sources, useful for uncompressed estimates",
+    )
     args = parser.parse_args()
-    selected = select_files()
-    manifest = {
-        "target_bytes": TARGET_BYTES,
-        "selected_bytes": sum(x["size"] for x in selected),
-        "files": selected,
-        "tokenizer": "Qwen/Qwen2.5-0.5B",
-        "token_count": None,
-    }
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
+    existing_manifest_path = output / "manifest.json"
+    if args.supplement_bytes is not None:
+        if args.supplement_bytes <= 0:
+            raise ValueError("--supplement-bytes must be positive")
+        if not existing_manifest_path.exists():
+            raise FileNotFoundError(
+                f"--supplement-bytes requires an existing {existing_manifest_path}"
+            )
+        manifest = json.loads(existing_manifest_path.read_text(encoding="utf-8"))
+        existing_files = manifest.get("files", [])
+        excluded = {(item["repo_id"], item["path"]) for item in existing_files}
+        source_filter = set(args.sources) if args.sources else None
+        selected = select_files(args.supplement_bytes, excluded, source_filter)
+        if sum(item["size"] for item in selected) < args.supplement_bytes:
+            raise ValueError("available candidate files cannot satisfy supplement target")
+        manifest["supplement_bytes"] = args.supplement_bytes
+        manifest["files"] = existing_files + selected
+        manifest["selected_bytes"] = sum(item["size"] for item in manifest["files"])
+    else:
+        source_filter = set(args.sources) if args.sources else None
+        selected = select_files(args.target_bytes, source_filter=source_filter)
+        manifest = {
+            "target_bytes": args.target_bytes,
+            "selected_bytes": sum(x["size"] for x in selected),
+            "files": selected,
+            "tokenizer": "Qwen/Qwen2.5-0.5B",
+            "token_count": None,
+        }
     write_manifest(output, manifest)
     print(f"Selected {len(selected)} files, {manifest['selected_bytes'] / 1024**3:.2f} GiB", flush=True)
     if args.dry_run:
