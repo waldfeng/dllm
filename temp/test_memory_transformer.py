@@ -29,7 +29,7 @@ def tiny_model() -> MemoryTransformerForCausalLM:
         vocab_size=32,
         hidden_size=32,
         intermediate_size=64,
-        num_layers=2,
+        num_layers=4,
         num_attention_heads=4,
         num_key_value_heads=2,
         num_memory_blocks=4,
@@ -49,7 +49,7 @@ def test_forward_loss_router_gradients_and_stats():
     (output["loss"] + 0.01 * output["router_loss"]).backward()
     assert model.memory.ffn_gate.grad is not None
     assert model.layers[0].router.weight.grad is not None
-    assert len(output["route_indices"]) == 2
+    assert len(output["route_indices"]) == 4
     assert output["route_indices"][0].shape == (2, 8, 4, 2)
 
 
@@ -70,8 +70,10 @@ def test_memory_initializes_each_matrix_at_linear_scale():
     config = tiny_model().config
     model = tiny_model()
     q_expected = (2.0 / (config.hidden_size + config.hidden_size)) ** 0.5
-    gate_expected = (2.0 / config.hidden_size) ** 0.5
-    down_expected = (2.0 / config.intermediate_size) ** 0.5
+    gate_expected = (
+        2.0 / (config.hidden_size + config.intermediate_size)
+    ) ** 0.5
+    down_expected = gate_expected
     assert 0.5 * q_expected < model.memory.q_proj.std() < 1.5 * q_expected
     assert 0.5 * gate_expected < model.memory.ffn_gate.std() < 1.5 * gate_expected
     assert 0.5 * down_expected < model.memory.ffn_down.std() < 1.5 * down_expected
@@ -104,6 +106,17 @@ def test_attention_mask_and_invalid_head_dimension():
             vocab_size=32,
             hidden_size=10,
             intermediate_size=20,
+            num_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_memory_blocks=1,
+            top_k=1,
+        )
+    with pytest.raises(ValueError, match="num_layers must equal"):
+        MemoryTransformerConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
             num_layers=1,
             num_attention_heads=2,
             num_key_value_heads=1,

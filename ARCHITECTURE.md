@@ -45,9 +45,11 @@ heads and then averaged.
 
 ## Initialization
 
-Every memory bank is initialized one two-dimensional matrix at a time. Q/K/V/O
-matrices use Xavier uniform initialization. FFN gate/up/down matrices use Kaiming
-uniform initialization. Applying an initializer to the complete three-dimensional
+Every memory bank is initialized one two-dimensional matrix at a time. All
+trainable projection matrices, including FFN gate/up/down, Q/K/V/O, routers, and
+the language-model head, use Xavier uniform initialization. SiLU and RMSNorm are
+not trainable linear layers: SiLU has no parameters to initialize and RMSNorm
+starts with a unit scale. Applying an initializer to the complete three-dimensional
 bank would incorrectly treat the block axis as a convolution dimension and make
 the weights much too small.
 

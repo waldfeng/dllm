@@ -49,6 +49,11 @@ class MemoryTransformerConfig:
             raise ValueError(f"configuration values must be positive: {invalid}")
         if self.hidden_size % self.num_attention_heads:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
+        if self.num_layers != self.num_memory_blocks:
+            raise ValueError(
+                "num_layers must equal num_memory_blocks: each memory block has "
+                "one corresponding recurrent reasoner cycle"
+            )
         if self.num_attention_heads % self.num_key_value_heads:
             raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
         if (self.hidden_size // self.num_attention_heads) % 2:
@@ -139,14 +144,17 @@ class SharedMemory(nn.Module):
     def reset_parameters(self) -> None:
         # Initialize each addressable matrix separately. Initializing the whole
         # 3-D tensor makes PyTorch treat the block dimension as a kernel axis.
-        for bank in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
+        for bank in (
+            self.ffn_gate,
+            self.ffn_up,
+            self.ffn_down,
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            self.o_proj,
+        ):
             for block in bank:
                 nn.init.xavier_uniform_(block)
-        for bank in (self.ffn_gate, self.ffn_up, self.ffn_down):
-            for block in bank:
-                nn.init.kaiming_uniform_(
-                    block, a=0.0, mode="fan_in", nonlinearity="relu"
-                )
 
     @staticmethod
     def _locations(indices: Tensor, block_id: int) -> Tensor:
