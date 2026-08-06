@@ -121,7 +121,12 @@ def download(selected: list[dict], output: Path, workers: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default="datasets")
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="parallel file workers passed to ModelScope snapshot_download",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--count-tokens", action="store_true")
     parser.add_argument("--tokenizer", default="temp/qwen-tokenizer")
@@ -139,6 +144,8 @@ def main() -> None:
         help="restrict selection to named sources, useful for uncompressed estimates",
     )
     args = parser.parse_args()
+    if args.workers <= 0:
+        raise ValueError("--workers must be positive")
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     existing_manifest_path = output / "manifest.json"

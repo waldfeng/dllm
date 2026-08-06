@@ -82,7 +82,9 @@ uv pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --python .venv -e ".[
 2. Download selected source shards if they are not already present:
 
 ```bash
-.venv/bin/python scripts/download_pretrain_datasets.py --output datasets
+.venv/bin/python scripts/download_pretrain_datasets.py \
+  --output datasets \
+  --workers 16
 ```
 
 3. Tokenize every JSONL/JSONL.ZST document and require at least 20B tokens:

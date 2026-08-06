@@ -13,7 +13,9 @@ uv pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --python .venv -e ".[
 Download/resume the selected source shards:
 
 ```bash
-.venv/bin/python scripts/download_pretrain_datasets.py --output datasets
+.venv/bin/python scripts/download_pretrain_datasets.py \
+  --output datasets \
+  --workers 16
 ```
 
 The selection alternates available sources and paginates the ModelScope file
