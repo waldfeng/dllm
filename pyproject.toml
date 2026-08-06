@@ -1,18 +1,15 @@
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
-
 [project]
-name = "dynamic-router-prototype"
+name = "memory-transformer"
 version = "0.1.0"
-dependencies = ["torch", "numpy", "transformers", "modelscope"]
+description = "A recurrent Transformer with globally shared routed FFN and attention memory"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.2",
+  "transformers>=4.45",
+]
 
-[tool.setuptools.packages.find]
-include = ["dynamic_router*"]
-
-[project.scripts]
-prepare-c4 = "scripts.prepare_c4_modelscope:main"
-train-c4 = "scripts.train_c4:main"
+[project.optional-dependencies]
+dev = ["pytest>=8"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["temp"]
