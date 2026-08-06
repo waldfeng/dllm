@@ -18,5 +18,8 @@ dev = ["pytest>=8"]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+py-modules = ["memory_transformer", "pretrain_data"]
+
 [tool.pytest.ini_options]
 testpaths = ["temp"]
