@@ -669,6 +669,7 @@ def main() -> None:
                 distributed,
                 use_fsdp,
                 schedule_metadata,
+                data_metadata,
             )
             if rank == 0:
                 print(
@@ -693,6 +694,7 @@ def main() -> None:
             distributed,
             use_fsdp,
             schedule_metadata,
+            data_metadata,
         )
         if rank == 0:
             print(
