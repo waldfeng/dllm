@@ -105,19 +105,33 @@ from these shards and assigns disjoint batches to ranks.
 
 The two-GPU training entry point uses bf16, FSDP, gradient accumulation,
 cosine decay with warmup, gradient clipping, atomic checkpoint saves, and
-checkpoint resume:
+checkpoint resume. The production 12-hour run uses the largest batch that
+was safe in a real forward/backward/Adam benchmark, then backs off the
+effective token batch by one eighth to leave GPU headroom:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 train.py \
   --dataset-dir datasets/tokens \
   --tokenizer temp/qwen-tokenizer \
-  --steps 100000 \
-  --sequence-length 2048 \
+  --steps 900 \
+  --sequence-length 4608 \
   --batch-size 1 \
-  --gradient-accumulation 8 \
+  --gradient-accumulation 7 \
+  --lr 2.5e-4 \
+  --warmup-steps 60 \
+  --min-lr-ratio 0.1 \
   --precision bf16 \
-  --checkpoint datasets/checkpoints/memory-transformer.pt
+  --save-steps 0 \
+  --save-interval-hours 1 \
+  --checkpoint datasets/checkpoints/memory-transformer-12h.pt \
+  --log-steps 10
 ```
+
+This configuration has an effective global batch of 64,512 tokens per
+optimizer step. The measured throughput is about 1,348 tokens/second across
+both GPUs, giving about 12 hours for 900 steps. The checkpoint path is
+atomically overwritten once per wall-clock hour; training output should be
+redirected to a persistent log file such as `logs/train_12h.log`.
 
 The reference implementation is correctness-oriented. The block dispatch is
 memory-safe but not a fused production kernel; benchmark throughput before

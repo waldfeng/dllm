@@ -56,6 +56,21 @@ def iter_text_records(input_dir: Path) -> Iterator[tuple[Path, str]]:
                 yield path, text
 
 
+def _batched_records(
+    input_dir: Path, batch_size: int
+) -> Iterator[list[tuple[Path, str]]]:
+    if batch_size <= 0:
+        raise ValueError("tokenizer batch size must be positive")
+    batch: list[tuple[Path, str]] = []
+    for record in iter_text_records(input_dir):
+        batch.append(record)
+        if len(batch) == batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
 class TokenShardWriter:
     def __init__(self, output_dir: Path, shard_tokens: int) -> None:
         if shard_tokens <= 0:
@@ -127,6 +142,7 @@ def prepare_token_shards(
     shard_tokens: int = 100_000_000,
     min_tokens: int = 20_000_000_000,
     max_tokens: Optional[int] = None,
+    tokenizer_batch_size: int = 256,
 ) -> dict:
     """Tokenize every JSONL document and write uint32 mmap shards.
 
@@ -146,22 +162,57 @@ def prepare_token_shards(
     source_documents: dict[str, int] = {}
     source_tokens: dict[str, int] = {}
     stopped_at_limit = False
-    for path, text in iter_text_records(input_dir):
-        encoded = tokenizer.encode(text, add_special_tokens=False)
-        tokens = np.asarray((*encoded, eos_id), dtype=np.uint32)
-        if max_tokens is not None and total_tokens + len(tokens) > max_tokens:
-            tokens = tokens[: max_tokens - total_tokens]
-            stopped_at_limit = True
-        if len(tokens) == 0:
-            break
-        writer.append(tokens)
-        total_tokens += len(tokens)
-        documents += 1
-        key = str(path.relative_to(input_dir))
-        source_documents[key] = source_documents.get(key, 0) + 1
-        source_tokens[key] = source_tokens.get(key, 0) + len(tokens)
+    current_path: Optional[Path] = None
+    current_documents = 0
+    current_tokens = 0
+    for batch in _batched_records(input_dir, tokenizer_batch_size):
+        texts = [text for _, text in batch]
+        if callable(tokenizer):
+            encoded_batch = tokenizer(
+                texts,
+                add_special_tokens=False,
+                return_attention_mask=False,
+            )["input_ids"]
+        else:  # Keep the small tokenizer test doubles intentionally simple.
+            encoded_batch = [
+                tokenizer.encode(text, add_special_tokens=False) for text in texts
+            ]
+        for (path, _), encoded in zip(batch, encoded_batch):
+            if current_path is not None and path != current_path:
+                print(
+                    f"processed source={current_path.relative_to(input_dir)} "
+                    f"documents={current_documents} tokens={current_tokens} "
+                    f"total_tokens={total_tokens}",
+                    flush=True,
+                )
+                current_documents = 0
+                current_tokens = 0
+            current_path = path
+            tokens = np.asarray((*encoded, eos_id), dtype=np.uint32)
+            if max_tokens is not None and total_tokens + len(tokens) > max_tokens:
+                tokens = tokens[: max_tokens - total_tokens]
+                stopped_at_limit = True
+            if len(tokens) == 0:
+                break
+            writer.append(tokens)
+            total_tokens += len(tokens)
+            documents += 1
+            current_documents += 1
+            current_tokens += len(tokens)
+            key = str(path.relative_to(input_dir))
+            source_documents[key] = source_documents.get(key, 0) + 1
+            source_tokens[key] = source_tokens.get(key, 0) + len(tokens)
+            if stopped_at_limit:
+                break
         if stopped_at_limit:
             break
+    if current_path is not None:
+        print(
+            f"processed source={current_path.relative_to(input_dir)} "
+            f"documents={current_documents} tokens={current_tokens} "
+            f"total_tokens={total_tokens}",
+            flush=True,
+        )
     writer.close()
     manifest = {
         "format": "uint32_token_shards_v1",

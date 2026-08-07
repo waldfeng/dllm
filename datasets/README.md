@@ -33,5 +33,7 @@ training-ready token manifest is produced by the preprocessing command:
 
 The preprocessor reads all `.jsonl`, `.jsonl.gz`, and `.jsonl.zst` files under
 the input directory, appends one EOS token per document, writes uint32 mmap
-shards, and fails if fewer than 20B tokens were prepared. Use
-`--min-tokens 0` only for a smoke dataset.
+shards, and fails if fewer than 20B tokens were prepared. Tokenization is
+batched with `--tokenizer-batch-size` (default 256) and logs each completed
+source file with its cumulative token count. Use `--min-tokens 0` only for a
+smoke dataset.

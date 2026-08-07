@@ -24,6 +24,7 @@ def main() -> None:
     )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--shard-tokens", type=int, default=100_000_000)
+    parser.add_argument("--tokenizer-batch-size", type=int, default=256)
     parser.add_argument("--min-tokens", type=int, default=20_000_000_000)
     parser.add_argument("--max-tokens", type=int)
     parser.add_argument("--count-only", action="store_true")
@@ -42,6 +43,7 @@ def main() -> None:
         shard_tokens=args.shard_tokens,
         min_tokens=args.min_tokens,
         max_tokens=args.max_tokens,
+        tokenizer_batch_size=args.tokenizer_batch_size,
     )
     print(
         f"prepared documents={manifest['documents']} "

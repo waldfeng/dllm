@@ -7,6 +7,7 @@ import contextlib
 import os
 import random
 import tempfile
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Iterator
@@ -66,7 +67,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=Path("datasets/checkpoints/last.pt"))
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--save-steps", type=int, default=1000)
+    parser.add_argument(
+        "--save-interval-hours",
+        type=float,
+        default=0.0,
+        help="overwrite the checkpoint after this wall-clock interval; 0 disables it",
+    )
     parser.add_argument("--log-steps", type=int, default=10)
+    parser.add_argument(
+        "--max-runtime-hours",
+        type=float,
+        default=0.0,
+        help="stop training after this many wall-clock hours (0 disables it)",
+    )
+    parser.add_argument(
+        "--no-final-save",
+        action="store_true",
+        help="skip the final checkpoint save when training ends",
+    )
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     return parser.parse_args()
 
@@ -188,6 +206,40 @@ def scheduler_for(
         return float(min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, scale)
+
+
+def build_resume_scheduler(
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    current_lr: float,
+    start_step: int,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Build a scheduler that warms from *current_lr* to *args.lr* and then
+    cosine-decays to *args.min_lr_ratio* across the remaining steps."""
+    peak_lr = args.lr
+    warmup = args.warmup_steps
+    if warmup <= 0:
+        raise ValueError("warmup_steps must be positive for resume continuation")
+    start_ratio = max(1e-8, current_lr / peak_lr)
+    remaining = args.steps - start_step
+    if remaining <= 0:
+        raise ValueError("no steps remaining after resume")
+
+    def scale(step: int) -> float:
+        relative = max(0, step - start_step)
+        if relative < warmup:
+            progress = relative / warmup
+            return start_ratio + progress * (1.0 - start_ratio)
+        decay_steps = remaining - warmup
+        if decay_steps <= 0:
+            return 1.0
+        progress = (relative - warmup) / decay_steps
+        cosine = 0.5 * (1.0 + np.cos(np.pi * min(1.0, progress)))
+        return max(args.min_lr_ratio, args.min_lr_ratio + (1.0 - args.min_lr_ratio) * cosine)
+
+    for pg in optimizer.param_groups:
+        pg["lr"] = peak_lr
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, scale, last_epoch=start_step - 1)
 
 
 def save_checkpoint(
@@ -313,6 +365,8 @@ def main() -> None:
         raise ValueError("steps and gradient-accumulation must be positive")
     if args.log_steps <= 0:
         raise ValueError("log-steps must be positive")
+    if args.save_steps < 0 or args.save_interval_hours < 0:
+        raise ValueError("save intervals must be non-negative")
     rank, world_size, local_rank, device, distributed = setup_distributed(args.device)
     seed_everything(args.seed, rank)
     store = TokenStore(args.dataset_dir)
@@ -333,6 +387,7 @@ def main() -> None:
         optimizer, args.steps, args.warmup_steps, args.min_lr_ratio
     )
     start_step = 0
+    continuation_lr: float | None = None
     if args.resume is not None:
         start_step = load_checkpoint(
             args.resume,
@@ -343,11 +398,55 @@ def main() -> None:
             use_fsdp,
             device,
         )
-        if start_step > args.steps:
-            raise ValueError("checkpoint step is greater than requested --steps")
+        if start_step >= args.steps:
+            raise ValueError("checkpoint step must be less than requested --steps")
+        if args.warmup_steps > 0 and start_step > 0:
+            continuation_lr = scheduler.get_last_lr()[0]
+            scheduler = build_resume_scheduler(
+                optimizer, args, continuation_lr, start_step
+            )
     iterator = batch_iterator(store, args, rank, world_size, start_step)
     model.train()
     optimizer.zero_grad(set_to_none=True)
+    run_started = time.monotonic()
+    checkpoint_interval = args.save_interval_hours * 3600.0
+    next_wall_checkpoint = (
+        run_started + checkpoint_interval if checkpoint_interval > 0 else None
+    )
+    checkpoint_signal = (
+        torch.zeros(1, dtype=torch.int32, device=device)
+        if distributed and checkpoint_interval > 0
+        else None
+    )
+    stop_signal = (
+        torch.zeros(1, dtype=torch.int32, device=device)
+        if distributed and args.max_runtime_hours > 0
+        else None
+    )
+    tokens_per_step = (
+        args.batch_size * world_size * args.sequence_length * args.gradient_accumulation
+    )
+    last_log_time = run_started
+    last_log_step = start_step
+    if rank == 0:
+        extra = ""
+        if continuation_lr is not None:
+            extra = (
+                f" resume_lr={continuation_lr:.3e}"
+            )
+        print(
+            f"start step={start_step} target_steps={args.steps} "
+            f"params={config.parameter_count():,} vocab={vocab_size} "
+            f"global_tokens_per_step={tokens_per_step:,} "
+            f"lr={args.lr:.3e} warmup_steps={args.warmup_steps} "
+            f"min_lr_ratio={args.min_lr_ratio:.3f} precision={args.precision} "
+            f"fsdp={use_fsdp} checkpoint={args.checkpoint}"
+            f" max_runtime_h={args.max_runtime_hours:.1f}"
+            f"{extra}",
+            flush=True,
+        )
+    if rank == 0 and device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     for step in range(start_step, args.steps):
         loss_value = torch.zeros((), device=device)
         router_value = torch.zeros((), device=device)
@@ -391,13 +490,52 @@ def main() -> None:
             )
             metrics = reduce_mean(metrics, distributed)
             if rank == 0:
+                now = time.monotonic()
+                window_seconds = max(now - last_log_time, 1e-6)
+                window_steps = completed_step - last_log_step
+                tokens_per_second = window_steps * tokens_per_step / window_seconds
+                if device.type == "cuda":
+                    allocated_gib = torch.cuda.memory_allocated(device) / 2**30
+                    reserved_gib = torch.cuda.memory_reserved(device) / 2**30
+                    peak_gib = torch.cuda.max_memory_allocated(device) / 2**30
+                    memory = (
+                        f" alloc_gib={allocated_gib:.2f}"
+                        f" reserved_gib={reserved_gib:.2f} peak_gib={peak_gib:.2f}"
+                    )
+                    torch.cuda.reset_peak_memory_stats(device)
+                else:
+                    memory = ""
                 print(
                     f"step={completed_step} loss={metrics[0].item():.5f} "
                     f"router={metrics[1].item():.5f} grad={metrics[2].item():.5f} "
-                    f"lr={scheduler.get_last_lr()[0]:.3e}",
+                    f"lr={scheduler.get_last_lr()[0]:.3e} "
+                    f"elapsed_h={(now - run_started) / 3600.0:.3f} "
+                    f"tokens_per_s={tokens_per_second:.1f}{memory}",
                     flush=True,
                 )
-        if args.save_steps > 0 and completed_step % args.save_steps == 0:
+                last_log_time = now
+                last_log_step = completed_step
+        step_checkpoint_due = args.save_steps > 0 and completed_step % args.save_steps == 0
+        wall_checkpoint_due = (
+            rank == 0
+            and next_wall_checkpoint is not None
+            and time.monotonic() >= next_wall_checkpoint
+        )
+        max_runtime_due = False
+        if args.max_runtime_hours > 0:
+            elapsed_h = (time.monotonic() - run_started) / 3600.0
+            if rank == 0 and elapsed_h >= args.max_runtime_hours:
+                max_runtime_due = True
+            if stop_signal is not None:
+                stop_signal.fill_(int(max_runtime_due))
+                dist.broadcast(stop_signal, src=0)
+                max_runtime_due = bool(stop_signal.item())
+        should_save = step_checkpoint_due or wall_checkpoint_due or max_runtime_due
+        if checkpoint_signal is not None:
+            checkpoint_signal.fill_(int(should_save))
+            dist.broadcast(checkpoint_signal, src=0)
+            should_save = bool(checkpoint_signal.item())
+        if should_save:
             save_checkpoint(
                 args.checkpoint,
                 model,
@@ -409,17 +547,41 @@ def main() -> None:
                 distributed,
                 use_fsdp,
             )
-    save_checkpoint(
-        args.checkpoint,
-        model,
-        optimizer,
-        scheduler,
-        args.steps,
-        config,
-        rank,
-        distributed,
-        use_fsdp,
-    )
+            if rank == 0:
+                print(
+                    f"checkpoint_saved step={completed_step} path={args.checkpoint} "
+                    f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
+                    flush=True,
+                )
+                if next_wall_checkpoint is not None:
+                    next_wall_checkpoint = time.monotonic() + checkpoint_interval
+        if max_runtime_due:
+            early_exit = True
+            break
+    if not early_exit and not args.no_final_save:
+        save_checkpoint(
+            args.checkpoint,
+            model,
+            optimizer,
+            scheduler,
+            args.steps,
+            config,
+            rank,
+            distributed,
+            use_fsdp,
+        )
+        if rank == 0:
+            print(
+                f"checkpoint_saved final_step={args.steps} path={args.checkpoint} "
+                f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
+                flush=True,
+            )
+    elif early_exit and rank == 0:
+        print(
+            f"max_runtime_stopped step={completed_step} "
+            f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
+            flush=True,
+        )
     if distributed:
         dist.destroy_process_group()
 
