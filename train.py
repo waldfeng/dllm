@@ -45,6 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-dir", type=Path, default=Path("datasets/tokens"))
     parser.add_argument("--tokenizer", default="temp/qwen-tokenizer")
     parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument(
+        "--schedule-steps",
+        type=int,
+        default=0,
+        help="total optimizer steps covered by the LR schedule; 0 uses --steps",
+    )
     parser.add_argument("--sequence-length", "--seq-len", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=1, help="per-GPU batch size")
     parser.add_argument("--gradient-accumulation", type=int, default=8)
@@ -213,31 +219,51 @@ def build_resume_scheduler(
     args: argparse.Namespace,
     current_lr: float,
     start_step: int,
+    schedule_steps: int,
 ) -> torch.optim.lr_scheduler.LambdaLR:
-    """Build a scheduler that warms from *current_lr* to *args.lr* and then
-    cosine-decays to *args.min_lr_ratio* across the remaining steps."""
-    peak_lr = args.lr
-    warmup = args.warmup_steps
-    if peak_lr <= 0 or current_lr < 0:
+    """Build a continuation scheduler from the current checkpoint LR."""
+    return build_continuation_scheduler(
+        optimizer,
+        peak_lr=args.lr,
+        start_lr=current_lr,
+        warmup_steps=args.warmup_steps,
+        min_lr_ratio=args.min_lr_ratio,
+        schedule_start_step=start_step,
+        schedule_steps=schedule_steps,
+    )
+
+
+def build_continuation_scheduler(
+    optimizer: torch.optim.Optimizer,
+    peak_lr: float,
+    start_lr: float,
+    warmup_steps: int,
+    min_lr_ratio: float,
+    schedule_start_step: int,
+    schedule_steps: int,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Build a scheduler whose phase is defined by absolute optimizer steps."""
+    if peak_lr <= 0 or start_lr < 0:
         raise ValueError("learning rates must be non-negative and peak lr must be positive")
-    if warmup <= 0:
+    if warmup_steps <= 0:
         raise ValueError("warmup_steps must be positive for resume continuation")
-    start_ratio = max(1e-8, current_lr / peak_lr)
-    remaining = args.steps - start_step
-    if remaining <= 0:
-        raise ValueError("no steps remaining after resume")
+    if schedule_start_step < 0 or schedule_steps <= schedule_start_step:
+        raise ValueError("schedule must extend beyond its starting step")
+    if not 0 <= min_lr_ratio <= 1:
+        raise ValueError("min_lr_ratio must be in [0, 1]")
+    start_ratio = max(1e-8, start_lr / peak_lr)
 
     def scale(step: int) -> float:
-        relative = max(0, step - start_step)
-        if relative < warmup:
-            progress = relative / warmup
+        relative = max(0, step - schedule_start_step)
+        if relative < warmup_steps:
+            progress = relative / warmup_steps
             return start_ratio + progress * (1.0 - start_ratio)
-        decay_steps = remaining - warmup
+        decay_steps = schedule_steps - schedule_start_step - warmup_steps
         if decay_steps <= 0:
             return 1.0
-        progress = (relative - warmup) / decay_steps
+        progress = (relative - warmup_steps) / decay_steps
         cosine = 0.5 * (1.0 + np.cos(np.pi * min(1.0, progress)))
-        return max(args.min_lr_ratio, args.min_lr_ratio + (1.0 - args.min_lr_ratio) * cosine)
+        return max(min_lr_ratio, min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
 
     for pg in optimizer.param_groups:
         pg["lr"] = peak_lr
@@ -255,6 +281,7 @@ def save_checkpoint(
     rank: int,
     distributed: bool,
     use_fsdp: bool,
+    schedule_metadata: dict[str, object] | None = None,
 ) -> None:
     if use_fsdp:
         state_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -288,6 +315,7 @@ def save_checkpoint(
             "scheduler": scheduler.state_dict(),
             "config": asdict(config),
             "rng_states": rng_states,
+            "schedule": schedule_metadata,
         }
         with tempfile.NamedTemporaryFile(
             dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
@@ -310,10 +338,13 @@ def load_checkpoint(
     distributed: bool,
     use_fsdp: bool,
     device: torch.device,
-) -> int:
+    expected_config: MemoryTransformerConfig,
+) -> tuple[int, dict[str, object] | None, dict[str, object]]:
     if not path.exists():
         raise FileNotFoundError(path)
     payload = torch.load(path, map_location="cpu", weights_only=False)
+    if payload.get("config") != asdict(expected_config):
+        raise ValueError("checkpoint model config does not match the requested config")
     if use_fsdp:
         state_config = FullStateDictConfig(offload_to_cpu=False, rank0_only=False)
         optim_config = FullOptimStateDictConfig(offload_to_cpu=False, rank0_only=False)
@@ -340,7 +371,7 @@ def load_checkpoint(
                 torch.cuda.set_rng_state(state["cuda"])
     if distributed:
         dist.barrier()
-    return int(payload["step"])
+    return int(payload["step"]), payload.get("schedule"), payload["scheduler"]
 
 
 def batch_iterator(
@@ -368,8 +399,16 @@ def main() -> None:
         raise ValueError("steps and gradient-accumulation must be positive")
     if args.log_steps <= 0:
         raise ValueError("log-steps must be positive")
-    if args.save_steps < 0 or args.save_interval_hours < 0:
-        raise ValueError("save intervals must be non-negative")
+    if (
+        args.save_steps < 0
+        or args.save_interval_hours < 0
+        or args.max_runtime_hours < 0
+        or args.schedule_steps < 0
+    ):
+        raise ValueError("save, runtime, and schedule limits must be non-negative")
+    schedule_steps = args.schedule_steps or args.steps
+    if schedule_steps <= 0:
+        raise ValueError("schedule-steps must be positive")
     rank, world_size, local_rank, device, distributed = setup_distributed(args.device)
     seed_everything(args.seed, rank)
     store = TokenStore(args.dataset_dir)
@@ -391,8 +430,9 @@ def main() -> None:
     )
     start_step = 0
     continuation_lr: float | None = None
+    schedule_metadata: dict[str, object] | None = None
     if args.resume is not None:
-        start_step = load_checkpoint(
+        start_step, saved_schedule, saved_scheduler_state = load_checkpoint(
             args.resume,
             model,
             optimizer,
@@ -400,13 +440,51 @@ def main() -> None:
             distributed,
             use_fsdp,
             device,
+            config,
         )
         if start_step >= args.steps:
             raise ValueError("checkpoint step must be less than requested --steps")
-        if args.warmup_steps > 0 and start_step > 0:
+        if saved_schedule is not None and saved_schedule.get("mode") == "continuation":
+            required = {
+                "start_step",
+                "start_lr",
+                "peak_lr",
+                "warmup_steps",
+                "min_lr_ratio",
+                "schedule_steps",
+            }
+            if not required.issubset(saved_schedule):
+                raise ValueError("checkpoint continuation schedule metadata is incomplete")
+            checkpoint_schedule_steps = int(saved_schedule["schedule_steps"])
+            if args.schedule_steps and args.schedule_steps != checkpoint_schedule_steps:
+                raise ValueError("--schedule-steps does not match checkpoint schedule")
+            schedule_metadata = dict(saved_schedule)
+            scheduler = build_continuation_scheduler(
+                optimizer,
+                peak_lr=float(saved_schedule["peak_lr"]),
+                start_lr=float(saved_schedule["start_lr"]),
+                warmup_steps=int(saved_schedule["warmup_steps"]),
+                min_lr_ratio=float(saved_schedule["min_lr_ratio"]),
+                schedule_start_step=int(saved_schedule["start_step"]),
+                schedule_steps=checkpoint_schedule_steps,
+            )
+            scheduler.load_state_dict(saved_scheduler_state)
+            for group, lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
+                group["lr"] = lr
             continuation_lr = scheduler.get_last_lr()[0]
+        elif args.warmup_steps > 0 and start_step > 0:
+            continuation_lr = scheduler.get_last_lr()[0]
+            schedule_metadata = {
+                "mode": "continuation",
+                "start_step": start_step,
+                "start_lr": continuation_lr,
+                "peak_lr": args.lr,
+                "warmup_steps": args.warmup_steps,
+                "min_lr_ratio": args.min_lr_ratio,
+                "schedule_steps": schedule_steps,
+            }
             scheduler = build_resume_scheduler(
-                optimizer, args, continuation_lr, start_step
+                optimizer, args, continuation_lr, start_step, schedule_steps
             )
     iterator = batch_iterator(store, args, rank, world_size, start_step)
     model.train()
@@ -444,6 +522,7 @@ def main() -> None:
             f"lr={args.lr:.3e} warmup_steps={args.warmup_steps} "
             f"min_lr_ratio={args.min_lr_ratio:.3f} precision={args.precision} "
             f"fsdp={use_fsdp} checkpoint={args.checkpoint}"
+            f" schedule_steps={schedule_steps}"
             f" max_runtime_h={args.max_runtime_hours:.1f}"
             f"{extra}",
             flush=True,
@@ -550,6 +629,7 @@ def main() -> None:
                 rank,
                 distributed,
                 use_fsdp,
+                schedule_metadata,
             )
             if rank == 0:
                 print(
@@ -573,6 +653,7 @@ def main() -> None:
             rank,
             distributed,
             use_fsdp,
+            schedule_metadata,
         )
         if rank == 0:
             print(
