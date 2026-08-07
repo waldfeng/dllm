@@ -343,7 +343,12 @@ def load_checkpoint(
     use_fsdp: bool,
     device: torch.device,
     expected_config: MemoryTransformerConfig,
-) -> tuple[int, dict[str, object] | None, dict[str, object]]:
+) -> tuple[
+    int,
+    dict[str, object] | None,
+    dict[str, object] | None,
+    dict[str, object],
+]:
     if not path.exists():
         raise FileNotFoundError(path)
     payload = torch.load(path, map_location="cpu", weights_only=False)
@@ -375,7 +380,27 @@ def load_checkpoint(
                 torch.cuda.set_rng_state(state["cuda"])
     if distributed:
         dist.barrier()
-    return int(payload["step"]), payload.get("schedule"), payload["scheduler"]
+    return (
+        int(payload["step"]),
+        payload.get("schedule"),
+        payload.get("data"),
+        payload["scheduler"],
+    )
+
+
+def build_data_metadata(
+    store: TokenStore, args: argparse.Namespace, world_size: int
+) -> dict[str, object]:
+    return {
+        "total_tokens": store.total_tokens,
+        "vocab_size": int(store.manifest["vocab_size"]),
+        "eos_token_id": int(store.manifest["eos_token_id"]),
+        "sequence_length": args.sequence_length,
+        "batch_size": args.batch_size,
+        "gradient_accumulation": args.gradient_accumulation,
+        "world_size": world_size,
+        "seed": args.seed,
+    }
 
 
 def batch_iterator(
