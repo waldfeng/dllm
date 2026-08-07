@@ -284,6 +284,7 @@ def save_checkpoint(
     distributed: bool,
     use_fsdp: bool,
     schedule_metadata: dict[str, object] | None = None,
+    data_metadata: dict[str, object] | None = None,
 ) -> None:
     if use_fsdp:
         state_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -318,6 +319,7 @@ def save_checkpoint(
             "config": asdict(config),
             "rng_states": rng_states,
             "schedule": schedule_metadata,
+            "data": data_metadata,
         }
         with tempfile.NamedTemporaryFile(
             dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
