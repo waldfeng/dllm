@@ -268,7 +268,9 @@ def build_continuation_scheduler(
     for pg in optimizer.param_groups:
         pg["lr"] = peak_lr
         pg["initial_lr"] = peak_lr
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, scale, last_epoch=start_step - 1)
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer, scale, last_epoch=schedule_start_step - 1
+    )
 
 
 def save_checkpoint(
