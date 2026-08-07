@@ -460,8 +460,9 @@ def main() -> None:
     start_step = 0
     continuation_lr: float | None = None
     schedule_metadata: dict[str, object] | None = None
+    data_metadata = build_data_metadata(store, args, world_size)
     if args.resume is not None:
-        start_step, saved_schedule, saved_scheduler_state = load_checkpoint(
+        start_step, saved_schedule, saved_data, saved_scheduler_state = load_checkpoint(
             args.resume,
             model,
             optimizer,
@@ -471,6 +472,14 @@ def main() -> None:
             device,
             config,
         )
+        if saved_data is not None and saved_data != data_metadata:
+            raise ValueError("checkpoint data metadata does not match the requested data stream")
+        if saved_data is None and rank == 0:
+            print(
+                "resume_warning checkpoint has no data metadata; "
+                "data continuity relies on unchanged loader arguments",
+                flush=True,
+            )
         if start_step >= args.steps:
             raise ValueError("checkpoint step must be less than requested --steps")
         if saved_schedule is not None and saved_schedule.get("mode") == "continuation":
@@ -487,6 +496,7 @@ def main() -> None:
             checkpoint_schedule_steps = int(saved_schedule["schedule_steps"])
             if args.schedule_steps and args.schedule_steps != checkpoint_schedule_steps:
                 raise ValueError("--schedule-steps does not match checkpoint schedule")
+            schedule_steps = checkpoint_schedule_steps
             schedule_metadata = dict(saved_schedule)
             scheduler = build_continuation_scheduler(
                 optimizer,
