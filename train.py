@@ -218,6 +218,8 @@ def build_resume_scheduler(
     cosine-decays to *args.min_lr_ratio* across the remaining steps."""
     peak_lr = args.lr
     warmup = args.warmup_steps
+    if peak_lr <= 0 or current_lr < 0:
+        raise ValueError("learning rates must be non-negative and peak lr must be positive")
     if warmup <= 0:
         raise ValueError("warmup_steps must be positive for resume continuation")
     start_ratio = max(1e-8, current_lr / peak_lr)
@@ -239,6 +241,7 @@ def build_resume_scheduler(
 
     for pg in optimizer.param_groups:
         pg["lr"] = peak_lr
+        pg["initial_lr"] = peak_lr
     return torch.optim.lr_scheduler.LambdaLR(optimizer, scale, last_epoch=start_step - 1)
 
 
@@ -447,6 +450,7 @@ def main() -> None:
         )
     if rank == 0 and device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+    early_exit = False
     for step in range(start_step, args.steps):
         loss_value = torch.zeros((), device=device)
         router_value = torch.zeros((), device=device)
