@@ -39,6 +39,17 @@ def tiny_model() -> MemoryTransformerForCausalLM:
     return MemoryTransformerForCausalLM(config)
 
 
+def test_labels_equal_to_input_ids_is_next_token():
+    model = tiny_model().eval()
+    ids = torch.arange(16).view(2, 8) % 32
+    shifted = torch.cat((ids[:, 1:], torch.zeros(2, 1, dtype=ids.dtype)), dim=1)
+    with torch.no_grad():
+        next_token = model(ids, labels=ids)["loss"]
+        plus_two = model(ids, labels=shifted)["loss"]
+    assert torch.isfinite(next_token)
+    assert next_token != plus_two
+
+
 def test_forward_loss_router_gradients_and_stats():
     model = tiny_model()
     ids = torch.randint(32, (2, 8))

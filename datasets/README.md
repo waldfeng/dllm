@@ -26,7 +26,7 @@ training-ready token manifest is produced by the preprocessing command:
 .venv/bin/python scripts/prepare_pretrain_data.py \
   --input-dir datasets \
   --output-dir datasets/tokens \
-  --tokenizer temp/qwen-tokenizer \
+  --tokenizer tokenizer/qwen \
   --local-files-only \
   --min-tokens 20000000000
 ```

@@ -19,7 +19,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("datasets/tokens"))
     parser.add_argument(
         "--tokenizer",
-        default="temp/qwen-tokenizer",
+        default="tokenizer/qwen",
         help="local tokenizer directory or a Hugging Face/ModelScope identifier",
     )
     parser.add_argument("--local-files-only", action="store_true")

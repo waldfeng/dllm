@@ -93,7 +93,7 @@ uv pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --python .venv -e ".[
 .venv/bin/python scripts/prepare_pretrain_data.py \
   --input-dir datasets \
   --output-dir datasets/tokens \
-  --tokenizer temp/qwen-tokenizer \
+  --tokenizer tokenizer/qwen \
   --local-files-only \
   --min-tokens 20000000000
 ```
@@ -112,7 +112,7 @@ effective token batch by one eighth to leave GPU headroom:
 ```bash
 torchrun --standalone --nproc_per_node=2 train.py \
   --dataset-dir datasets/tokens \
-  --tokenizer temp/qwen-tokenizer \
+  --tokenizer tokenizer/qwen \
   --steps 900 \
   --sequence-length 4608 \
   --batch-size 1 \

@@ -22,4 +22,4 @@ build-backend = "setuptools.build_meta"
 py-modules = ["memory_transformer", "pretrain_data"]
 
 [tool.pytest.ini_options]
-testpaths = ["temp"]
+testpaths = ["tests"]

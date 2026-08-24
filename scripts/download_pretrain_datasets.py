@@ -129,7 +129,7 @@ def main() -> None:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--count-tokens", action="store_true")
-    parser.add_argument("--tokenizer", default="temp/qwen-tokenizer")
+    parser.add_argument("--tokenizer", default="tokenizer/qwen")
     parser.add_argument("--max-tokens", type=int)
     parser.add_argument("--target-bytes", type=int, default=TARGET_BYTES)
     parser.add_argument(

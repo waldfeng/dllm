@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover - only old torch versions take this path
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-dir", type=Path, default=Path("datasets/tokens"))
-    parser.add_argument("--tokenizer", default="temp/qwen-tokenizer")
+    parser.add_argument("--tokenizer", default="tokenizer/qwen")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument(
         "--schedule-steps",
@@ -462,7 +462,7 @@ def main() -> None:
     schedule_metadata: dict[str, object] | None = None
     data_metadata = build_data_metadata(store, args, world_size)
     if args.resume is not None:
-        start_step, saved_schedule, saved_data, saved_scheduler_state = load_checkpoint(
+        start_step, _saved_schedule, saved_data, _saved_scheduler_state = load_checkpoint(
             args.resume,
             model,
             optimizer,
@@ -482,37 +482,11 @@ def main() -> None:
             )
         if start_step >= args.steps:
             raise ValueError("checkpoint step must be less than requested --steps")
-        if saved_schedule is not None and saved_schedule.get("mode") == "continuation":
-            required = {
-                "start_step",
-                "start_lr",
-                "peak_lr",
-                "warmup_steps",
-                "min_lr_ratio",
-                "schedule_steps",
-            }
-            if not required.issubset(saved_schedule):
-                raise ValueError("checkpoint continuation schedule metadata is incomplete")
-            checkpoint_schedule_steps = int(saved_schedule["schedule_steps"])
-            if args.schedule_steps and args.schedule_steps != checkpoint_schedule_steps:
-                raise ValueError("--schedule-steps does not match checkpoint schedule")
-            schedule_steps = checkpoint_schedule_steps
-            schedule_metadata = dict(saved_schedule)
-            scheduler = build_continuation_scheduler(
-                optimizer,
-                peak_lr=float(saved_schedule["peak_lr"]),
-                start_lr=float(saved_schedule["start_lr"]),
-                warmup_steps=int(saved_schedule["warmup_steps"]),
-                min_lr_ratio=float(saved_schedule["min_lr_ratio"]),
-                schedule_start_step=int(saved_schedule["start_step"]),
-                schedule_steps=checkpoint_schedule_steps,
-            )
-            scheduler.load_state_dict(saved_scheduler_state)
-            for group, lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
-                group["lr"] = lr
-            continuation_lr = scheduler.get_last_lr()[0]
-        elif args.warmup_steps > 0 and start_step > 0:
-            continuation_lr = scheduler.get_last_lr()[0]
+        if args.warmup_steps > 0 and start_step > 0:
+            # A resume keeps the optimizer state but starts the next phase from
+            # the schedule requested by the current command line. This allows
+            # a shorter cosine phase after a long-running schedule has plateaued.
+            continuation_lr = float(optimizer.param_groups[0]["lr"])
             schedule_metadata = {
                 "mode": "continuation",
                 "start_step": start_step,
@@ -584,7 +558,7 @@ def main() -> None:
                 sync_context = model.no_sync()
             with sync_context:
                 with autocast_context(device, args.precision):
-                    output = model(input_tensor, labels=label_tensor)
+                    output = model(input_tensor, labels=input_tensor)
                     loss = output["loss"] + args.router_weight * output["router_loss"]
                     scaled_loss = loss / args.gradient_accumulation
                 if not torch.isfinite(loss):

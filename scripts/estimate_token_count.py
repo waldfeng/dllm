@@ -53,7 +53,7 @@ def sample_file(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, default=Path("datasets/manifest.json"))
-    parser.add_argument("--tokenizer", default="temp/qwen-tokenizer")
+    parser.add_argument("--tokenizer", default="tokenizer/qwen")
     parser.add_argument("--sample-bytes", type=int, default=8 * 1024 * 1024)
     parser.add_argument("--sample-files", type=int, default=1)
     parser.add_argument("--target-tokens", type=int, default=20_000_000_000)
