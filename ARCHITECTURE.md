@@ -72,16 +72,25 @@ and the final norm. It remains inside the requested 1B-1.5B range.
 
 ## Early Exit And Calibrated Readout
 
-After each reasoner cycle the model evaluates three signals on the last token
-position and may halt the loop for the whole sequence once a minimum depth is
-reached:
+After each reasoner cycle the model evaluates a weighted halting cost on the
+last token position; the exit depth is the argmax of the depth-selection
+distribution over the whole loop (batch-level):
 
 ```text
-p_t = top-1 probability of the depth-calibrated logits
-m_t = p1 - p2 (softmax probability margin)
-d_t = ||norm(x_t) - norm(x_{t-1})|| / ||norm(x_t)||  (mask-averaged over positions)
-halt  iff  t >= min_depth and p_t >= tau_c and m_t >= tau_m and d_t <= tau_d
+l_t = pi_conf   * max(0, tau_c - p_t)   # top-1 probability deficit
+    + pi_margin * max(0, tau_m - m_t)   # m_t = p1 - p2 probability margin
+    + pi_delta  * max(0, d_t - tau_d)   # normalized state change (mask-averaged)
+    + pi_speed  * t / num_depths        # speed pressure
+    + pi_guard  * max(0, min_depth - t) / num_depths
+rho = softmax(-l_t / temperature)
+exit depth = argmax_t rho_t             # equivalently the smallest l_t
 ```
+
+Online the loop tracks the running minimum of `l_t` and halts at the first
+depth whose cost rises above it; depths below `min_depth` are never exit
+candidates, and the shortlist cross-entropy term is dropped because it has no
+ground truth at inference (its annealed prior mass is zero, so the training
+and inference depth-selection distributions coincide).
 
 `CalibratedExitReadout` is an optional per-depth correction on the frozen
 `lm_head`: `logits_t = s_t * (W h + B_t (A_t h) + c_t)` with rank-16 LoRA
@@ -98,29 +107,25 @@ speed `t/24`, min-depth guard `max(0, 8 - t)/24`) combined by a learnable
 six-way weight distribution `pi = softmax(theta)`; term seven aligns
 `softmax(weighted terms)` with the fixed prior
 `[0.65, 0.05, 0.05, 0.05, 0.15, 0.05]` through a sigmoid (the prior's CE mass
-anneals to 0.20 so selection shifts onto inference-available signals, because
-the CE term does not exist without a ground-truth token); term eight sharpens
-the depth-selection distribution `rho = softmax(-l_t / T)` and normalizes its
-entropy by `log(depths)`.  The shortlist CE uses the top-64 teacher tokens
-plus the true token, so per-depth supervision costs almost nothing.
+anneals to 0.0 so the training depth-selection distribution is identical to
+the inference-time one, because the CE term does not exist without a
+ground-truth token); term eight sharpens the depth-selection distribution
+`rho = softmax(-l_t / T)` and normalizes its entropy by `log(depths)`.  The
+shortlist CE uses the top-64 teacher tokens plus the true token, so per-depth
+supervision costs almost nothing.
 
-`scripts/calibrate_early_exit.py` fits the final thresholds after readout
-training: it derives the oracle exit depth (`CE_t - CE_full <= epsilon`) on
-held-out windows and grid-searches `(tau_c, tau_m, tau_d)` for the fastest
-policy whose relative CE degradation stays within `--budget`, validated on a
-disjoint half.  The artifact written to `--output` carries the policy that
-`test.py --early-exit-config` loads.
+The trained six-way weights and the final temperature are saved inside the
+exit checkpoint (`exit_loss_weights`, `exit_temperature`); `test.py` restores
+them and enables the depth-selection halting automatically for two-stage
+checkpoints.
 
 ```bash
 torchrun --standalone --nproc_per_node=2 train.py ...   # pretraining (unchanged)
 python train.py --train-exit-readout --resume <base.pt> \
   --checkpoint datasets/checkpoints/exit-readout.pt --steps 2000 \
   --exit-readout-rank 16 --device auto
-python scripts/calibrate_early_exit.py \
-  --checkpoint datasets/checkpoints/exit-readout.pt \
-  --dataset-dir datasets/tokens --output early_exit_calibration.pt
 python test.py --checkpoint datasets/checkpoints/exit-readout.pt \
-  --early-exit-config early_exit_calibration.pt --benchmark-tokens 128
+  --benchmark-tokens 128
 ```
 
 Disable the early exit with `--no-early-exit` (the default configuration runs

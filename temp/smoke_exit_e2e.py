@@ -1,4 +1,4 @@
-"""End-to-end smoke: readout training -> calibration -> benchmark on a tiny model."""
+"""End-to-end smoke: readout training -> selection checkpoint -> benchmark on a tiny model."""
 
 import json
 import subprocess
@@ -80,7 +80,6 @@ def main() -> None:
     store = build_store()
     base = build_base_checkpoint(store)
     trained = WORK / "exit-readout.pt"
-    calibration = WORK / "calibration.pt"
     tokenizer_dir = build_tokenizer()
     python = str(Path(".venv/bin/python").resolve())
     run([
@@ -100,23 +99,18 @@ def main() -> None:
     ])
     payload = torch.load(trained, map_location="cpu", weights_only=False)
     assert any(name.startswith("exit_readout.") for name in payload["model"])
-    print("readout checkpoint keys ok", flush=True)
-    run([
-        python, "scripts/calibrate_early_exit.py",
-        "--checkpoint", trained,
-        "--dataset-dir", store,
-        "--output", calibration,
-        "--sequence-length", "8", "--batch-size", "2", "--windows", "16",
-        "--epsilon", "1.0", "--budget", "0.5", "--min-depth", "2",
-        "--device", "cpu", "--precision", "fp32",
-    ])
-    artifact = torch.load(calibration, map_location="cpu", weights_only=False)
-    print("policy:", artifact["policy"], flush=True)
+    assert "exit_loss_weights" in payload and "exit_temperature" in payload
+    print(
+        "readout checkpoint keys ok weights=",
+        [round(float(v), 4) for v in payload["exit_loss_weights"].tolist()],
+        "temperature=",
+        round(float(payload["exit_temperature"]), 4),
+        flush=True,
+    )
     run([
         python, "test.py",
         "--checkpoint", trained,
         "--tokenizer", tokenizer_dir,
-        "--early-exit-config", calibration,
         "--prompt", "abc def",
         "--max-chars", "8",
         "--benchmark-tokens", "5",

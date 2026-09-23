@@ -1,5 +1,6 @@
 import argparse
 import math
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,9 @@ from memory_transformer import (
     MemoryTransformerConfig,
     MemoryTransformerForCausalLM,
     ensure_exit_readout,
+    selection_exit_depth,
 )
+from test import load_model
 from train import exit_readout_losses
 
 
@@ -65,30 +68,31 @@ def uniform_weights() -> torch.Tensor:
     return prior / prior.sum()
 
 
-def test_extreme_thresholds_run_full_depth_and_match_baseline():
-    model = tiny_model(
+def speed_only_model(**overrides) -> MemoryTransformerForCausalLM:
+    values = dict(
         early_exit_enabled=True,
-        early_exit_min_depth=4,
         early_exit_confidence_threshold=1e-6,
         early_exit_margin_threshold=0.0,
         early_exit_state_delta_threshold=1e9,
-    ).eval()
+    )
+    values.update(overrides)
+    return tiny_model(**values)
+
+
+def test_full_min_depth_runs_full_depth_and_matches_baseline():
+    model = speed_only_model(early_exit_min_depth=4).eval()
     ids = torch.arange(8).view(1, 8) % 32
     with torch.no_grad():
         exited = model(ids, early_exit=True)
         baseline = model(ids, early_exit=False)
     assert exited["exit_depth"] == 4
+    assert exited["exit_halted"] is False
     assert torch.equal(exited["logits"], baseline["logits"])
 
 
-def test_min_depth_halt_equals_manual_partial_loop():
-    model = tiny_model(
-        early_exit_enabled=True,
-        early_exit_min_depth=2,
-        early_exit_confidence_threshold=1e-6,
-        early_exit_margin_threshold=0.0,
-        early_exit_state_delta_threshold=1e9,
-    ).eval()
+def test_monotone_cost_halts_at_min_depth_and_matches_manual_loop():
+    model = speed_only_model(early_exit_min_depth=2).eval()
+    ensure_exit_readout(model)
     ids = torch.arange(8).view(1, 8) % 32
     with torch.no_grad():
         output = model(ids, early_exit=True)
@@ -98,7 +102,7 @@ def test_min_depth_halt_equals_manual_partial_loop():
         reference = model.lm_head(model.norm(x))
     assert output["exit_depth"] == 2
     assert output["exit_halted"] is True
-    assert torch.allclose(output["logits"], reference)
+    assert torch.equal(output["logits"], reference)
 
 
 def test_calibrated_readout_identity_is_bitwise_equal():
@@ -115,6 +119,7 @@ def test_calibrated_readout_identity_is_bitwise_equal():
         states = torch.randn(3, 32)
         at_depth = model.exit_readout.logits_at(1, states, model.lm_head.weight)
         plain = torch.nn.functional.linear(states, model.lm_head.weight)
+    assert exited["exit_depth"] == 4
     assert torch.equal(exited["logits"], baseline["logits"])
     assert torch.equal(at_depth, plain)
 
@@ -266,18 +271,32 @@ def test_exit_rollout_shapes_and_zero_first_delta():
     assert torch.all(rollout["deltas"][1:] > 0.0)
 
 
-def test_checkpoint_roundtrip_with_readout(tmp_path: Path):
+def test_checkpoint_roundtrip_with_selection_payload(tmp_path: Path):
     model = tiny_model().eval()
     ensure_exit_readout(model)
     ids = torch.arange(8).view(1, 8) % 32
     with torch.no_grad():
         before = model(ids, early_exit=True)["logits"]
+    weights = torch.tensor(list(model.config.exit_selection_weights))
     path = tmp_path / "exit-readout.pt"
-    torch.save({"model": model.state_dict(), "exit_readout_rank": 16}, path)
-    restored = tiny_model().eval()
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    ensure_exit_readout(restored, rank=int(payload["exit_readout_rank"]))
-    restored.load_state_dict(payload["model"])
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "config": asdict(model.config),
+            "exit_readout_rank": 16,
+            "exit_loss_weights": weights,
+            "exit_temperature": 0.25,
+        },
+        path,
+    )
+    restored = load_model(path, torch.device("cpu"))
+    assert restored.config.early_exit_enabled is True
+    assert torch.allclose(
+        torch.tensor(restored.config.exit_selection_weights),
+        torch.tensor(model.config.exit_selection_weights),
+        atol=1e-6,
+    )
+    assert restored.config.exit_selection_temperature == pytest.approx(0.25)
     with torch.no_grad():
         after = restored(ids, early_exit=True)["logits"]
     assert torch.equal(before, after)
@@ -294,48 +313,48 @@ def test_shortlist_full_coverage_matches_full_ce():
         model, rollout, target, weights, uniform_weights(), permissive_args(), 0.0, 4
     )
     states = rollout["states"].float()
+    log_vocab = math.log(model.lm_head.weight.shape[-1])
     expected = []
     for depth_index in range(4):
         logits = model.exit_readout.logits_at(
             depth_index, states[depth_index], model.lm_head.weight.to(states.dtype)
         )
         full_ce = torch.nn.functional.cross_entropy(logits, target, reduction="none")
-        expected.append(torch.sigmoid(full_ce))
+        expected.append(full_ce / log_vocab)
     expected_mean = torch.stack(expected).mean().detach()
     assert abs(stats["ce"] - float(expected_mean)) < 1e-6
 
 
 def test_generate_returns_stats():
-    model = tiny_model(
-        early_exit_enabled=True,
-        early_exit_min_depth=1,
-        early_exit_confidence_threshold=1e-6,
-        early_exit_margin_threshold=0.0,
-        early_exit_state_delta_threshold=1e9,
-    ).eval()
+    model = speed_only_model(early_exit_min_depth=1).eval()
     ids = torch.arange(4).view(1, 4) % 32
     with torch.no_grad():
         generated, stats = model.generate(ids, 3, early_exit=True, return_stats=True)
     assert generated.shape == (1, 7)
     assert stats["steps"] == 3.0
-    assert 1.0 <= stats["avg_exit_depth"] <= 4.0
+    assert stats["avg_exit_depth"] == 1.0
 
 
-def test_apply_exit_policy_sets_and_validates():
+def test_selection_exit_depth_pure_rule():
+    assert selection_exit_depth([3.0, 2.0, 1.0, 0.5], 1, 4) == (4, False)
+    assert selection_exit_depth([1.0, 2.0, 3.0, 4.0], 1, 4) == (1, True)
+    assert selection_exit_depth([9.0, 8.0, 1.0, 5.0], 2, 4) == (3, True)
+    assert selection_exit_depth([9.0, 8.0, 7.0, 3.0], 3, 4) == (4, False)
+    assert selection_exit_depth([1.0, 0.5], 5, 4) == (4, False)
+
+
+def test_apply_exit_selection_sets_and_validates():
     model = tiny_model()
-    model.apply_exit_policy(
-        {
-            "early_exit_enabled": True,
-            "early_exit_min_depth": 3,
-            "early_exit_confidence_threshold": 0.8,
-            "early_exit_margin_threshold": 0.2,
-            "early_exit_state_delta_threshold": 0.1,
-        }
-    )
+    model.apply_exit_selection([0.0, 0.2, 0.2, 0.2, 0.2, 0.2], 0.3)
     assert model.config.early_exit_enabled is True
-    assert model.config.early_exit_min_depth == 3
-    with pytest.raises(ValueError, match="unknown exit policy keys"):
-        model.apply_exit_policy({"bogus": 1})
+    assert model.config.exit_selection_temperature == 0.3
+    assert model.config.exit_selection_weights[0] == 0.0
+    with pytest.raises(ValueError, match="must sum to one"):
+        model.apply_exit_selection([0.5, 0.1, 0.1, 0.1, 0.1, 0.05], 0.25)
+    with pytest.raises(ValueError, match="must hold six values"):
+        model.apply_exit_selection([0.5, 0.5], 0.25)
+    with pytest.raises(ValueError, match="must be non-negative"):
+        model.apply_exit_selection([-0.1, 0.22, 0.22, 0.22, 0.22, 0.22], 0.25)
 
 
 def test_config_validates_exit_fields():
@@ -345,13 +364,41 @@ def test_config_validates_exit_fields():
         tiny_config(early_exit_confidence_threshold=0.0)
     with pytest.raises(ValueError, match="early_exit_state_delta_threshold"):
         tiny_config(early_exit_state_delta_threshold=0.0)
+    with pytest.raises(ValueError, match="exit_selection_weights must hold six"):
+        tiny_config(exit_selection_weights=(0.5, 0.5))
+    with pytest.raises(ValueError, match="must sum to one"):
+        tiny_config(exit_selection_weights=(0.5, 0.1, 0.1, 0.1, 0.1, 0.05))
+    with pytest.raises(ValueError, match="must be non-negative"):
+        tiny_config(exit_selection_weights=(-0.1, 0.22, 0.22, 0.22, 0.22, 0.22))
+    with pytest.raises(ValueError, match="exit_selection_temperature"):
+        tiny_config(exit_selection_temperature=0.0)
     with pytest.raises(ValueError, match="exit_readout_rank"):
         tiny_config(exit_readout_rank=0)
 
 
+def test_exit_selection_cost_matches_reference():
+    model = tiny_model(
+        early_exit_confidence_threshold=0.9,
+        early_exit_margin_threshold=0.3,
+        early_exit_state_delta_threshold=0.05,
+    )
+    confidence = torch.tensor([0.5, 0.95])
+    margin = torch.tensor([0.1, 0.4])
+    delta = torch.tensor([0.5, 0.01])
+    cost = model._exit_selection_cost(confidence, margin, delta, 1)
+    weights = model.config.exit_selection_weights
+    expected = (
+        weights[1] * 0.2
+        + weights[2] * 0.1
+        + weights[3] * 0.225
+        + weights[4] * 0.5
+        + weights[5] * 0.0
+    )
+    assert torch.allclose(cost, torch.tensor(expected), atol=1e-6)
+
+
 def test_oversized_min_depth_clamps_to_full_depth():
-    model = tiny_model(early_exit_enabled=True, early_exit_min_depth=99,
-                       early_exit_confidence_threshold=1e-6).eval()
+    model = speed_only_model(early_exit_min_depth=99).eval()
     ids = torch.arange(8).view(1, 8) % 32
     with torch.no_grad():
         output = model(ids, early_exit=True)

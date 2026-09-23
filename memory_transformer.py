@@ -5,20 +5,23 @@ the 24 reasoner cycles owns a router and two RMSNorms, but all cycles access the
 same FFN/Q/KV/O banks.  Routing is top-3 per head and K/V deliberately share
 the same route head and weights.
 
-Early exit (per-sequence granularity): after each reasoner cycle the model
-scores three signals on the last token position -- top-1 confidence ``p_t``,
-top1-minus-top2 probability margin, and the normalized state change
-``||norm(x_t) - norm(x_{t-1})|| / ||norm(x_t)||`` -- and halts the loop when all
-thresholds hold past a minimum depth.  An optional ``CalibratedExitReadout``
-(rank-r LoRA plus per-depth vocabulary bias and temperature on the frozen
-lm_head) supplies the depth-calibrated logits used by both the halting rule and
-the final readout.  Calibration references: CALM (arXiv 2207.07061), FPRM
-(arXiv 2606.18206), post-hoc readout diagnostics (arXiv 2607.20519), Huginn
-deep supervision (arXiv 2502.05171), RecurTrace (arXiv 2609.03379).
+Early exit (batch-level): after each reasoner cycle the model reads the last
+token position and evaluates the weighted halting cost ``l_t`` built from the
+top-1 confidence ``p_t``, the top1-minus-top2 probability margin, the
+normalized state change ``||norm(x_t) - norm(x_{t-1})|| / ||norm(x_t)||``, the
+speed ``t/num_depths``, and the min-depth guard.  The exit depth is the argmax
+of the depth-selection distribution ``softmax(-l_t / temperature)`` (the
+smallest cost); online, the loop halts at the first depth whose cost rises
+above the running minimum.  The optional ``CalibratedExitReadout`` (rank-r LoRA
+plus per-depth vocabulary bias and temperature on the frozen lm_head) supplies
+the depth-calibrated logits used by both the halting rule and the final
+readout.  Design references: CALM (arXiv 2207.07061), FPRM (arXiv 2606.18206),
+post-hoc readout diagnostics (arXiv 2607.20519), Huginn deep supervision
+(arXiv 2502.05171), RecurTrace (arXiv 2609.03379).
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -48,6 +51,15 @@ class MemoryTransformerConfig:
     early_exit_confidence_threshold: float = 0.9
     early_exit_margin_threshold: float = 0.3
     early_exit_state_delta_threshold: float = 0.05
+    exit_selection_weights: tuple = (
+        0.0,
+        0.14285714285714285,
+        0.14285714285714285,
+        0.14285714285714285,
+        0.42857142857142855,
+        0.14285714285714285,
+    )
+    exit_selection_temperature: float = 0.25
     exit_readout_rank: int = 16
 
     def __post_init__(self) -> None:
@@ -91,6 +103,14 @@ class MemoryTransformerConfig:
             raise ValueError("early_exit_margin_threshold must be non-negative")
         if self.early_exit_state_delta_threshold <= 0:
             raise ValueError("early_exit_state_delta_threshold must be positive")
+        if len(self.exit_selection_weights) != 6:
+            raise ValueError("exit_selection_weights must hold six values")
+        if any(weight < 0 for weight in self.exit_selection_weights):
+            raise ValueError("exit_selection_weights must be non-negative")
+        if abs(sum(self.exit_selection_weights) - 1.0) > 1e-3:
+            raise ValueError("exit_selection_weights must sum to one")
+        if self.exit_selection_temperature <= 0:
+            raise ValueError("exit_selection_temperature must be positive")
         if self.exit_readout_rank < 1:
             raise ValueError("exit_readout_rank must be positive")
 
@@ -332,6 +352,29 @@ def ensure_exit_readout(
     return model.exit_readout
 
 
+def selection_exit_depth(
+    losses: Sequence[float], min_depth: int, num_depths: int
+) -> tuple[int, bool]:
+    """Batch-level halting rule over per-depth selection costs.
+
+    ``losses[index]`` is the cost ``l_t`` of depth ``t = index + 1``.  The exit
+    depth is the argmax of the depth-selection distribution
+    ``softmax(-l_t / temperature)``, i.e. the smallest cost; online, the loop
+    halts at the first depth whose cost rises above the running minimum.
+    Depths below ``min_depth`` are never exit candidates.  Returns the 1-based
+    exit depth and whether halting happened before the full depth.
+    """
+    best: Optional[tuple[float, int]] = None
+    for index, loss in enumerate(losses):
+        if index + 1 < min_depth:
+            continue
+        if best is None or loss < best[0]:
+            best = (loss, index)
+        else:
+            return best[1] + 1, True
+    return num_depths, False
+
+
 class MemoryReasoner(nn.Module):
     """One recurrent reasoner cycle; memory is passed explicitly for FSDP safety."""
 
@@ -438,35 +481,50 @@ class MemoryTransformerForCausalLM(nn.Module):
             return self.exit_readout.logits_at(depth_index, states, self.lm_head.weight)
         return F.linear(states, self.lm_head.weight)
 
-    def apply_exit_policy(self, policy: dict[str, object]) -> None:
-        """Overlay an early-exit policy (calibration artifact) onto the config."""
-        allowed = {
-            "early_exit_enabled",
-            "early_exit_min_depth",
-            "early_exit_confidence_threshold",
-            "early_exit_margin_threshold",
-            "early_exit_state_delta_threshold",
-        }
-        unknown = set(policy) - allowed
-        if unknown:
-            raise ValueError(f"unknown exit policy keys: {sorted(unknown)}")
-        for key, value in policy.items():
-            setattr(self.config, key, value)
-        self.config.__post_init__()
+    def _exit_selection_cost(
+        self,
+        confidence: Tensor,
+        margin: Tensor,
+        delta: Optional[Tensor],
+        depth_index: int,
+    ) -> Tensor:
+        """Batch-mean halting cost ``l_t`` at one depth (lower is better).
 
-    def load_exit_calibration(
-        self, path, apply_policy: bool = True
-    ) -> Optional[dict[str, object]]:
-        """Load a calibration artifact and (optionally) attach its readout."""
-        payload = torch.load(path, map_location="cpu", weights_only=False)
-        if "readout" in payload:
-            rank = payload.get("rank") or self.config.exit_readout_rank
-            ensure_exit_readout(self, rank=int(rank))
-            self.exit_readout.load_state_dict(payload["readout"])
-        policy = payload.get("policy")
-        if apply_policy and policy:
-            self.apply_exit_policy(policy)
-        return policy
+        Weighted sum of the inference-available terms of the readout-training
+        objective: confidence deficit, probability-margin deficit, state-delta
+        deficit, speed ``t/num_depths``, and min-depth guard.  The shortlist
+        cross-entropy term has no ground truth at inference and its annealed
+        prior mass is zero, so it is omitted.
+        """
+        weights = self.config.exit_selection_weights
+        cost = weights[1] * (self.config.early_exit_confidence_threshold - confidence).clamp_min(
+            0.0
+        ).mean()
+        cost = cost + weights[2] * (self.config.early_exit_margin_threshold - margin).clamp_min(
+            0.0
+        ).mean()
+        if delta is not None and weights[3] > 0:
+            cost = cost + weights[3] * (
+                delta.to(confidence.dtype) - self.config.early_exit_state_delta_threshold
+            ).clamp_min(0.0).mean()
+        num_depths = self.config.num_layers
+        cost = cost + weights[4] * ((depth_index + 1) / num_depths)
+        min_depth = min(self.config.early_exit_min_depth, num_depths)
+        cost = cost + weights[5] * (max(0, min_depth - (depth_index + 1)) / num_depths)
+        return cost
+
+    def apply_exit_selection(
+        self,
+        weights: Sequence[float],
+        temperature: float,
+        enable: bool = True,
+    ) -> None:
+        """Attach trained depth-selection weights and temperature to the config."""
+        self.config.exit_selection_weights = tuple(float(value) for value in weights)
+        self.config.exit_selection_temperature = float(temperature)
+        if enable:
+            self.config.early_exit_enabled = True
+        self.config.__post_init__()
 
     @staticmethod
     def load_balance_loss(
@@ -531,6 +589,9 @@ class MemoryTransformerForCausalLM(nn.Module):
         exit_margin: list[Tensor] = []
         exit_delta: list[Optional[Tensor]] = []
         exit_normed: Optional[Tensor] = None
+        best_cost: Optional[Tensor] = None
+        best_depth: Optional[int] = None
+        best_normed: Optional[Tensor] = None
         prev_normed: Optional[Tensor] = None
         halted = False
         for depth_index, layer in enumerate(self.layers):
@@ -549,11 +610,6 @@ class MemoryTransformerForCausalLM(nn.Module):
             if not enabled:
                 continue
             normed = self.norm(x)
-            last_logits = self._exit_readout_logits(depth_index, normed[:, -1, :])
-            last_probabilities = torch.softmax(last_logits.float(), dim=-1)
-            top2 = torch.topk(last_probabilities, 2, dim=-1).values
-            confidence = top2[:, 0]
-            margin = top2[:, 0] - top2[:, 1]
             if prev_normed is None:
                 delta = None
             else:
@@ -565,27 +621,29 @@ class MemoryTransformerForCausalLM(nn.Module):
                     delta = (per_position * mask).sum(-1) / mask.sum(-1).clamp_min(1.0)
                 else:
                     delta = per_position.mean(-1)
+            last_logits = self._exit_readout_logits(depth_index, normed[:, -1, :])
+            last_probabilities = torch.softmax(last_logits.float(), dim=-1)
+            top2 = torch.topk(last_probabilities, 2, dim=-1).values
+            confidence = top2[:, 0]
+            margin = top2[:, 0] - top2[:, 1]
             exit_confidence.append(confidence.detach())
             exit_margin.append(margin.detach())
             exit_delta.append(None if delta is None else delta.detach())
-            if depth_index + 1 >= min(
+            prev_normed = normed.detach()
+            if depth_index + 1 < min(
                 self.config.early_exit_min_depth, self.config.num_layers
             ):
-                ready = (
-                    confidence >= self.config.early_exit_confidence_threshold
-                ).all() & (
-                    margin >= self.config.early_exit_margin_threshold
-                ).all()
-                if delta is not None:
-                    ready = ready & (
-                        delta <= self.config.early_exit_state_delta_threshold
-                    ).all()
-                if bool(ready):
-                    exit_depth = depth_index + 1
-                    exit_normed = normed
-                    halted = True
-                    break
-            prev_normed = normed.detach()
+                continue
+            cost = self._exit_selection_cost(confidence, margin, delta, depth_index)
+            if best_cost is None or bool(cost < best_cost):
+                best_cost = cost
+                best_depth = depth_index
+                best_normed = normed
+                continue
+            exit_depth = best_depth + 1
+            exit_normed = best_normed
+            halted = True
+            break
         if enabled and self.exit_readout is not None:
             normed_final = exit_normed if halted else self.norm(x)
             logits = self.exit_readout.logits_at(

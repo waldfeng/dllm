@@ -123,8 +123,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pi1-anneal-end",
         type=float,
-        default=0.20,
-        help="prior mass of the CE term at training end (inference-side signals)",
+        default=0.0,
+        help="prior mass of the CE term at training end; 0 keeps the training "
+        "depth-selection distribution identical to the inference-time one",
     )
     parser.add_argument("--exit-temp-start", type=float, default=2.0)
     parser.add_argument("--exit-temp-end", type=float, default=0.25)
@@ -524,12 +525,15 @@ def exit_readout_losses(
 ) -> tuple[Tensor, dict[str, float]]:
     """Assemble the eight readout-training losses (all minimization-direction).
 
-    Six per-depth normalized terms (sigmoid CE, confidence deficit, probability
-    margin deficit, state-delta deficit, speed t/24, min-depth guard), weighted
-    by the learnable distribution ``weights``; term seven aligns
-    ``softmax(weighted terms)`` with the (annealed) prior through a sigmoid;
-    term eight sharpens the depth-selection distribution and normalizes its
-    entropy by ``log(depths)``.
+    Six per-depth normalized terms (full-vocabulary CE divided by ``ln(V)``,
+    confidence deficit, probability margin deficit, state-delta deficit, speed
+    ``t/24``, min-depth guard), weighted by the learnable distribution
+    ``weights``; term seven aligns ``softmax(weighted terms)`` with the
+    (annealed) prior through a sigmoid; term eight sharpens the
+    depth-selection distribution and normalizes its entropy by ``log(depths)``.
+    The depth-selection distribution doubles as the inference-time halting
+    distribution; annealing the prior's CE mass to zero keeps the training and
+    inference distributions identical.
     """
     device = rollout["states"].device
     depths_range = torch.arange(num_depths, device=device, dtype=torch.float32)
@@ -538,13 +542,8 @@ def exit_readout_losses(
     speed = depth_fraction
     deltas = rollout["deltas"].float()
     states = rollout["states"].float()
-    teacher_logits = rollout["teacher_logits"].float()
     target = target_tokens
-    shortlist_size = max(1, min(args.exit_shortlist, teacher_logits.shape[-1] - 1))
-    top_indices = teacher_logits.topk(shortlist_size, dim=-1).indices
-    in_top = (top_indices == target[:, None]).any(-1)
-    shortlist = torch.cat((top_indices, target[:, None]), dim=-1)
-    keep_last = ~in_top
+    log_vocab = float(np.log(max(2, model.lm_head.weight.shape[-1])))
 
     compute_dtype = torch.bfloat16 if states.is_cuda else states.dtype
     head_weight = model.lm_head.weight.to(compute_dtype)
@@ -558,17 +557,8 @@ def exit_readout_losses(
         confidence = (top2[:, 0] - log_normalizer).exp()
         margin = confidence - (top2[:, 1] - log_normalizer).exp()
         target_logit = logits.gather(1, target[:, None]).squeeze(1)
-        short_logits = logits.gather(1, shortlist)
-        last_column = torch.where(
-            keep_last[:, None],
-            short_logits[:, -1:],
-            torch.full_like(short_logits[:, -1:], float("-inf")),
-        )
-        short_logits = torch.cat((short_logits[:, :-1], last_column), dim=-1)
-        cross_entropy = -(
-            target_logit - torch.logsumexp(short_logits, dim=-1)
-        )
-        per_depth_terms[0].append(torch.sigmoid(cross_entropy))
+        cross_entropy = (log_normalizer - target_logit) / log_vocab
+        per_depth_terms[0].append(cross_entropy)
         per_depth_terms[1].append((args.exit_tau_confidence - confidence).clamp_min(0.0))
         per_depth_terms[2].append((args.exit_tau_margin - margin).clamp_min(0.0))
         per_depth_terms[3].append((deltas[depth_index] - args.exit_tau_delta).clamp_min(0.0))
@@ -812,6 +802,20 @@ def train_exit_readout(args: argparse.Namespace) -> None:
         torch.cuda.reset_peak_memory_stats(device)
     sync_parameters = trainable if args.freeze_loss_weights else trainable + [weights]
     run_started = time.monotonic()
+
+    def selection_payload(step_progress: float) -> dict[str, object]:
+        learned = (
+            weights.detach().softmax(dim=0)
+            if not args.freeze_loss_weights
+            else weights.detach()
+        )
+        return {
+            "exit_loss_weights": learned.cpu(),
+            "exit_temperature": float(
+                _anneal(args.exit_temp_start, args.exit_temp_end, step_progress)
+            ),
+        }
+
     iterator = token_batches(
         store,
         sequence_length=args.sequence_length,
@@ -888,6 +892,7 @@ def train_exit_readout(args: argparse.Namespace) -> None:
                     "optimizer": optimizer.state_dict(),
                     "config": asdict(config),
                     "exit_readout_rank": model.exit_readout.rank,
+                    **selection_payload(progress),
                 },
                 args.checkpoint,
             )
@@ -904,6 +909,7 @@ def train_exit_readout(args: argparse.Namespace) -> None:
                 "optimizer": optimizer.state_dict(),
                 "config": asdict(config),
                 "exit_readout_rank": model.exit_readout.rank,
+                **selection_payload(1.0),
             },
             args.checkpoint,
         )

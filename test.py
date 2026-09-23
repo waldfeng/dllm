@@ -4,10 +4,11 @@ Reads a prompt, then iteratively appends argmax tokens until 100 characters
 of generated text. EOS is ignored so generation does not stop early. After
 each completion, reads the next prompt until EOF / empty line.
 
-Early exit: with ``--early-exit-config`` (a policy artifact from
-``scripts/calibrate_early_exit.py``) or an enabled checkpoint policy the model
-halts its reasoner loop per step once the calibrated confidence, margin, and
-state-delta criteria hold.  ``--benchmark`` measures tokens/second with the
+Early exit: two-stage checkpoints (ones carrying the trained
+``CalibratedExitReadout``) enable the reasoner loop's depth-selection halting
+-- the exit depth is the argmax of ``softmax(-l_t / temperature)`` over the
+per-depth halting costs, with the trained six-term weights and temperature
+restored from the checkpoint.  ``--benchmark`` measures tokens/second with the
 early exit on and off and reports the speedup.
 """
 
@@ -38,14 +39,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--repetition-penalty", type=float, default=1.15)
     parser.add_argument(
-        "--early-exit-config",
-        type=Path,
-        help="policy artifact from scripts/calibrate_early_exit.py",
-    )
-    parser.add_argument(
         "--no-early-exit",
         action="store_true",
-        help="disable the early exit even if a policy is available",
+        help="disable the early exit even if a trained readout is present",
     )
     parser.add_argument(
         "--benchmark-tokens",
@@ -67,6 +63,14 @@ def load_model(path: Path, device: torch.device) -> MemoryTransformerForCausalLM
         ensure_exit_readout(
             model, rank=int(payload.get("exit_readout_rank", config.exit_readout_rank))
         )
+        model.config.early_exit_enabled = True
+        if payload.get("exit_loss_weights") is not None:
+            model.config.exit_selection_weights = tuple(
+                float(value) for value in payload["exit_loss_weights"]
+            )
+        if payload.get("exit_temperature") is not None:
+            model.config.exit_selection_temperature = float(payload["exit_temperature"])
+        model.config.__post_init__()
     model.load_state_dict(payload["model"])
     model.to(device)
     model.eval()
@@ -166,10 +170,7 @@ def benchmark(model, tokenizer, device: torch.device, args: argparse.Namespace) 
     depth_count = model.config.num_layers
     results = {}
     for label, enabled in (("full_depth", False), ("early_exit", True)):
-        if enabled and (
-            args.no_early_exit
-            or (model.config.early_exit_enabled is False and args.early_exit_config is None)
-        ):
+        if enabled and (args.no_early_exit or model.config.early_exit_enabled is False):
             continue
         ids = input_ids.clone()
         depths: list[int] = []
@@ -218,9 +219,6 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = load_tokenizer(args.tokenizer, local_files_only=Path(args.tokenizer).exists())
     model = load_model(args.checkpoint, device)
-    if args.early_exit_config is not None:
-        policy = model.load_exit_calibration(args.early_exit_config)
-        print(f"early_exit_policy={policy}", flush=True)
     if args.no_early_exit:
         model.config.early_exit_enabled = False
     benchmark(model, tokenizer, device, args)
