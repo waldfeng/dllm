@@ -383,13 +383,21 @@ class MemoryReasoner(nn.Module):
         allowed = causal[None, None, :, :]
         if attention_mask is not None:
             allowed = allowed & attention_mask[:, None, None, :].bool()
-        attn = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=allowed,
-            dropout_p=self.dropout.p if self.training else 0.0,
-        )
+            attn = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=allowed,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
+        else:
+            attn = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=True,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
         attn = attn.transpose(1, 2).reshape_as(x)
         attn = memory("o", attn, indices[..., 3, :], weights[..., 3, :])
         x = x + self.dropout(attn)

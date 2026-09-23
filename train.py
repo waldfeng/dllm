@@ -134,6 +134,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="pin the six loss weights to the prior instead of learning them",
     )
+    parser.add_argument(
+        "--memory-target",
+        type=float,
+        default=0.9,
+        help="readout mode: fraction of total GPU memory the auto batch probe "
+        "should fill (batch_size <= 0 enables the probe)",
+    )
+    parser.add_argument(
+        "--probe-batch",
+        type=int,
+        default=16,
+        help="readout mode: seed batch size of the memory probe",
+    )
     return parser.parse_args()
 
 
@@ -533,10 +546,13 @@ def exit_readout_losses(
     shortlist = torch.cat((top_indices, target[:, None]), dim=-1)
     keep_last = ~in_top
 
-    head_weight = model.lm_head.weight.to(states.dtype)
+    compute_dtype = torch.bfloat16 if states.is_cuda else states.dtype
+    head_weight = model.lm_head.weight.to(compute_dtype)
     per_depth_terms = [[] for _ in range(6)]
     for depth_index in range(num_depths):
-        logits = model.exit_readout.logits_at(depth_index, states[depth_index], head_weight)
+        depth_states = states[depth_index].to(compute_dtype)
+        logits = model.exit_readout.logits_at(depth_index, depth_states, head_weight)
+        logits = logits.float()
         log_normalizer = torch.logsumexp(logits, dim=-1)
         top2 = torch.topk(logits, 2, dim=-1).values
         confidence = (top2[:, 0] - log_normalizer).exp()
@@ -600,9 +616,114 @@ def exit_readout_losses(
     return total, stats
 
 
+def _distributed_average(value: float, distributed: bool, device: torch.device) -> float:
+    if not distributed:
+        return value
+    tensor = torch.tensor([value], dtype=torch.float64, device=device)
+    torch.distributed.all_reduce(tensor)
+    return float(tensor.item()) / max(1, torch.distributed.get_world_size())
+
+
+def _probe_memory_step(
+    model: MemoryTransformerForCausalLM,
+    store: TokenStore,
+    args: argparse.Namespace,
+    config,
+    weights: Tensor,
+    prior: Tensor,
+    device: torch.device,
+    autocast: contextlib.AbstractContextManager,
+    batch_size: int,
+) -> float:
+    """Run one full readout step and return its peak CUDA allocation (-1 on OOM)."""
+    iterator = token_batches(
+        store,
+        sequence_length=args.sequence_length,
+        batch_size=batch_size,
+        steps=1,
+        seed=args.seed,
+    )
+    inputs, labels = next(iterator)
+    input_tensor = torch.from_numpy(inputs).to(device)
+    target_tensor = torch.from_numpy(labels).to(device)[:, -1]
+    torch.cuda.reset_peak_memory_stats(device)
+    try:
+        with torch.no_grad():
+            with autocast:
+                rollout = model.exit_rollout(input_tensor)
+        total, _ = exit_readout_losses(
+            model, rollout, target_tensor, weights, prior.to(device), args, 0.0,
+            config.num_layers,
+        )
+        total.backward()
+        model.zero_grad(set_to_none=True)
+        del rollout, total
+        return float(torch.cuda.max_memory_allocated(device))
+    except torch.cuda.OutOfMemoryError:
+        model.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+        return -1.0
+
+
+def _probe_target_batch(
+    model: MemoryTransformerForCausalLM,
+    store: TokenStore,
+    args: argparse.Namespace,
+    config,
+    weights: Tensor,
+    prior: Tensor,
+    device: torch.device,
+    autocast: contextlib.AbstractContextManager,
+) -> int:
+    """Pick the per-rank batch that fills --memory-target of total GPU memory."""
+    total_bytes = torch.cuda.get_device_properties(device).total_memory
+    budget = args.memory_target * total_bytes
+    seed_batch = max(1, args.probe_batch)
+    batch = seed_batch
+    first = _probe_memory_step(
+        model, store, args, config, weights, prior, device, autocast, batch
+    )
+    while first < 0 and batch > 1:
+        batch //= 2
+        first = _probe_memory_step(
+            model, store, args, config, weights, prior, device, autocast, batch
+        )
+    if first < 0:
+        raise RuntimeError("memory probe OOMed even at batch size 1")
+    points = [(batch, first)]
+    for factor in (3.0, 2.0):
+        larger = _probe_memory_step(
+            model, store, args, config, weights, prior, device, autocast,
+            int(batch * factor),
+        )
+        if larger >= 0:
+            points.append((int(batch * factor), larger))
+            break
+    if len(points) == 1:
+        return batch
+    (b0, p0), (b1, p1) = points[0], points[1]
+    slope = (p1 - p0) / (b1 - b0)
+    fixed = p0 - slope * b0
+    target = max(points[0][0], int((budget - fixed) / max(1.0, slope)))
+    print(
+        f"exit_readout_probe seed={points[0][0]} peak={points[0][1] / 2**30:.1f}GiB "
+        f"scaled={points[1][0]} peak={points[1][1] / 2**30:.1f}GiB "
+        f"fixed={fixed / 2**30:.1f}GiB slope={slope / 2**20:.1f}MiB/row "
+        f"target={target}",
+        flush=True,
+    )
+    while target > points[0][0]:
+        if _probe_memory_step(
+            model, store, args, config, weights, prior, device, autocast, target
+        ) >= 0:
+            break
+        target = max(points[0][0], int(target * 0.85))
+    torch.cuda.empty_cache()
+    return target
+
+
 def train_exit_readout(args: argparse.Namespace) -> None:
-    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
-        raise RuntimeError("exit-readout training runs on a single device only")
+    rank, world_size, local_rank, device, distributed = setup_distributed(args.device)
     if args.resume is None:
         raise ValueError("--resume must point at the base pretrained checkpoint")
     if args.steps <= 0:
@@ -612,11 +733,7 @@ def train_exit_readout(args: argparse.Namespace) -> None:
     )
     if prior.numel() != 6 or abs(float(prior.sum()) - 1.0) > 1e-4:
         raise ValueError("--loss-weight-prior must hold six values summing to one")
-    device = (
-        torch.device("cuda") if args.device != "cpu" and torch.cuda.is_available()
-        else torch.device("cpu")
-    )
-    seed_everything(args.seed, 0)
+    seed_everything(args.seed, rank)
     store = TokenStore(args.dataset_dir)
     vocab_size = int(store.manifest["vocab_size"])
     if Path(args.tokenizer).exists():
@@ -626,7 +743,7 @@ def train_exit_readout(args: argparse.Namespace) -> None:
                 f"tokenizer length {len(tokenizer)} does not match token manifest vocab "
                 f"size {vocab_size}"
             )
-    else:
+    elif rank == 0:
         print(
             f"exit_readout_warning tokenizer path {args.tokenizer} missing; "
             "skipping tokenizer check (readout training never tokenizes text)",
@@ -656,6 +773,10 @@ def train_exit_readout(args: argparse.Namespace) -> None:
     for name, parameter in model.named_parameters():
         parameter.requires_grad_(name.startswith("exit_readout."))
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    start_step = int(payload.get("step", 0)) if has_readout else 0
+    remaining_steps = args.steps - start_step
+    if remaining_steps <= 0:
+        raise ValueError(f"--steps {args.steps} already reached by resumed step {start_step}")
     if args.freeze_loss_weights:
         weights = prior.to(device)
         optimizer_parameters = trainable
@@ -669,28 +790,41 @@ def train_exit_readout(args: argparse.Namespace) -> None:
         optimizer_parameters, lr=args.exit_readout_lr,
         weight_decay=args.exit_readout_weight_decay,
     )
-    warmup_steps = min(20, max(1, args.steps // 10))
-    scheduler = scheduler_for(optimizer, args.steps, warmup_steps, 0.1)
+    if has_readout and payload.get("optimizer"):
+        optimizer.load_state_dict(payload["optimizer"])
+    warmup_steps = min(20, max(1, remaining_steps // 10))
+    scheduler = scheduler_for(optimizer, remaining_steps, warmup_steps, 0.1)
     prior_start = prior.clone()
     prior_end = prior.clone()
     prior_end[0] = args.pi1_anneal_end
     prior_end[1:] *= (1.0 - args.pi1_anneal_end) / max(1e-6, float(prior_end[1:].sum()))
+    autocast = (
+        torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        if device.type == "cuda" and args.precision == "bf16"
+        else contextlib.nullcontext()
+    )
+    if args.batch_size <= 0:
+        if device.type != "cuda":
+            raise ValueError("--batch-size 0 (memory probe) requires a CUDA device")
+        args.batch_size = _probe_target_batch(
+            model, store, args, config, weights, prior_start, device, autocast
+        )
+        torch.cuda.reset_peak_memory_stats(device)
+    sync_parameters = trainable if args.freeze_loss_weights else trainable + [weights]
+    run_started = time.monotonic()
     iterator = token_batches(
         store,
         sequence_length=args.sequence_length,
         batch_size=args.batch_size,
-        steps=args.steps,
-        rank=0,
-        world_size=1,
+        steps=remaining_steps,
+        rank=rank,
+        world_size=world_size,
+        start_step=start_step,
         seed=args.seed,
     )
-    autocast = (
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if device.type == "cuda" and args.precision == "bf16"
-        else contextlib.nullcontext()
-    )
-    run_started = time.monotonic()
-    for step, (inputs, labels) in enumerate(iterator):
+    for local_step, (inputs, labels) in enumerate(iterator):
+        global_step = start_step + local_step
+        progress = global_step / max(1, args.steps - 1)
         input_tensor = torch.from_numpy(inputs).to(device)
         target_tensor = torch.from_numpy(labels).to(device)[:, -1]
         with torch.no_grad():
@@ -700,49 +834,86 @@ def train_exit_readout(args: argparse.Namespace) -> None:
             model,
             rollout,
             target_tensor,
-            weights,
-            prior_start.lerp(prior_end, min(1.0, step / max(1, args.steps - 1))).to(device),
+            weights if args.freeze_loss_weights else weights.softmax(dim=0),
+            prior_start.lerp(prior_end, min(1.0, progress)).to(device),
             args,
-            step / max(1, args.steps - 1),
+            progress,
             config.num_layers,
         )
         if not torch.isfinite(total):
-            raise FloatingPointError(f"non-finite exit-readout loss at step {step}")
+            raise FloatingPointError(f"non-finite exit-readout loss at step {global_step}")
         optimizer.zero_grad(set_to_none=True)
         total.backward()
-        torch.nn.utils.clip_grad_norm_(trainable + ([] if args.freeze_loss_weights else [weights]), 1.0)
+        del rollout, total
+        if distributed:
+            for parameter in sync_parameters:
+                if parameter.grad is not None:
+                    torch.distributed.all_reduce(parameter.grad)
+                    parameter.grad.div_(world_size)
+        torch.nn.utils.clip_grad_norm_(sync_parameters, 1.0)
         optimizer.step()
         scheduler.step()
-        if (step + 1) % args.log_steps == 0 or step == 0:
+        stats = {
+            key: _distributed_average(value, distributed, device)
+            for key, value in stats.items()
+        }
+        if rank == 0 and ((local_step + 1) % args.log_steps == 0 or local_step == 0):
             weights_display = weights.detach().softmax(dim=0)
+            memory_note = ""
+            if device.type == "cuda":
+                peak_gib = torch.cuda.max_memory_allocated(device) / 2**30
+                utilization = 100.0 * peak_gib / (
+                    torch.cuda.get_device_properties(device).total_memory / 2**30
+                )
+                memory_note = f"peak={peak_gib:.1f}GiB({utilization:.0f}%) "
             print(
-                f"exit_readout step={step + 1} total={stats['total']:.5f} "
+                f"exit_readout step={global_step + 1} total={stats['total']:.5f} "
                 f"ce={stats['ce']:.5f} conf={stats['confidence']:.5f} "
                 f"margin={stats['margin']:.5f} delta={stats['delta']:.5f} "
                 f"speed={stats['speed']:.5f} guard={stats['guard']:.5f} "
                 f"align={stats['weight_alignment']:.5f} sparse={stats['sparsity']:.5f} "
-                f"argmin={stats['selection_argmin']} E[t]={stats['expected_depth']:.2f} "
+                f"argmin={int(stats['selection_argmin'])} E[t]={stats['expected_depth']:.2f} "
                 f"T={stats['temperature']:.3f} "
                 f"pi={','.join(f'{value:.3f}' for value in weights_display.tolist())} "
+                f"batch={args.batch_size} {memory_note}"
                 f"lr={scheduler.get_last_lr()[0]:.3e} "
                 f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
                 flush=True,
             )
-    atomic_torch_save(
-        {
-            "step": args.steps,
-            "model": {key: value.cpu() for key, value in model.state_dict().items()},
-            "optimizer": optimizer.state_dict(),
-            "config": asdict(config),
-            "exit_readout_rank": model.exit_readout.rank,
-        },
-        args.checkpoint,
-    )
-    print(
-        f"exit_readout_saved step={args.steps} path={args.checkpoint} "
-        f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
-        flush=True,
-    )
+        if args.save_steps > 0 and (global_step + 1) % args.save_steps == 0 and rank == 0:
+            atomic_torch_save(
+                {
+                    "step": global_step + 1,
+                    "model": {key: value.cpu() for key, value in model.state_dict().items()},
+                    "optimizer": optimizer.state_dict(),
+                    "config": asdict(config),
+                    "exit_readout_rank": model.exit_readout.rank,
+                },
+                args.checkpoint,
+            )
+            print(
+                f"exit_readout_saved step={global_step + 1} path={args.checkpoint} "
+                f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
+                flush=True,
+            )
+    if rank == 0:
+        atomic_torch_save(
+            {
+                "step": args.steps,
+                "model": {key: value.cpu() for key, value in model.state_dict().items()},
+                "optimizer": optimizer.state_dict(),
+                "config": asdict(config),
+                "exit_readout_rank": model.exit_readout.rank,
+            },
+            args.checkpoint,
+        )
+        print(
+            f"exit_readout_saved step={args.steps} path={args.checkpoint} "
+            f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
+            flush=True,
+        )
+    if distributed:
+        torch.distributed.destroy_process_group()
 
 
 def main() -> None:
