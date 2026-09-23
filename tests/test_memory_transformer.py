@@ -35,6 +35,7 @@ def tiny_model() -> MemoryTransformerForCausalLM:
         num_memory_blocks=4,
         top_k=2,
         max_position_embeddings=32,
+        early_exit_min_depth=2,
     )
     return MemoryTransformerForCausalLM(config)
 

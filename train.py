@@ -23,6 +23,7 @@ from memory_transformer import (
     MemoryTransformerConfig,
     MemoryTransformerForCausalLM,
     SharedMemory,
+    ensure_exit_readout,
 )
 from pretrain_data import TokenStore, load_tokenizer, token_batches
 
@@ -61,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-key-value-heads", type=int, default=8)
     parser.add_argument("--num-memory-blocks", type=int, default=24)
     parser.add_argument("--top-k", type=int, default=3)
+    parser.add_argument("--max-position-embeddings", type=int, default=32768)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--warmup-steps", type=int, default=1000)
@@ -92,6 +94,46 @@ def parse_args() -> argparse.Namespace:
         help="skip the final checkpoint save when training ends",
     )
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument(
+        "--train-exit-readout",
+        action="store_true",
+        help="continued-training mode: freeze the backbone and fit only the "
+        "per-depth calibrated exit readout (r=16 LoRA + bias + temperature)",
+    )
+    parser.add_argument("--exit-readout-rank", type=int, default=16)
+    parser.add_argument("--exit-readout-lr", type=float, default=1e-3)
+    parser.add_argument("--exit-readout-weight-decay", type=float, default=1e-4)
+    parser.add_argument("--exit-shortlist", type=int, default=64)
+    parser.add_argument("--exit-min-depth", type=int, default=8)
+    parser.add_argument("--exit-tau-confidence", type=float, default=0.9)
+    parser.add_argument("--exit-tau-margin", type=float, default=0.3)
+    parser.add_argument("--exit-tau-delta", type=float, default=0.05)
+    parser.add_argument(
+        "--loss-weight-prior",
+        default="0.65,0.05,0.05,0.05,0.15,0.05",
+        help="fixed target distribution over the six loss terms "
+        "[CE, confidence, margin, delta, speed, guard]",
+    )
+    parser.add_argument(
+        "--pi1-anneal-start",
+        type=float,
+        default=0.65,
+        help="prior mass of the CE term at training start",
+    )
+    parser.add_argument(
+        "--pi1-anneal-end",
+        type=float,
+        default=0.20,
+        help="prior mass of the CE term at training end (inference-side signals)",
+    )
+    parser.add_argument("--exit-temp-start", type=float, default=2.0)
+    parser.add_argument("--exit-temp-end", type=float, default=0.25)
+    parser.add_argument("--exit-sparsity-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--freeze-loss-weights",
+        action="store_true",
+        help="pin the six loss weights to the prior instead of learning them",
+    )
     return parser.parse_args()
 
 
@@ -133,6 +175,7 @@ def build_config(args: argparse.Namespace, vocab_size: int) -> MemoryTransformer
         num_key_value_heads=args.num_key_value_heads,
         num_memory_blocks=args.num_memory_blocks,
         top_k=args.top_k,
+        max_position_embeddings=args.max_position_embeddings,
     )
 
 
@@ -422,8 +465,291 @@ def batch_iterator(
     )
 
 
+def atomic_torch_save(payload: dict[str, object], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+    ) as stream:
+        temporary = Path(stream.name)
+    try:
+        torch.save(payload, temporary)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+ARCHITECTURE_KEYS = (
+    "vocab_size",
+    "hidden_size",
+    "intermediate_size",
+    "num_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "num_memory_blocks",
+    "top_k",
+    "max_position_embeddings",
+    "rms_norm_eps",
+    "rope_theta",
+    "tie_word_embeddings",
+    "dropout",
+)
+
+
+def _anneal(start: float, end: float, progress: float) -> float:
+    return start + (end - start) * min(1.0, max(0.0, progress))
+
+
+def exit_readout_losses(
+    model: MemoryTransformerForCausalLM,
+    rollout: dict[str, Tensor],
+    target_tokens: Tensor,
+    weights: Tensor,
+    prior: Tensor,
+    args: argparse.Namespace,
+    progress: float,
+    num_depths: int,
+) -> tuple[Tensor, dict[str, float]]:
+    """Assemble the eight readout-training losses (all minimization-direction).
+
+    Six per-depth normalized terms (sigmoid CE, confidence deficit, probability
+    margin deficit, state-delta deficit, speed t/24, min-depth guard), weighted
+    by the learnable distribution ``weights``; term seven aligns
+    ``softmax(weighted terms)`` with the (annealed) prior through a sigmoid;
+    term eight sharpens the depth-selection distribution and normalizes its
+    entropy by ``log(depths)``.
+    """
+    device = rollout["states"].device
+    depths_range = torch.arange(num_depths, device=device, dtype=torch.float32)
+    depth_fraction = (depths_range + 1.0) / num_depths
+    guard = (args.exit_min_depth - (depths_range + 1.0)).clamp_min(0.0) / num_depths
+    speed = depth_fraction
+    deltas = rollout["deltas"].float()
+    states = rollout["states"].float()
+    teacher_logits = rollout["teacher_logits"].float()
+    target = target_tokens
+    shortlist_size = max(1, min(args.exit_shortlist, teacher_logits.shape[-1] - 1))
+    top_indices = teacher_logits.topk(shortlist_size, dim=-1).indices
+    in_top = (top_indices == target[:, None]).any(-1)
+    shortlist = torch.cat((top_indices, target[:, None]), dim=-1)
+    keep_last = ~in_top
+
+    head_weight = model.lm_head.weight.to(states.dtype)
+    per_depth_terms = [[] for _ in range(6)]
+    for depth_index in range(num_depths):
+        logits = model.exit_readout.logits_at(depth_index, states[depth_index], head_weight)
+        log_normalizer = torch.logsumexp(logits, dim=-1)
+        top2 = torch.topk(logits, 2, dim=-1).values
+        confidence = (top2[:, 0] - log_normalizer).exp()
+        margin = confidence - (top2[:, 1] - log_normalizer).exp()
+        target_logit = logits.gather(1, target[:, None]).squeeze(1)
+        short_logits = logits.gather(1, shortlist)
+        last_column = torch.where(
+            keep_last[:, None],
+            short_logits[:, -1:],
+            torch.full_like(short_logits[:, -1:], float("-inf")),
+        )
+        short_logits = torch.cat((short_logits[:, :-1], last_column), dim=-1)
+        cross_entropy = -(
+            target_logit - torch.logsumexp(short_logits, dim=-1)
+        )
+        per_depth_terms[0].append(torch.sigmoid(cross_entropy))
+        per_depth_terms[1].append((args.exit_tau_confidence - confidence).clamp_min(0.0))
+        per_depth_terms[2].append((args.exit_tau_margin - margin).clamp_min(0.0))
+        per_depth_terms[3].append((deltas[depth_index] - args.exit_tau_delta).clamp_min(0.0))
+        per_depth_terms[4].append(speed[depth_index].expand(confidence.shape))
+        per_depth_terms[5].append(guard[depth_index].expand(confidence.shape))
+    term_rows = torch.stack(
+        [torch.stack(column, dim=0) for column in per_depth_terms], dim=0
+    )  # [6, D, B]
+    term_means = term_rows.mean(dim=(1, 2))  # [6]
+    weighted_terms = weights * term_means  # [6]
+    alignment = torch.sigmoid(
+        torch.nn.functional.cross_entropy(
+            torch.log(weighted_terms.clamp_min(1e-12)).unsqueeze(0), prior.unsqueeze(0)
+        )
+    )
+    selection_logits = -(
+        (weights[:, None, None] * term_rows).sum(dim=0).mean(dim=1)
+    )  # [D]
+    temperature = _anneal(args.exit_temp_start, args.exit_temp_end, progress)
+    selection = torch.softmax(selection_logits / temperature, dim=0)
+    sparsity = -(selection * selection.clamp_min(1e-12).log()).sum() / max(
+        1e-6, float(np.log(num_depths))
+    )
+    total = weighted_terms.sum() + alignment + args.exit_sparsity_weight * sparsity
+    stats = {
+        name: value.detach().item()
+        for name, value in zip(
+            (
+                "ce",
+                "confidence",
+                "margin",
+                "delta",
+                "speed",
+                "guard",
+                "weight_alignment",
+                "sparsity",
+            ),
+            [*weighted_terms.detach(), alignment.detach(), sparsity.detach()],
+        )
+    }
+    stats["total"] = total.detach().item()
+    stats["selection_argmin"] = int(selection_logits.argmin().item()) + 1
+    stats["expected_depth"] = float((selection * (depths_range + 1.0)).sum().item())
+    stats["temperature"] = temperature
+    return total, stats
+
+
+def train_exit_readout(args: argparse.Namespace) -> None:
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        raise RuntimeError("exit-readout training runs on a single device only")
+    if args.resume is None:
+        raise ValueError("--resume must point at the base pretrained checkpoint")
+    if args.steps <= 0:
+        raise ValueError("steps must be positive")
+    prior = torch.tensor(
+        [float(value) for value in args.loss_weight_prior.split(",")], dtype=torch.float32
+    )
+    if prior.numel() != 6 or abs(float(prior.sum()) - 1.0) > 1e-4:
+        raise ValueError("--loss-weight-prior must hold six values summing to one")
+    device = (
+        torch.device("cuda") if args.device != "cpu" and torch.cuda.is_available()
+        else torch.device("cpu")
+    )
+    seed_everything(args.seed, 0)
+    store = TokenStore(args.dataset_dir)
+    vocab_size = int(store.manifest["vocab_size"])
+    if Path(args.tokenizer).exists():
+        tokenizer = load_tokenizer(args.tokenizer)
+        if len(tokenizer) != vocab_size:
+            raise ValueError(
+                f"tokenizer length {len(tokenizer)} does not match token manifest vocab "
+                f"size {vocab_size}"
+            )
+    else:
+        print(
+            f"exit_readout_warning tokenizer path {args.tokenizer} missing; "
+            "skipping tokenizer check (readout training never tokenizes text)",
+            flush=True,
+        )
+    config = build_config(args, vocab_size)
+    payload = torch.load(args.resume, map_location="cpu", weights_only=False)
+    saved = payload.get("config") or {}
+    mismatched = [key for key in ARCHITECTURE_KEYS if saved.get(key) != getattr(config, key)]
+    if mismatched:
+        raise ValueError(
+            f"base checkpoint architecture does not match the requested config: {mismatched}"
+        )
+    model = MemoryTransformerForCausalLM(config)
+    has_readout = any(
+        name.startswith("exit_readout.") for name in payload["model"]
+    )
+    if has_readout:
+        ensure_exit_readout(model, rank=int(payload.get("exit_readout_rank", args.exit_readout_rank)))
+    model.load_state_dict(payload["model"])
+    if not has_readout:
+        ensure_exit_readout(model, rank=args.exit_readout_rank)
+    dtype = torch.bfloat16 if args.precision == "bf16" and device.type == "cuda" else torch.float32
+    model.to(device=device, dtype=dtype)
+    model.exit_readout.float()
+    model.eval()
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_(name.startswith("exit_readout."))
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if args.freeze_loss_weights:
+        weights = prior.to(device)
+        optimizer_parameters = trainable
+    else:
+        weights = torch.nn.Parameter(torch.log(prior.to(device) / prior.to(device)[-1:]).float())
+        optimizer_parameters = [
+            {"params": trainable},
+            {"params": [weights], "weight_decay": 0.0},
+        ]
+    optimizer = torch.optim.AdamW(
+        optimizer_parameters, lr=args.exit_readout_lr,
+        weight_decay=args.exit_readout_weight_decay,
+    )
+    warmup_steps = min(20, max(1, args.steps // 10))
+    scheduler = scheduler_for(optimizer, args.steps, warmup_steps, 0.1)
+    prior_start = prior.clone()
+    prior_end = prior.clone()
+    prior_end[0] = args.pi1_anneal_end
+    prior_end[1:] *= (1.0 - args.pi1_anneal_end) / max(1e-6, float(prior_end[1:].sum()))
+    iterator = token_batches(
+        store,
+        sequence_length=args.sequence_length,
+        batch_size=args.batch_size,
+        steps=args.steps,
+        rank=0,
+        world_size=1,
+        seed=args.seed,
+    )
+    autocast = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if device.type == "cuda" and args.precision == "bf16"
+        else contextlib.nullcontext()
+    )
+    run_started = time.monotonic()
+    for step, (inputs, labels) in enumerate(iterator):
+        input_tensor = torch.from_numpy(inputs).to(device)
+        target_tensor = torch.from_numpy(labels).to(device)[:, -1]
+        with torch.no_grad():
+            with autocast:
+                rollout = model.exit_rollout(input_tensor)
+        total, stats = exit_readout_losses(
+            model,
+            rollout,
+            target_tensor,
+            weights,
+            prior_start.lerp(prior_end, min(1.0, step / max(1, args.steps - 1))).to(device),
+            args,
+            step / max(1, args.steps - 1),
+            config.num_layers,
+        )
+        if not torch.isfinite(total):
+            raise FloatingPointError(f"non-finite exit-readout loss at step {step}")
+        optimizer.zero_grad(set_to_none=True)
+        total.backward()
+        torch.nn.utils.clip_grad_norm_(trainable + ([] if args.freeze_loss_weights else [weights]), 1.0)
+        optimizer.step()
+        scheduler.step()
+        if (step + 1) % args.log_steps == 0 or step == 0:
+            weights_display = weights.detach().softmax(dim=0)
+            print(
+                f"exit_readout step={step + 1} total={stats['total']:.5f} "
+                f"ce={stats['ce']:.5f} conf={stats['confidence']:.5f} "
+                f"margin={stats['margin']:.5f} delta={stats['delta']:.5f} "
+                f"speed={stats['speed']:.5f} guard={stats['guard']:.5f} "
+                f"align={stats['weight_alignment']:.5f} sparse={stats['sparsity']:.5f} "
+                f"argmin={stats['selection_argmin']} E[t]={stats['expected_depth']:.2f} "
+                f"T={stats['temperature']:.3f} "
+                f"pi={','.join(f'{value:.3f}' for value in weights_display.tolist())} "
+                f"lr={scheduler.get_last_lr()[0]:.3e} "
+                f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
+                flush=True,
+            )
+    atomic_torch_save(
+        {
+            "step": args.steps,
+            "model": {key: value.cpu() for key, value in model.state_dict().items()},
+            "optimizer": optimizer.state_dict(),
+            "config": asdict(config),
+            "exit_readout_rank": model.exit_readout.rank,
+        },
+        args.checkpoint,
+    )
+    print(
+        f"exit_readout_saved step={args.steps} path={args.checkpoint} "
+        f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
+        flush=True,
+    )
+
+
 def main() -> None:
     args = parse_args()
+    if args.train_exit_readout:
+        train_exit_readout(args)
+        return
     if args.steps <= 0 or args.gradient_accumulation <= 0:
         raise ValueError("steps and gradient-accumulation must be positive")
     if args.log_steps <= 0:

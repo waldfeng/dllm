@@ -70,6 +70,65 @@ The exact default parameter count is `1,092,383,232` (1.09B), including two
 untied embedding matrices, the four memory banks, 24 routers, all cycle norms,
 and the final norm. It remains inside the requested 1B-1.5B range.
 
+## Early Exit And Calibrated Readout
+
+After each reasoner cycle the model evaluates three signals on the last token
+position and may halt the loop for the whole sequence once a minimum depth is
+reached:
+
+```text
+p_t = top-1 probability of the depth-calibrated logits
+m_t = p1 - p2 (softmax probability margin)
+d_t = ||norm(x_t) - norm(x_{t-1})|| / ||norm(x_t)||  (mask-averaged over positions)
+halt  iff  t >= min_depth and p_t >= tau_c and m_t >= tau_m and d_t <= tau_d
+```
+
+`CalibratedExitReadout` is an optional per-depth correction on the frozen
+`lm_head`: `logits_t = s_t * (W h + B_t (A_t h) + c_t)` with rank-16 LoRA
+(`A_t`, `B_t`), a full-vocabulary bias `c_t`, and a per-depth temperature
+`s_t`.  `B_t` and `c_t` start at zero and `s_t` at one, so an unfitted readout
+is bit-identical to the shared head.  Only readout parameters train in the
+continued-training mode (`train.py --train-exit-readout`); the backbone is
+frozen and the rollout runs under `no_grad`.
+
+The readout objective sums eight terms, every one minimized and normalized
+into [0, 1]: six per-depth terms (sigmoid of shortlist CE, confidence deficit
+`max(0, tau_c - p_t)`, probability-margin deficit, state-delta deficit,
+speed `t/24`, min-depth guard `max(0, 8 - t)/24`) combined by a learnable
+six-way weight distribution `pi = softmax(theta)`; term seven aligns
+`softmax(weighted terms)` with the fixed prior
+`[0.65, 0.05, 0.05, 0.05, 0.15, 0.05]` through a sigmoid (the prior's CE mass
+anneals to 0.20 so selection shifts onto inference-available signals, because
+the CE term does not exist without a ground-truth token); term eight sharpens
+the depth-selection distribution `rho = softmax(-l_t / T)` and normalizes its
+entropy by `log(depths)`.  The shortlist CE uses the top-64 teacher tokens
+plus the true token, so per-depth supervision costs almost nothing.
+
+`scripts/calibrate_early_exit.py` fits the final thresholds after readout
+training: it derives the oracle exit depth (`CE_t - CE_full <= epsilon`) on
+held-out windows and grid-searches `(tau_c, tau_m, tau_d)` for the fastest
+policy whose relative CE degradation stays within `--budget`, validated on a
+disjoint half.  The artifact written to `--output` carries the policy that
+`test.py --early-exit-config` loads.
+
+```bash
+torchrun --standalone --nproc_per_node=2 train.py ...   # pretraining (unchanged)
+python train.py --train-exit-readout --resume <base.pt> \
+  --checkpoint datasets/checkpoints/exit-readout.pt --steps 2000 \
+  --exit-readout-rank 16 --device auto
+python scripts/calibrate_early_exit.py \
+  --checkpoint datasets/checkpoints/exit-readout.pt \
+  --dataset-dir datasets/tokens --output early_exit_calibration.pt
+python test.py --checkpoint datasets/checkpoints/exit-readout.pt \
+  --early-exit-config early_exit_calibration.pt --benchmark-tokens 128
+```
+
+Disable the early exit with `--no-early-exit` (the default configuration runs
+the full 24 cycles and is bit-identical to the unmodified model).  Design
+references: CALM (arXiv 2207.07061), Huginn deep supervision (arXiv
+2502.05171), post-hoc readout diagnostics (arXiv 2607.20519), FPRM
+fixed-point halting (arXiv 2606.18206), RecurTrace (arXiv 2609.03379).
+
 ## Data And Training
 
 1. Install dependencies with the required Tsinghua mirror:

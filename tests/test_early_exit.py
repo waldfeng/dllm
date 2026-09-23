@@ -1,0 +1,367 @@
+import argparse
+import math
+from pathlib import Path
+
+import pytest
+import torch
+
+from memory_transformer import (
+    CalibratedExitReadout,
+    MemoryTransformerConfig,
+    MemoryTransformerForCausalLM,
+    ensure_exit_readout,
+)
+from train import exit_readout_losses
+
+
+def tiny_config(**overrides) -> MemoryTransformerConfig:
+    values = dict(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_memory_blocks=4,
+        top_k=2,
+        max_position_embeddings=32,
+        early_exit_min_depth=2,
+    )
+    values.update(overrides)
+    return MemoryTransformerConfig(**values)
+
+
+def tiny_model(**overrides) -> MemoryTransformerForCausalLM:
+    return MemoryTransformerForCausalLM(tiny_config(**overrides))
+
+
+def permissive_args(**overrides) -> argparse.Namespace:
+    values = dict(
+        exit_shortlist=64,
+        exit_min_depth=1,
+        exit_tau_confidence=0.0,
+        exit_tau_margin=0.0,
+        exit_tau_delta=1e9,
+        exit_temp_start=2.0,
+        exit_temp_end=0.25,
+        exit_sparsity_weight=1.0,
+    )
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def synthetic_rollout(
+    depth: int = 4, batch: int = 2, hidden: int = 32, vocab: int = 32, seed: int = 0
+) -> dict[str, torch.Tensor]:
+    generator = torch.Generator().manual_seed(seed)
+    states = torch.randn(depth, batch, hidden, generator=generator)
+    deltas = torch.rand(depth, batch, generator=generator)
+    teacher = torch.randn(batch, vocab, generator=generator) * 5.0
+    return {"states": states, "deltas": deltas, "teacher_logits": teacher}
+
+
+def uniform_weights() -> torch.Tensor:
+    prior = torch.tensor([0.65, 0.05, 0.05, 0.05, 0.15, 0.05])
+    return prior / prior.sum()
+
+
+def test_extreme_thresholds_run_full_depth_and_match_baseline():
+    model = tiny_model(
+        early_exit_enabled=True,
+        early_exit_min_depth=4,
+        early_exit_confidence_threshold=1e-6,
+        early_exit_margin_threshold=0.0,
+        early_exit_state_delta_threshold=1e9,
+    ).eval()
+    ids = torch.arange(8).view(1, 8) % 32
+    with torch.no_grad():
+        exited = model(ids, early_exit=True)
+        baseline = model(ids, early_exit=False)
+    assert exited["exit_depth"] == 4
+    assert torch.equal(exited["logits"], baseline["logits"])
+
+
+def test_min_depth_halt_equals_manual_partial_loop():
+    model = tiny_model(
+        early_exit_enabled=True,
+        early_exit_min_depth=2,
+        early_exit_confidence_threshold=1e-6,
+        early_exit_margin_threshold=0.0,
+        early_exit_state_delta_threshold=1e9,
+    ).eval()
+    ids = torch.arange(8).view(1, 8) % 32
+    with torch.no_grad():
+        output = model(ids, early_exit=True)
+        x = model.embed_tokens(ids)
+        for layer in model.layers[:2]:
+            x, _index, _weight, _probability = layer(x, model.memory, attention_mask=None)
+        reference = model.lm_head(model.norm(x))
+    assert output["exit_depth"] == 2
+    assert output["exit_halted"] is True
+    assert torch.allclose(output["logits"], reference)
+
+
+def test_calibrated_readout_identity_is_bitwise_equal():
+    model = tiny_model(
+        early_exit_enabled=True,
+        early_exit_min_depth=4,
+        early_exit_confidence_threshold=1e-6,
+    ).eval()
+    ensure_exit_readout(model)
+    ids = torch.arange(8).view(1, 8) % 32
+    with torch.no_grad():
+        exited = model(ids, early_exit=True)
+        baseline = model(ids, early_exit=False)
+        states = torch.randn(3, 32)
+        at_depth = model.exit_readout.logits_at(1, states, model.lm_head.weight)
+        plain = torch.nn.functional.linear(states, model.lm_head.weight)
+    assert torch.equal(exited["logits"], baseline["logits"])
+    assert torch.equal(at_depth, plain)
+
+
+def test_exit_terms_move_in_the_minimization_direction():
+    model = tiny_model().eval()
+    ensure_exit_readout(model)
+    target = torch.tensor([3, 7])
+
+    def run(rollout, weights, **overrides):
+        total, stats = exit_readout_losses(
+            model, rollout, target, weights, uniform_weights(), permissive_args(**overrides), 0.0, 4
+        )
+        return total, stats
+
+    rollout = synthetic_rollout()
+    weights = uniform_weights()
+    shaping_args = permissive_args(
+        exit_tau_confidence=0.9, exit_tau_margin=0.3, exit_tau_delta=1e9
+    )
+
+    def run(rollout, weights, args):
+        total, stats = exit_readout_losses(
+            model, rollout, target, weights, uniform_weights(), args, 0.0, 4
+        )
+        return total, stats
+
+    weak_total, weak_stats = run(rollout, weights, shaping_args)
+    peaked = synthetic_rollout()
+    with torch.no_grad():
+        model.exit_readout.bias.zero_()
+        model.exit_readout.bias[:, 3] = 20.0
+        model.exit_readout.bias[:, 7] = 20.0
+        others = torch.ones(32, dtype=torch.bool)
+        others[[3, 7]] = False
+        model.exit_readout.bias[:, others] = -20.0
+    strong_total, strong_stats = run(peaked, weights, shaping_args)
+    with torch.no_grad():
+        model.exit_readout.bias.zero_()
+    assert strong_stats["confidence"] < weak_stats["confidence"]
+    assert strong_stats["margin"] < weak_stats["margin"]
+    assert strong_stats["ce"] < weak_stats["ce"]
+
+    flat_delta = synthetic_rollout()
+    flat_delta["deltas"] = torch.zeros(4, 2)
+    rough_delta = synthetic_rollout()
+    rough_delta["deltas"] = torch.full((4, 2), 0.5)
+    delta_args = permissive_args(
+        exit_tau_confidence=0.9, exit_tau_margin=0.3, exit_tau_delta=0.05
+    )
+    _, flat_stats = run(flat_delta, weights, delta_args)
+    _, rough_stats = run(rough_delta, weights, delta_args)
+    assert rough_stats["delta"] > flat_stats["delta"]
+
+    penalized = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    _, guard_free = run(rollout, penalized, permissive_args(exit_min_depth=1))
+    _, guarded = run(rollout, penalized, permissive_args(exit_min_depth=8))
+    assert guard_free["guard"] == 0.0
+    assert guarded["guard"] > 0.0
+    assert strong_total.isfinite() and weak_total.isfinite()
+
+
+def test_loss_terms_are_bounded_and_weights_sum_to_one():
+    model = tiny_model().eval()
+    ensure_exit_readout(model)
+    weights = uniform_weights()
+    prior = uniform_weights()
+    total, stats = exit_readout_losses(
+        model,
+        synthetic_rollout(),
+        torch.tensor([3, 7]),
+        weights,
+        prior,
+        permissive_args(),
+        0.0,
+        4,
+    )
+    assert abs(float(weights.sum()) - 1.0) < 1e-5
+    assert 0.0 <= stats["weight_alignment"] <= 1.0
+    assert 0.0 <= stats["sparsity"] <= 1.0 + 1e-6
+    assert 0.0 <= stats["ce"] <= 1.0
+    assert 0.0 <= stats["confidence"] <= 1.0
+    assert 0.0 <= stats["margin"] <= 1.0
+    assert 0.0 <= stats["delta"] <= 1.0
+    assert 0.0 <= stats["speed"] <= 1.0
+    assert 0.0 <= stats["guard"] <= 1.0
+    assert torch.isfinite(total)
+
+
+def test_saturation_reaches_exact_zero():
+    model = tiny_model().eval()
+    ensure_exit_readout(model)
+    weights = uniform_weights()
+    _, stats = exit_readout_losses(
+        model,
+        synthetic_rollout(),
+        torch.tensor([3, 7]),
+        weights,
+        uniform_weights(),
+        permissive_args(exit_tau_confidence=0.0, exit_tau_margin=0.0),
+        0.0,
+        4,
+    )
+    assert stats["confidence"] == 0.0
+    assert stats["margin"] == 0.0
+
+
+def test_fixed_weights_receive_no_gradient():
+    model = tiny_model().eval()
+    ensure_exit_readout(model)
+    weights = uniform_weights()
+    total, _stats = exit_readout_losses(
+        model,
+        synthetic_rollout(),
+        torch.tensor([3, 7]),
+        weights,
+        uniform_weights(),
+        permissive_args(),
+        0.0,
+        4,
+    )
+    total.backward()
+    assert weights.grad is None
+    assert model.exit_readout.vocabulary.grad is not None
+    backbone = model.memory.ffn_gate.grad
+    assert backbone is None
+
+
+def test_training_mode_ignores_early_exit():
+    model = tiny_model(early_exit_enabled=True)
+    ids = torch.arange(8).view(1, 8) % 32
+    output = model(ids, early_exit=True)
+    assert "exit_depth" not in output
+    model.eval()
+    with torch.no_grad():
+        output = model(ids, early_exit=True)
+    assert "exit_depth" in output
+
+
+def test_exit_rollout_shapes_and_zero_first_delta():
+    model = tiny_model().eval()
+    ids = torch.arange(8).view(2, 4) % 32
+    with torch.no_grad():
+        rollout = model.exit_rollout(ids)
+    assert rollout["states"].shape == (4, 2, 32)
+    assert rollout["deltas"].shape == (4, 2)
+    assert rollout["teacher_logits"].shape == (2, 32)
+    assert torch.all(rollout["deltas"][0] == 0.0)
+    assert torch.all(rollout["deltas"][1:] > 0.0)
+
+
+def test_checkpoint_roundtrip_with_readout(tmp_path: Path):
+    model = tiny_model().eval()
+    ensure_exit_readout(model)
+    ids = torch.arange(8).view(1, 8) % 32
+    with torch.no_grad():
+        before = model(ids, early_exit=True)["logits"]
+    path = tmp_path / "exit-readout.pt"
+    torch.save({"model": model.state_dict(), "exit_readout_rank": 16}, path)
+    restored = tiny_model().eval()
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    ensure_exit_readout(restored, rank=int(payload["exit_readout_rank"]))
+    restored.load_state_dict(payload["model"])
+    with torch.no_grad():
+        after = restored(ids, early_exit=True)["logits"]
+    assert torch.equal(before, after)
+
+
+def test_shortlist_full_coverage_matches_full_ce():
+    model = tiny_model().eval()
+    ensure_exit_readout(model)
+    rollout = synthetic_rollout()
+    teacher = rollout["teacher_logits"]
+    target = teacher.argmin(dim=-1)
+    weights = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    _, stats = exit_readout_losses(
+        model, rollout, target, weights, uniform_weights(), permissive_args(), 0.0, 4
+    )
+    states = rollout["states"].float()
+    expected = []
+    for depth_index in range(4):
+        logits = model.exit_readout.logits_at(
+            depth_index, states[depth_index], model.lm_head.weight.to(states.dtype)
+        )
+        full_ce = torch.nn.functional.cross_entropy(logits, target, reduction="none")
+        expected.append(torch.sigmoid(full_ce))
+    expected_mean = torch.stack(expected).mean().detach()
+    assert abs(stats["ce"] - float(expected_mean)) < 1e-6
+
+
+def test_generate_returns_stats():
+    model = tiny_model(
+        early_exit_enabled=True,
+        early_exit_min_depth=1,
+        early_exit_confidence_threshold=1e-6,
+        early_exit_margin_threshold=0.0,
+        early_exit_state_delta_threshold=1e9,
+    ).eval()
+    ids = torch.arange(4).view(1, 4) % 32
+    with torch.no_grad():
+        generated, stats = model.generate(ids, 3, early_exit=True, return_stats=True)
+    assert generated.shape == (1, 7)
+    assert stats["steps"] == 3.0
+    assert 1.0 <= stats["avg_exit_depth"] <= 4.0
+
+
+def test_apply_exit_policy_sets_and_validates():
+    model = tiny_model()
+    model.apply_exit_policy(
+        {
+            "early_exit_enabled": True,
+            "early_exit_min_depth": 3,
+            "early_exit_confidence_threshold": 0.8,
+            "early_exit_margin_threshold": 0.2,
+            "early_exit_state_delta_threshold": 0.1,
+        }
+    )
+    assert model.config.early_exit_enabled is True
+    assert model.config.early_exit_min_depth == 3
+    with pytest.raises(ValueError, match="unknown exit policy keys"):
+        model.apply_exit_policy({"bogus": 1})
+
+
+def test_config_validates_exit_fields():
+    with pytest.raises(ValueError, match="early_exit_min_depth"):
+        tiny_config(early_exit_min_depth=0)
+    with pytest.raises(ValueError, match="early_exit_confidence_threshold"):
+        tiny_config(early_exit_confidence_threshold=0.0)
+    with pytest.raises(ValueError, match="early_exit_state_delta_threshold"):
+        tiny_config(early_exit_state_delta_threshold=0.0)
+    with pytest.raises(ValueError, match="exit_readout_rank"):
+        tiny_config(exit_readout_rank=0)
+
+
+def test_oversized_min_depth_clamps_to_full_depth():
+    model = tiny_model(early_exit_enabled=True, early_exit_min_depth=99,
+                       early_exit_confidence_threshold=1e-6).eval()
+    ids = torch.arange(8).view(1, 8) % 32
+    with torch.no_grad():
+        output = model(ids, early_exit=True)
+        baseline = model(ids, early_exit=False)
+    assert output["exit_depth"] == 4
+    assert torch.equal(output["logits"], baseline["logits"])
+
+
+def test_readout_module_rejects_bad_depth():
+    readout = CalibratedExitReadout(hidden_size=8, vocab_size=16, num_depths=3, rank=2)
+    states = torch.randn(5, 8)
+    with pytest.raises(ValueError, match="outside"):
+        readout.logits_at(3, states, torch.randn(16, 8))

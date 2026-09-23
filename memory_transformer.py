@@ -4,6 +4,17 @@ The model has one globally shared memory with 24 addressable blocks.  Each of
 the 24 reasoner cycles owns a router and two RMSNorms, but all cycles access the
 same FFN/Q/KV/O banks.  Routing is top-3 per head and K/V deliberately share
 the same route head and weights.
+
+Early exit (per-sequence granularity): after each reasoner cycle the model
+scores three signals on the last token position -- top-1 confidence ``p_t``,
+top1-minus-top2 probability margin, and the normalized state change
+``||norm(x_t) - norm(x_{t-1})|| / ||norm(x_t)||`` -- and halts the loop when all
+thresholds hold past a minimum depth.  An optional ``CalibratedExitReadout``
+(rank-r LoRA plus per-depth vocabulary bias and temperature on the frozen
+lm_head) supplies the depth-calibrated logits used by both the halting rule and
+the final readout.  Calibration references: CALM (arXiv 2207.07061), FPRM
+(arXiv 2606.18206), post-hoc readout diagnostics (arXiv 2607.20519), Huginn
+deep supervision (arXiv 2502.05171), RecurTrace (arXiv 2609.03379).
 """
 
 from dataclasses import dataclass
@@ -32,6 +43,12 @@ class MemoryTransformerConfig:
     rope_theta: float = 1000000.0
     tie_word_embeddings: bool = False
     dropout: float = 0.0
+    early_exit_enabled: bool = False
+    early_exit_min_depth: int = 8
+    early_exit_confidence_threshold: float = 0.9
+    early_exit_margin_threshold: float = 0.3
+    early_exit_state_delta_threshold: float = 0.05
+    exit_readout_rank: int = 16
 
     def __post_init__(self) -> None:
         positive = {
@@ -64,6 +81,18 @@ class MemoryTransformerConfig:
             raise ValueError("normalization epsilon and RoPE theta must be positive")
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must be in [0, 1)")
+        if not 1 <= self.early_exit_min_depth:
+            # Values above num_layers are clamped at use time so the 24-cycle
+            # production default (8) also validates for smaller test models.
+            raise ValueError("early_exit_min_depth must be at least 1")
+        if not 0 < self.early_exit_confidence_threshold <= 1:
+            raise ValueError("early_exit_confidence_threshold must be in (0, 1]")
+        if self.early_exit_margin_threshold < 0:
+            raise ValueError("early_exit_margin_threshold must be non-negative")
+        if self.early_exit_state_delta_threshold <= 0:
+            raise ValueError("early_exit_state_delta_threshold must be positive")
+        if self.exit_readout_rank < 1:
+            raise ValueError("exit_readout_rank must be positive")
 
     @property
     def head_dim(self) -> int:
@@ -238,6 +267,71 @@ class SharedMemory(nn.Module):
         return self.routed_linear(x, bank, indices, weights)
 
 
+class CalibratedExitReadout(nn.Module):
+    """Per-depth calibrated readout on top of the frozen ``lm_head``.
+
+    Depth ``t`` computes ``logits = temperature[t] * (W h + B_t (A_t h) + c_t)``
+    with ``W`` the frozen language-model head.  ``B_t`` and ``c_t`` start at
+    zero and the temperature starts at one, so an unfitted readout is exactly
+    the identity mapping of the shared head (bit-level equal logits).  Only
+    these low-rank corrections, the bias, and the temperature are trainable;
+    the backbone and the shared head stay frozen.
+    """
+
+    def __init__(
+        self, hidden_size: int, vocab_size: int, num_depths: int, rank: int
+    ) -> None:
+        super().__init__()
+        if rank < 1 or num_depths < 1:
+            raise ValueError("rank and num_depths must be positive")
+        self.rank = rank
+        self.num_depths = num_depths
+        self.project = nn.Parameter(torch.zeros(num_depths, rank, hidden_size))
+        self.vocabulary = nn.Parameter(torch.zeros(num_depths, vocab_size, rank))
+        self.bias = nn.Parameter(torch.zeros(num_depths, vocab_size))
+        self.temperature = nn.Parameter(torch.ones(num_depths))
+        for depth in range(num_depths):
+            nn.init.kaiming_uniform_(self.project[depth], a=5**0.5)
+
+    def reset_identity(self) -> None:
+        """Restore the exact identity initialization (B = c = 0, T = 1)."""
+        nn.init.zeros_(self.vocabulary)
+        nn.init.zeros_(self.bias)
+        nn.init.ones_(self.temperature)
+        for depth in range(self.num_depths):
+            nn.init.kaiming_uniform_(self.project[depth], a=5**0.5)
+
+    def logits_at(self, depth_index: int, states: Tensor, head_weight: Tensor) -> Tensor:
+        """Calibrated logits for normed states ``[..., hidden]`` at one depth."""
+        if not 0 <= depth_index < self.num_depths:
+            raise ValueError(f"depth index {depth_index} outside [0, {self.num_depths})")
+        base = F.linear(states, head_weight)
+        dtype = states.dtype
+        projected = states @ self.project[depth_index].to(dtype).transpose(0, 1)
+        correction = projected @ self.vocabulary[depth_index].to(dtype).transpose(0, 1)
+        correction = correction + self.bias[depth_index].to(dtype)
+        return (base + correction) * self.temperature[depth_index].to(dtype)
+
+    def extra_repr(self) -> str:
+        return f"depths={self.num_depths} rank={self.rank}"
+
+
+def ensure_exit_readout(
+    model: "MemoryTransformerForCausalLM", rank: Optional[int] = None
+) -> "CalibratedExitReadout":
+    """Attach (idempotently) the calibrated exit readout to a model."""
+    if model.exit_readout is None:
+        model.exit_readout = CalibratedExitReadout(
+            hidden_size=model.config.hidden_size,
+            vocab_size=model.config.vocab_size,
+            num_depths=model.config.num_layers,
+            rank=rank if rank is not None else model.config.exit_readout_rank,
+        )
+    elif rank is not None and rank != model.exit_readout.rank:
+        raise ValueError("exit readout rank mismatch with the existing module")
+    return model.exit_readout
+
+
 class MemoryReasoner(nn.Module):
     """One recurrent reasoner cycle; memory is passed explicitly for FSDP safety."""
 
@@ -316,6 +410,7 @@ class MemoryTransformerForCausalLM(nn.Module):
         )
         self.norm = RMSNorm(self.config.hidden_size, self.config.rms_norm_eps)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        self.exit_readout: Optional[CalibratedExitReadout] = None
         self.apply(self._init)
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
@@ -328,6 +423,42 @@ class MemoryTransformerForCausalLM(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=0.02)
+
+    def _exit_readout_logits(self, depth_index: int, states: Tensor) -> Tensor:
+        """Last-position logits for the halting rule at one depth."""
+        if self.exit_readout is not None:
+            return self.exit_readout.logits_at(depth_index, states, self.lm_head.weight)
+        return F.linear(states, self.lm_head.weight)
+
+    def apply_exit_policy(self, policy: dict[str, object]) -> None:
+        """Overlay an early-exit policy (calibration artifact) onto the config."""
+        allowed = {
+            "early_exit_enabled",
+            "early_exit_min_depth",
+            "early_exit_confidence_threshold",
+            "early_exit_margin_threshold",
+            "early_exit_state_delta_threshold",
+        }
+        unknown = set(policy) - allowed
+        if unknown:
+            raise ValueError(f"unknown exit policy keys: {sorted(unknown)}")
+        for key, value in policy.items():
+            setattr(self.config, key, value)
+        self.config.__post_init__()
+
+    def load_exit_calibration(
+        self, path, apply_policy: bool = True
+    ) -> Optional[dict[str, object]]:
+        """Load a calibration artifact and (optionally) attach its readout."""
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if "readout" in payload:
+            rank = payload.get("rank") or self.config.exit_readout_rank
+            ensure_exit_readout(self, rank=int(rank))
+            self.exit_readout.load_state_dict(payload["readout"])
+        policy = payload.get("policy")
+        if apply_policy and policy:
+            self.apply_exit_policy(policy)
+        return policy
 
     @staticmethod
     def load_balance_loss(
@@ -356,6 +487,7 @@ class MemoryTransformerForCausalLM(nn.Module):
         labels: Optional[Tensor] = None,
         attention_mask: Optional[Tensor] = None,
         return_router_stats: bool = False,
+        early_exit: Optional[bool] = None,
     ) -> dict[str, object]:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, sequence]")
@@ -371,6 +503,14 @@ class MemoryTransformerForCausalLM(nn.Module):
         if labels is not None and labels.shape != input_ids.shape:
             raise ValueError("labels must have the same shape as input_ids")
 
+        enabled = (
+            self.config.early_exit_enabled if early_exit is None else bool(early_exit)
+        )
+        if enabled and self.training:
+            # Halting is an inference-time mechanism; training always runs the
+            # full depth so gradients and router statistics stay unchanged.
+            enabled = False
+
         x = self.embed_tokens(input_ids)
         if attention_mask is not None:
             x = x * attention_mask.unsqueeze(-1).to(x.dtype)
@@ -378,7 +518,14 @@ class MemoryTransformerForCausalLM(nn.Module):
         route_indices = []
         route_weights = []
         route_probabilities = []
-        for layer in self.layers:
+        exit_depth = self.config.num_layers
+        exit_confidence: list[Tensor] = []
+        exit_margin: list[Tensor] = []
+        exit_delta: list[Optional[Tensor]] = []
+        exit_normed: Optional[Tensor] = None
+        prev_normed: Optional[Tensor] = None
+        halted = False
+        for depth_index, layer in enumerate(self.layers):
             x, indices, weights, probabilities = layer(
                 x, self.memory, attention_mask=attention_mask
             )
@@ -391,11 +538,67 @@ class MemoryTransformerForCausalLM(nn.Module):
                 route_indices.append(indices)
                 route_weights.append(weights)
                 route_probabilities.append(probabilities)
-        logits = self.lm_head(self.norm(x))
+            if not enabled:
+                continue
+            normed = self.norm(x)
+            last_logits = self._exit_readout_logits(depth_index, normed[:, -1, :])
+            last_probabilities = torch.softmax(last_logits.float(), dim=-1)
+            top2 = torch.topk(last_probabilities, 2, dim=-1).values
+            confidence = top2[:, 0]
+            margin = top2[:, 0] - top2[:, 1]
+            if prev_normed is None:
+                delta = None
+            else:
+                difference = normed.float() - prev_normed
+                denominator = normed.float().norm(dim=-1).clamp_min(1e-6)
+                per_position = difference.norm(dim=-1) / denominator
+                if attention_mask is not None:
+                    mask = attention_mask.to(per_position.dtype)
+                    delta = (per_position * mask).sum(-1) / mask.sum(-1).clamp_min(1.0)
+                else:
+                    delta = per_position.mean(-1)
+            exit_confidence.append(confidence.detach())
+            exit_margin.append(margin.detach())
+            exit_delta.append(None if delta is None else delta.detach())
+            if depth_index + 1 >= min(
+                self.config.early_exit_min_depth, self.config.num_layers
+            ):
+                ready = (
+                    confidence >= self.config.early_exit_confidence_threshold
+                ).all() & (
+                    margin >= self.config.early_exit_margin_threshold
+                ).all()
+                if delta is not None:
+                    ready = ready & (
+                        delta <= self.config.early_exit_state_delta_threshold
+                    ).all()
+                if bool(ready):
+                    exit_depth = depth_index + 1
+                    exit_normed = normed
+                    halted = True
+                    break
+            prev_normed = normed.detach()
+        if enabled and self.exit_readout is not None:
+            normed_final = exit_normed if halted else self.norm(x)
+            logits = self.exit_readout.logits_at(
+                exit_depth - 1, normed_final, self.lm_head.weight
+            )
+        elif halted:
+            logits = self.lm_head(exit_normed)
+        else:
+            logits = self.lm_head(self.norm(x))
         result: dict[str, object] = {
             "logits": logits,
             "router_loss": torch.stack(route_losses).mean(),
         }
+        if enabled:
+            result["exit_depth"] = exit_depth
+            result["exit_halted"] = halted
+            result["exit_confidence"] = [tensor.tolist() for tensor in exit_confidence]
+            result["exit_margin"] = [tensor.tolist() for tensor in exit_margin]
+            result["exit_delta"] = [
+                None if tensor is None else tensor.tolist() for tensor in exit_delta
+            ]
         if labels is not None:
             shifted_logits = logits[:, :-1].contiguous()
             shifted_labels = labels[:, 1:].contiguous()
@@ -415,17 +618,75 @@ class MemoryTransformerForCausalLM(nn.Module):
         return result
 
     @torch.no_grad()
+    def exit_rollout(
+        self, input_ids: Tensor, attention_mask: Optional[Tensor] = None
+    ) -> dict[str, Tensor]:
+        """Full-depth backbone pass collecting per-depth readout inputs.
+
+        Runs every reasoner cycle without grad and records, per depth: the
+        final-normed last-position state (the calibrated readout input), the
+        mask-normalized state delta against the previous depth (zero at depth
+        one), and the plain lm_head teacher logits at full depth.  Used by the
+        exit-readout trainer and by threshold calibration.
+        """
+        if input_ids.ndim != 2:
+            raise ValueError("input_ids must have shape [batch, sequence]")
+        if attention_mask is not None:
+            if attention_mask.shape != input_ids.shape:
+                raise ValueError("attention_mask must have the same shape as input_ids")
+            attention_mask = attention_mask.bool()
+        x = self.embed_tokens(input_ids)
+        if attention_mask is not None:
+            x = x * attention_mask.unsqueeze(-1).to(x.dtype)
+        states: list[Tensor] = []
+        deltas: list[Tensor] = []
+        prev_normed: Optional[Tensor] = None
+        for layer in self.layers:
+            x, _indices, _weights, _probabilities = layer(
+                x, self.memory, attention_mask=attention_mask
+            )
+            if attention_mask is not None:
+                x = x * attention_mask.unsqueeze(-1).to(x.dtype)
+            normed = self.norm(x)
+            states.append(normed[:, -1, :])
+            if prev_normed is None:
+                deltas.append(x.new_zeros(x.shape[0]))
+            else:
+                difference = normed.float() - prev_normed
+                denominator = normed.float().norm(dim=-1).clamp_min(1e-6)
+                per_position = difference.norm(dim=-1) / denominator
+                if attention_mask is not None:
+                    mask = attention_mask.to(per_position.dtype)
+                    deltas.append(
+                        (per_position * mask).sum(-1) / mask.sum(-1).clamp_min(1.0)
+                    )
+                else:
+                    deltas.append(per_position.mean(-1))
+            prev_normed = normed.detach()
+        return {
+            "states": torch.stack(states),
+            "deltas": torch.stack(deltas),
+            "teacher_logits": F.linear(states[-1], self.lm_head.weight),
+        }
+
+    @torch.no_grad()
     def generate(
         self,
         input_ids: Tensor,
         max_new_tokens: int,
         eos_token_id: Optional[int] = None,
-    ) -> Tensor:
+        early_exit: Optional[bool] = None,
+        return_stats: bool = False,
+    ) -> Tensor | tuple[Tensor, dict[str, float]]:
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be non-negative")
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        exit_depths: list[int] = []
         for _ in range(max_new_tokens):
-            logits = self(input_ids)["logits"][:, -1]
+            output = self(input_ids, early_exit=early_exit)
+            if "exit_depth" in output:
+                exit_depths.append(int(output["exit_depth"]))
+            logits = output["logits"][:, -1]
             next_token = logits.argmax(-1, keepdim=True)
             if eos_token_id is not None:
                 next_token = torch.where(
@@ -437,4 +698,15 @@ class MemoryTransformerForCausalLM(nn.Module):
             input_ids = torch.cat((input_ids, next_token), dim=-1)
             if eos_token_id is not None and bool(finished.all()):
                 break
+        if return_stats:
+            steps = len(exit_depths)
+            if steps:
+                average_depth = sum(exit_depths) / steps
+            else:
+                average_depth = float(self.config.num_layers)
+            stats = {
+                "steps": float(steps),
+                "avg_exit_depth": average_depth,
+            }
+            return input_ids, stats
         return input_ids
