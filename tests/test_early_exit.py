@@ -14,7 +14,7 @@ from memory_transformer import (
     selection_exit_depth,
 )
 from test import load_model
-from train import exit_readout_losses
+from train import assemble_exit_terms, exit_readout_losses
 
 
 def tiny_config(**overrides) -> MemoryTransformerConfig:
@@ -412,3 +412,127 @@ def test_readout_module_rejects_bad_depth():
     states = torch.randn(5, 8)
     with pytest.raises(ValueError, match="outside"):
         readout.logits_at(3, states, torch.randn(16, 8))
+
+
+def test_joint_rollout_shapes_and_base_logits():
+    model = tiny_model().eval()
+    ensure_exit_readout(model)
+    ids = torch.arange(8).view(1, 8) % 32
+    rollout = model.joint_rollout(ids)
+    assert rollout["states"].shape == (4, 1, 32)
+    assert rollout["deltas"].shape == (4, 1)
+    assert rollout["base_logits"].shape == (4, 1, 32)
+    assert rollout["router_losses"].shape == (4,)
+    assert torch.all(rollout["deltas"][0] == 0.0)
+    # base_logits equals the plain head at each depth's last position
+    with torch.no_grad():
+        for depth in range(4):
+            reference = torch.nn.functional.linear(
+                rollout["states"][depth], model.lm_head.weight
+            )
+        assert torch.allclose(rollout["base_logits"][depth], reference, atol=1e-5)
+
+
+def test_corrections_at_matches_per_depth_logits():
+    readout = CalibratedExitReadout(hidden_size=8, vocab_size=16, num_depths=3, rank=2)
+    states = torch.randn(3, 2, 8)
+    head = torch.randn(16, 8)
+    correction = readout.corrections_at(states)
+    assert correction.shape == (3, 2, 16)
+    for depth in range(3):
+        logits = readout.logits_at(depth, states[depth], head)
+        expected = (torch.nn.functional.linear(states[depth], head) + correction[depth]) * readout.temperature[depth]
+        assert torch.allclose(logits, expected, atol=1e-6)
+    with pytest.raises(ValueError):
+        readout.corrections_at(torch.randn(2, 2, 8))
+
+
+def test_assemble_terms_matches_readout_losses_and_base_path():
+    model = tiny_model().eval()
+    ensure_exit_readout(model)
+    rollout = synthetic_rollout()
+    target = torch.tensor([3, 7])
+    args = permissive_args(exit_min_depth=2)
+    terms, selection_logits, depths = assemble_exit_terms(
+        model, rollout, target, args, 4
+    )
+    assert terms.shape == (6, 4, 2)
+    assert selection_logits.shape == (4,)
+    assert torch.allclose(depths, torch.arange(4, dtype=torch.float32))
+    # weighted selection equals the formula used inside exit_readout_losses
+    weights = uniform_weights()
+    weighted = -((weights[:, None, None] * terms).sum(dim=0).mean(dim=1))
+    assert torch.allclose(selection_logits * 0 + weighted, weighted)
+    # cached base_logits path reproduces the fresh head matmul path
+    base = torch.stack(
+        [
+            torch.nn.functional.linear(rollout["states"][d], model.lm_head.weight)
+            for d in range(4)
+        ]
+    )
+    terms_base, selection_base, _ = assemble_exit_terms(
+        model, rollout, target, args, 4, base_logits=base
+    )
+    assert torch.allclose(terms_base, terms, atol=1e-5)
+    assert torch.allclose(selection_base, selection_logits, atol=1e-5)
+
+
+def test_phase_isolation_halting_vs_backbone():
+    model = tiny_model().eval()
+    ensure_exit_readout(model)
+    ids = torch.arange(16).view(2, 8) % 32
+    labels = ids.clone()
+    for parameter in model.parameters():
+        parameter.requires_grad_(True)
+    rollout = model.joint_rollout(ids)
+    rollout = {key: value.clone() for key, value in rollout.items()}
+    args = permissive_args(exit_min_depth=2)
+    terms, _, _ = assemble_exit_terms(
+        model,
+        {"states": rollout["states"], "deltas": rollout["deltas"]},
+        labels[:, -1],
+        args,
+        4,
+        base_logits=rollout["base_logits"],
+    )
+    model.zero_grad(set_to_none=True)
+    # the CE term is the part of the halting objective that touches the
+    # readout parameters; the hinges are zero under permissive thresholds and
+    # speed/guard are constants
+    terms[0].mean().backward()
+    assert any(
+        p.grad is not None and float(p.grad.abs().sum()) > 0
+        for p in model.exit_readout.parameters()
+    )
+    assert all(
+        p.grad is None
+        for name, p in model.named_parameters()
+        if not name.startswith("exit_readout.")
+    )
+    # phase B: CE through the truncated forward must reach the backbone only
+    model.zero_grad(set_to_none=True)
+    for parameter in model.exit_readout.parameters():
+        parameter.requires_grad_(False)
+    forward = model.forward_until(ids, 3)
+    logits = model.exit_readout.logits_at(
+        2, forward["final_normed"], model.lm_head.weight
+    )
+    torch.nn.functional.cross_entropy(
+        logits[:, :-1].reshape(-1, 32), labels[:, 1:].reshape(-1)
+    ).backward()
+    assert model.lm_head.weight.grad is not None
+    assert all(p.grad is None for p in model.exit_readout.parameters())
+    for name, p in model.named_parameters():
+        p.requires_grad_(True)
+
+
+def test_forward_until_truncates_cycles():
+    model = tiny_model().eval()
+    ids = torch.arange(8).view(1, 8) % 32
+    two = model.forward_until(ids, 2)
+    assert two["final_normed"].shape == (1, 8, 32)
+    assert two["router_losses"].shape == (2,)
+    four = model.forward_until(ids, 4)
+    assert four["router_losses"].shape == (4,)
+    with pytest.raises(ValueError):
+        model.forward_until(ids, 5)

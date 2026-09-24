@@ -74,6 +74,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-fsdp", action="store_true")
     parser.add_argument("--checkpoint", type=Path, default=Path("datasets/checkpoints/last.pt"))
     parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--init-weights-from",
+        type=Path,
+        help="warm start full-parameter training: load only the model weights "
+        "from the given checkpoint and start a fresh optimizer and schedule on "
+        "the requested data stream (mutually exclusive with --resume)",
+    )
     parser.add_argument("--save-steps", type=int, default=1000)
     parser.add_argument(
         "--save-interval-hours",
@@ -147,6 +154,19 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="readout mode: seed batch size of the memory probe",
+    )
+    parser.add_argument(
+        "--train-exit-joint",
+        action="store_true",
+        help="joint two-phase mode: full-parameter backbone training on the "
+        "argmax-selected depth CE while the halting losses fit only the exit "
+        "readout LoRA and the six loss weights (replicated tensors, no FSDP)",
+    )
+    parser.add_argument(
+        "--exit-joint-readout-lr",
+        type=float,
+        default=1.25e-5,
+        help="joint mode: readout/loss-weight lr; applied once per micro-batch",
     )
     return parser.parse_args()
 
@@ -513,6 +533,73 @@ def _anneal(start: float, end: float, progress: float) -> float:
     return start + (end - start) * min(1.0, max(0.0, progress))
 
 
+def assemble_exit_terms(
+    model: MemoryTransformerForCausalLM,
+    rollout: dict[str, Tensor],
+    target_tokens: Tensor,
+    args: argparse.Namespace,
+    num_depths: int,
+    base_logits: Optional[Tensor] = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Build the six per-depth halting terms ``[6, D, B]`` and selection logits.
+
+    One shared definition of the six terms for both the exit-readout trainer
+    and the joint phase-A losses: full-vocabulary readout CE divided by
+    ``ln(V)``, confidence deficit, probability-margin deficit, state-delta
+    deficit, speed ``t/D``, and min-depth guard.  ``rollout["states"]`` holds
+    the per-depth last-position normed states; when ``base_logits`` is given
+    (the cached last-position ``W h`` products from :meth:`joint_rollout`) the
+    readout logits are reconstructed from it plus the batched LoRA correction,
+    skipping a redundant vocabulary matmul.
+    """
+    device = rollout["states"].device
+    depths_range = torch.arange(num_depths, device=device, dtype=torch.float32)
+    depth_fraction = (depths_range + 1.0) / num_depths
+    guard = (args.exit_min_depth - (depths_range + 1.0)).clamp_min(0.0) / num_depths
+    speed = depth_fraction
+    deltas = rollout["deltas"].float()
+    states = rollout["states"].float()
+    target = target_tokens
+    log_vocab = float(np.log(max(2, model.lm_head.weight.shape[-1])))
+
+    compute_dtype = torch.bfloat16 if states.is_cuda else states.dtype
+    readout = model.exit_readout
+    if readout is None:
+        raise ValueError("exit readout module missing")
+    if base_logits is not None:
+        corrections = readout.corrections_at(
+            rollout["states"].to(compute_dtype)
+        ).float()
+        logits = (base_logits.to(compute_dtype).float() + corrections) * readout.temperature.float().unsqueeze(-1).unsqueeze(-1)
+    else:
+        head_weight = model.lm_head.weight.to(compute_dtype)
+        logits = torch.stack(
+            [
+                readout.logits_at(depth_index, states[depth_index].to(compute_dtype), head_weight)
+                for depth_index in range(num_depths)
+            ]
+        ).float()
+    log_normalizer = torch.logsumexp(logits, dim=-1)  # [D, B]
+    top2 = torch.topk(logits, 2, dim=-1).values
+    confidence = (top2[..., 0] - log_normalizer).exp()
+    margin = confidence - (top2[..., 1] - log_normalizer).exp()
+    target_logit = logits.gather(-1, target[None, :, None].expand(num_depths, -1, 1)).squeeze(-1)
+    cross_entropy = (log_normalizer - target_logit.squeeze(-1)) / log_vocab
+    per_depth_terms = torch.stack(
+        [
+            cross_entropy,
+            (args.exit_tau_confidence - confidence).clamp_min(0.0),
+            (args.exit_tau_margin - margin).clamp_min(0.0),
+            (deltas - args.exit_tau_delta).clamp_min(0.0),
+            speed[:, None].expand(num_depths, cross_entropy.shape[-1]),
+            guard[:, None].expand(num_depths, cross_entropy.shape[-1]),
+        ],
+        dim=0,
+    )  # [6, D, B]
+    selection_logits = -(per_depth_terms.mean(dim=-1).sum(dim=0))  # [D]
+    return per_depth_terms, selection_logits, depths_range
+
+
 def exit_readout_losses(
     model: MemoryTransformerForCausalLM,
     rollout: dict[str, Tensor],
@@ -535,38 +622,9 @@ def exit_readout_losses(
     distribution; annealing the prior's CE mass to zero keeps the training and
     inference distributions identical.
     """
-    device = rollout["states"].device
-    depths_range = torch.arange(num_depths, device=device, dtype=torch.float32)
-    depth_fraction = (depths_range + 1.0) / num_depths
-    guard = (args.exit_min_depth - (depths_range + 1.0)).clamp_min(0.0) / num_depths
-    speed = depth_fraction
-    deltas = rollout["deltas"].float()
-    states = rollout["states"].float()
-    target = target_tokens
-    log_vocab = float(np.log(max(2, model.lm_head.weight.shape[-1])))
-
-    compute_dtype = torch.bfloat16 if states.is_cuda else states.dtype
-    head_weight = model.lm_head.weight.to(compute_dtype)
-    per_depth_terms = [[] for _ in range(6)]
-    for depth_index in range(num_depths):
-        depth_states = states[depth_index].to(compute_dtype)
-        logits = model.exit_readout.logits_at(depth_index, depth_states, head_weight)
-        logits = logits.float()
-        log_normalizer = torch.logsumexp(logits, dim=-1)
-        top2 = torch.topk(logits, 2, dim=-1).values
-        confidence = (top2[:, 0] - log_normalizer).exp()
-        margin = confidence - (top2[:, 1] - log_normalizer).exp()
-        target_logit = logits.gather(1, target[:, None]).squeeze(1)
-        cross_entropy = (log_normalizer - target_logit) / log_vocab
-        per_depth_terms[0].append(cross_entropy)
-        per_depth_terms[1].append((args.exit_tau_confidence - confidence).clamp_min(0.0))
-        per_depth_terms[2].append((args.exit_tau_margin - margin).clamp_min(0.0))
-        per_depth_terms[3].append((deltas[depth_index] - args.exit_tau_delta).clamp_min(0.0))
-        per_depth_terms[4].append(speed[depth_index].expand(confidence.shape))
-        per_depth_terms[5].append(guard[depth_index].expand(confidence.shape))
-    term_rows = torch.stack(
-        [torch.stack(column, dim=0) for column in per_depth_terms], dim=0
-    )  # [6, D, B]
+    term_rows, _, depths_range = assemble_exit_terms(
+        model, rollout, target_tokens, args, num_depths
+    )
     term_means = term_rows.mean(dim=(1, 2))  # [6]
     weighted_terms = weights * term_means  # [6]
     alignment = torch.sigmoid(
@@ -922,10 +980,439 @@ def train_exit_readout(args: argparse.Namespace) -> None:
         torch.distributed.destroy_process_group()
 
 
+def _joint_select_depth(
+    model: MemoryTransformerForCausalLM,
+    rollout: dict[str, Tensor],
+    target_tokens: Tensor,
+    weights: Tensor,
+    args: argparse.Namespace,
+    temperature: float,
+    num_depths: int,
+) -> tuple[int, Tensor, Tensor, Tensor]:
+    """Phase-A selection: #10 softmax over the six weighted terms -> argmax.
+
+    Uses the freshly updated halting parameters (call after ``opt_a.step()``)
+    plus the cached last-position base logits from :meth:`joint_rollout`.
+    Returns the 1-based exit depth, the selection distribution ``rho``, the
+    per-depth terms ``[6, D, B]``, and the raw selection logits ``[D]``.
+    Depths below ``--exit-min-depth`` are masked out of the softmax.
+    """
+    term_rows, selection_logits, depths_range = assemble_exit_terms(
+        model, rollout, target_tokens, args, num_depths,
+        base_logits=rollout["base_logits"],
+    )
+    weighted = (weights[:, None, None] * term_rows).sum(dim=0).mean(dim=1)  # [D]
+    logits = -weighted / temperature
+    min_depth = min(args.exit_min_depth, num_depths)
+    logits[: max(0, min_depth - 1)] = float("-inf")
+    selection = torch.softmax(logits, dim=0)
+    depth = int(selection.argmax().item()) + 1
+    return depth, selection, term_rows.detach(), weighted.detach()
+
+
+def train_joint_exit(args: argparse.Namespace) -> None:
+    """Two-phase joint training: full-parameter CE at the argmax depth.
+
+    Per micro-batch:
+      A. ``joint_rollout`` (no-grad, all 24 cycles) caches per-depth
+         last-position states/deltas and the cached ``W h`` base logits.
+      B. phase A: the six halting terms + alignment + sparsity losses touch
+         only the exit readout (LoRA/bias/temperature) and the six loss
+         weights; manual all-reduce, ``opt_a.step()``.
+      C. depth selection: recompute the terms with the updated parameters and
+         take the argmax of the #10 softmax distribution (>= exit-min-depth).
+      D. phase B: gradient pass through the first ``t*`` cycles; CE of the
+         calibrated readout at depth ``t*`` (readout parameters detached) plus
+         the router load loss; manual all-reduce, ``opt_b.step()``.
+
+    The backbone gradient is therefore 100% ground-truth CE + router loss and
+    the halting gradient never touches the backbone.
+    """
+    rank, world_size, local_rank, device, distributed = setup_distributed(args.device)
+    if args.resume is None and args.init_weights_from is None:
+        raise ValueError(
+            "joint mode requires --resume (joint checkpoint) or --init-weights-from "
+            "(base pretrained checkpoint)"
+        )
+    if args.steps <= 0:
+        raise ValueError("steps must be positive")
+    prior = torch.tensor(
+        [float(value) for value in args.loss_weight_prior.split(",")], dtype=torch.float32
+    )
+    if prior.numel() != 6 or abs(float(prior.sum()) - 1.0) > 1e-4:
+        raise ValueError("--loss-weight-prior must hold six values summing to one")
+    seed_everything(args.seed, rank)
+    store = TokenStore(args.dataset_dir)
+    vocab_size = int(store.manifest["vocab_size"])
+    if Path(args.tokenizer).exists():
+        tokenizer = load_tokenizer(args.tokenizer)
+        if len(tokenizer) != vocab_size:
+            raise ValueError(
+                f"tokenizer length {len(tokenizer)} does not match token manifest vocab "
+                f"size {vocab_size}"
+            )
+    elif rank == 0:
+        print(
+            "joint_exit_warning tokenizer path missing; skipping tokenizer check "
+            "(joint training only consumes the token store)",
+            flush=True,
+        )
+    config = build_config(args, vocab_size)
+    source_path = args.resume if args.resume is not None else args.init_weights_from
+    payload = torch.load(source_path, map_location="cpu", weights_only=False)
+    saved = payload.get("config") or {}
+    mismatched = [key for key in ARCHITECTURE_KEYS if saved.get(key) != getattr(config, key)]
+    if mismatched:
+        raise ValueError(
+            f"checkpoint architecture does not match the requested config: {mismatched}"
+        )
+    model = MemoryTransformerForCausalLM(config)
+    has_readout = any(name.startswith("exit_readout.") for name in payload["model"])
+    if has_readout:
+        ensure_exit_readout(model, rank=int(payload.get("exit_readout_rank", args.exit_readout_rank)))
+    model.load_state_dict(payload["model"])
+    if not has_readout:
+        ensure_exit_readout(model, rank=args.exit_readout_rank)
+    resume_step = int(payload.get("step", 0)) if args.resume is not None else 0
+    resume_optimizers = payload if args.resume is not None else {}
+    del payload
+    dtype = torch.bfloat16 if args.precision == "bf16" and device.type == "cuda" else torch.float32
+    model.to(device=device, dtype=dtype)
+    model.exit_readout.float()
+    model.train()
+    start_step = resume_step
+    remaining_steps = args.steps - start_step
+    if remaining_steps <= 0:
+        raise ValueError(f"--steps {args.steps} already reached by resumed step {start_step}")
+
+    # Parameter split: group A = exit readout + learned six-way loss weights;
+    # group B = everything else (the full backbone including lm_head).
+    readout_parameters = [p for p in model.exit_readout.parameters()]
+    backbone_parameters = [
+        p for n, p in model.named_parameters() if not n.startswith("exit_readout.")
+    ]
+    loss_weights_raw = torch.nn.Parameter(
+        torch.log(prior.to(device) / prior.to(device)[-1:]).float()
+    )
+    optimizer_a = torch.optim.AdamW(
+        [
+            {"params": readout_parameters, "weight_decay": args.exit_readout_weight_decay},
+            {"params": [loss_weights_raw], "weight_decay": 0.0},
+        ],
+        lr=args.exit_joint_readout_lr,
+    )
+    optimizer_b = torch.optim.AdamW(
+        backbone_parameters, lr=args.lr, weight_decay=args.weight_decay
+    )
+    # phase A updates once per micro-batch, so its schedule spans optimizer
+    # steps times gradient_accumulation
+    micro_total = remaining_steps * args.gradient_accumulation
+    scheduler_a = scheduler_for(
+        optimizer_a, micro_total, min(args.warmup_steps * args.gradient_accumulation, micro_total // 10 or 1), args.min_lr_ratio
+    )
+    scheduler_b = scheduler_for(
+        optimizer_b, remaining_steps, args.warmup_steps, args.min_lr_ratio
+    )
+    if args.resume is not None:
+        ckpt = resume_optimizers
+        if ckpt.get("optimizer_readout"):
+            optimizer_a.load_state_dict(ckpt["optimizer_readout"])
+        if ckpt.get("optimizer"):
+            optimizer_b.load_state_dict(ckpt["optimizer"])
+        if ckpt.get("loss_weights_raw") is not None:
+            with torch.no_grad():
+                loss_weights_raw.copy_(ckpt["loss_weights_raw"].to(device))
+        if ckpt.get("scheduler_readout"):
+            scheduler_a.load_state_dict(ckpt["scheduler_readout"])
+        if ckpt.get("scheduler"):
+            scheduler_b.load_state_dict(ckpt["scheduler"])
+    autocast = (
+        torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        if device.type == "cuda" and args.precision == "bf16"
+        else contextlib.nullcontext()
+    )
+    temperature = args.exit_temp_end  # fixed; training selection == inference halting
+    run_started = time.monotonic()
+
+    iterator = token_batches(
+        store,
+        sequence_length=args.sequence_length,
+        batch_size=args.batch_size,
+        # one micro-batch per yielded item: each runs its own phase-A halting
+        # update, and gradient_accumulation of them form one optimizer step
+        steps=remaining_steps * args.gradient_accumulation,
+        rank=rank,
+        world_size=world_size,
+        start_step=start_step * args.gradient_accumulation,
+        seed=args.seed,
+    )
+    micro_step_in_step = 0
+    accumulated_stats: dict[str, float] = {}
+    accumulated_depths: list[int] = []
+    skipped_steps = 0
+    optimizer_b.zero_grad(set_to_none=True)
+    for local_step, (inputs, labels) in enumerate(iterator):
+        global_step = start_step + local_step // args.gradient_accumulation
+        input_tensor = torch.from_numpy(inputs).to(device, non_blocking=True)
+        labels_tensor = torch.from_numpy(labels).to(device, non_blocking=True)
+        target_last = labels_tensor[:, -1]
+
+        # Phase A: halting losses (readout + loss weights only).
+        with autocast:
+            rollout = model.joint_rollout(input_tensor)
+        states = rollout["states"].clone()
+        deltas = rollout["deltas"].clone()
+        base_logits = rollout["base_logits"].clone()
+        router_all = rollout["router_losses"].clone()
+        del rollout
+        phase_a_rollout = {"states": states, "deltas": deltas}
+        term_rows, _, depths_range = assemble_exit_terms(
+            model, phase_a_rollout, target_last, args, config.num_layers,
+            base_logits=base_logits,
+        )
+        weights = loss_weights_raw.softmax(dim=0)
+        term_means = term_rows.mean(dim=(1, 2))
+        weighted_terms = weights * term_means
+        prior_now = prior.to(device)
+        alignment = torch.sigmoid(
+            torch.nn.functional.cross_entropy(
+                torch.log(weighted_terms.clamp_min(1e-12)).unsqueeze(0),
+                prior_now.unsqueeze(0),
+            )
+        )
+        selection_logits_a = -(
+            (weights[:, None, None] * term_rows).sum(dim=0).mean(dim=1)
+        )
+        selection_a = torch.softmax(selection_logits_a / temperature, dim=0)
+        sparsity = -(selection_a * selection_a.clamp_min(1e-12).log()).sum() / max(
+            1e-6, float(np.log(config.num_layers))
+        )
+        loss_a = weighted_terms.sum() + alignment + args.exit_sparsity_weight * sparsity
+        if not torch.isfinite(loss_a):
+            diagnostics = {
+                "weighted_terms": weighted_terms.detach().tolist(),
+                "weights": weights.detach().tolist(),
+                "term_means": term_means.detach().tolist(),
+                "alignment": float(alignment),
+                "sparsity": float(sparsity),
+                "temperature_max": float(
+                    model.exit_readout.temperature.detach().abs().max()
+                ),
+                "corrections_absmax": float(
+                    term_rows.detach().abs().max()
+                ),
+            }
+            raise FloatingPointError(
+                f"non-finite phase-A loss at step {global_step}: {diagnostics}"
+            )
+        optimizer_a.zero_grad(set_to_none=True)
+        loss_a.backward()
+        if distributed:
+            phase_a_group = readout_parameters + [loss_weights_raw]
+            for parameter in phase_a_group:
+                if parameter.grad is None:
+                    parameter.grad = torch.zeros_like(parameter)
+            for parameter in phase_a_group:
+                torch.distributed.all_reduce(parameter.grad)
+                parameter.grad.div_(world_size)
+        torch.nn.utils.clip_grad_norm_(
+            readout_parameters + [loss_weights_raw], args.max_grad_norm
+        )
+        phase_a_grads_finite = all(
+            parameter.grad is None or torch.isfinite(parameter.grad).all()
+            for parameter in readout_parameters + [loss_weights_raw]
+        )
+        if phase_a_grads_finite:
+            optimizer_a.step()
+            scheduler_a.step()
+        else:
+            skipped_steps += 1
+        optimizer_a.zero_grad(set_to_none=True)
+
+        # Depth selection with the updated halting parameters (#10 formula).
+        optimizer_b.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            fresh = loss_weights_raw.detach().softmax(dim=0)
+            depth, selection, _, _ = _joint_select_depth(
+                model,
+                {"states": states, "deltas": deltas, "base_logits": base_logits},
+                target_last,
+                fresh,
+                args,
+                temperature,
+                config.num_layers,
+            )
+        accumulated_depths.append(depth)
+
+        # Phase B: backbone CE at the selected depth (readout detached).
+        for parameter in readout_parameters:
+            parameter.requires_grad_(False)
+        with autocast:
+            forward = model.forward_until(
+                input_tensor, num_cycles=depth, collect_states=False
+            )
+            calibrated = model.exit_readout.logits_at(
+                depth - 1, forward["final_normed"], model.lm_head.weight
+            )
+            # fp32 softmax/CE: shallow-depth logits are large-magnitude and
+            # bf16 log-softmax over 151k classes loses precision
+            shifted_logits = calibrated[:, :-1].contiguous().float()
+            shifted_labels = labels_tensor[:, 1:].contiguous()
+            loss_b = torch.nn.functional.cross_entropy(
+                shifted_logits.reshape(-1, shifted_logits.size(-1)),
+                shifted_labels.reshape(-1),
+                ignore_index=-100,
+            ) + args.router_weight * forward["router_losses"][:depth].mean()
+        if not torch.isfinite(loss_b):
+            raise FloatingPointError(f"non-finite phase-B loss at step {global_step}")
+        (loss_b / args.gradient_accumulation).backward()
+        for parameter in readout_parameters:
+            parameter.requires_grad_(True)
+        micro_step_in_step += 1
+
+        with torch.no_grad():
+            masked = shifted_labels.ne(-100)
+            token_ce = torch.nn.functional.cross_entropy(
+                shifted_logits.reshape(-1, shifted_logits.size(-1)),
+                shifted_labels.reshape(-1),
+                ignore_index=-100,
+                reduction="sum",
+            ) / masked.sum().clamp_min(1)
+            accumulated_stats["ce_at_depth"] = (
+                accumulated_stats.get("ce_at_depth", 0.0) + float(token_ce)
+            )
+            accumulated_stats["loss_a"] = (
+                accumulated_stats.get("loss_a", 0.0) + float(loss_a.detach())
+            )
+            accumulated_stats["expected_depth"] = (
+                accumulated_stats.get("expected_depth", 0.0)
+                + float((selection * (depths_range + 1.0)).sum())
+            )
+        del forward, calibrated, shifted_logits
+
+        if micro_step_in_step == args.gradient_accumulation:
+            if distributed:
+                # the selected depth differs per rank, so cycles beyond a rank's
+                # depth produce no gradient; materialize zero grads for the
+                # missing ones to keep the all-reduce set identical everywhere
+                for parameter in backbone_parameters:
+                    if parameter.grad is None:
+                        parameter.grad = torch.zeros_like(parameter)
+                for parameter in backbone_parameters:
+                    torch.distributed.all_reduce(parameter.grad)
+                    parameter.grad.div_(world_size)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                backbone_parameters, args.max_grad_norm
+            )
+            grad_norm_value = float(grad_norm)
+            if not np.isfinite(grad_norm_value):
+                # shallow-depth CE gradients can spike early in training;
+                # drop the step instead of corrupting the backbone with NaNs
+                optimizer_b.zero_grad(set_to_none=True)
+                skipped_steps += 1
+                grad_norm_value = float("nan")
+            else:
+                optimizer_b.step()
+                scheduler_b.step()
+            optimizer_b.zero_grad(set_to_none=True)
+            completed_step = global_step + 1
+            divisor = args.gradient_accumulation
+            means = {key: value / divisor for key, value in accumulated_stats.items()}
+            mean_depth = sum(accumulated_depths) / len(accumulated_depths)
+            if rank == 0 and completed_step % args.log_steps == 0:
+                peak_note = ""
+                if device.type == "cuda":
+                    peak_gib = torch.cuda.max_memory_allocated(device) / 2**30
+                    peak_note = f" peak={peak_gib:.1f}GiB"
+                    torch.cuda.reset_peak_memory_stats(device)
+                weights_display = loss_weights_raw.detach().softmax(dim=0).cpu()
+                print(
+                    f"joint step={completed_step} lossB_ce={means['ce_at_depth']:.5f} "
+                    f"lossA={means['loss_a']:.5f} depth={mean_depth:.2f} "
+                    f"E[t]={means['expected_depth']:.2f} "
+                    f"w={','.join(f'{value:.3f}' for value in weights_display.tolist())} "
+                    f"grad={grad_norm_value:.3f} skipped={skipped_steps} "
+                    f"lrB={scheduler_b.get_last_lr()[0]:.3e} "
+                    f"lrA={scheduler_a.get_last_lr()[0]:.3e}{peak_note} "
+                    f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
+                    flush=True,
+                )
+            micro_step_in_step = 0
+            accumulated_stats = {}
+            accumulated_depths = []
+            if args.save_steps > 0 and completed_step % args.save_steps == 0:
+                if rank == 0:
+                    atomic_torch_save(
+                        {
+                            "step": completed_step,
+                            "model": {
+                                key: value.cpu()
+                                for key, value in model.state_dict().items()
+                            },
+                            "optimizer": optimizer_b.state_dict(),
+                            "optimizer_readout": optimizer_a.state_dict(),
+                            "loss_weights_raw": loss_weights_raw.detach().cpu(),
+                            "exit_loss_weights": weights_display
+                            if completed_step % args.log_steps == 0
+                            else loss_weights_raw.detach().softmax(dim=0).cpu(),
+                            "exit_temperature": temperature,
+                            "exit_readout_rank": model.exit_readout.rank,
+                            "scheduler": scheduler_b.state_dict(),
+                            "scheduler_readout": scheduler_a.state_dict(),
+                            "config": asdict(config),
+                        },
+                        args.checkpoint,
+                    )
+                    print(
+                        f"joint_saved step={completed_step} path={args.checkpoint} "
+                        f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
+                        flush=True,
+                    )
+                if distributed:
+                    dist.barrier()
+            if args.max_runtime_hours > 0 and (
+                (time.monotonic() - run_started) / 3600.0 >= args.max_runtime_hours
+            ):
+                if rank == 0:
+                    print(
+                        f"max_runtime_stopped step={completed_step} "
+                        f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
+                        flush=True,
+                    )
+                break
+    if rank == 0 and micro_step_in_step == 0 and not args.no_final_save:
+        atomic_torch_save(
+            {
+                "step": args.steps,
+                "model": {key: value.cpu() for key, value in model.state_dict().items()},
+                "optimizer": optimizer_b.state_dict(),
+                "optimizer_readout": optimizer_a.state_dict(),
+                "loss_weights_raw": loss_weights_raw.detach().cpu(),
+                "exit_loss_weights": loss_weights_raw.detach().softmax(dim=0).cpu(),
+                "exit_temperature": temperature,
+                "exit_readout_rank": model.exit_readout.rank,
+                "scheduler": scheduler_b.state_dict(),
+                "scheduler_readout": scheduler_a.state_dict(),
+                "config": asdict(config),
+            },
+            args.checkpoint,
+        )
+        print(
+            f"joint_saved step={args.steps} path={args.checkpoint} "
+            f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
+            flush=True,
+        )
+    if distributed:
+        torch.distributed.destroy_process_group()
+
+
 def main() -> None:
     args = parse_args()
     if args.train_exit_readout:
         train_exit_readout(args)
+        return
+    if args.train_exit_joint:
+        train_joint_exit(args)
         return
     if args.steps <= 0 or args.gradient_accumulation <= 0:
         raise ValueError("steps and gradient-accumulation must be positive")
@@ -953,6 +1440,25 @@ def main() -> None:
         )
     config = build_config(args, vocab_size)
     model = MemoryTransformerForCausalLM(config)
+    if args.init_weights_from is not None:
+        if args.resume is not None:
+            raise ValueError("--resume and --init-weights-from are mutually exclusive")
+        payload = torch.load(args.init_weights_from, map_location="cpu", weights_only=False)
+        saved = payload.get("config") or {}
+        mismatched = [key for key in ARCHITECTURE_KEYS if saved.get(key) != getattr(config, key)]
+        if mismatched:
+            raise ValueError(
+                f"init weights checkpoint architecture does not match the "
+                f"requested config: {mismatched}"
+            )
+        model.load_state_dict(payload["model"])
+        del payload
+        if rank == 0:
+            print(
+                f"init_weights loaded from {args.init_weights_from} "
+                "(model weights only; optimizer and schedule restart at step 0)",
+                flush=True,
+            )
     model, use_fsdp = wrap_model(model, args, device, distributed, local_rank)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay

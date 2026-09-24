@@ -332,6 +332,38 @@ class CalibratedExitReadout(nn.Module):
         correction = correction + self.bias[depth_index].to(dtype)
         return (base + correction) * self.temperature[depth_index].to(dtype)
 
+    def corrections_at(
+        self, states: Tensor, depth_index: Optional[Tensor] = None
+    ) -> Tensor:
+        """Batched LoRA correction for every depth at once (no head matmul).
+
+        ``states`` has shape ``[D, ..., hidden]`` (one row set per depth).  The
+        correction ``B_t (A_t h) + c_t`` for each depth ``t`` is computed with
+        two bmm ops instead of a Python loop.  When ``depth_index`` is given
+        (shape ``[...]`` matching the leading depth batch dims), the correction
+        for that single depth is selected per row instead.
+        """
+        if states.shape[0] != self.num_depths:
+            raise ValueError(
+                f"states leading dim {states.shape[0]} != num_depths {self.num_depths}"
+            )
+        dtype = states.dtype
+        lead = states.shape[1:-1]
+        flat = states.reshape(self.num_depths, -1, states.shape[-1])
+        projected = torch.bmm(
+            flat, self.project.to(dtype).transpose(1, 2)
+        )  # [D, N, r]
+        correction = torch.bmm(
+            projected, self.vocabulary.to(dtype).transpose(1, 2)
+        )  # [D, N, V]
+        correction = correction + self.bias.to(dtype).unsqueeze(1)
+        if depth_index is None:
+            return correction.reshape(self.num_depths, *lead, -1)
+        gathered = correction[
+            torch.arange(self.num_depths, device=states.device), depth_index.reshape(-1)
+        ]
+        return gathered.reshape(*depth_index.shape, -1)
+
     def extra_repr(self) -> str:
         return f"depths={self.num_depths} rank={self.rank}"
 
@@ -734,6 +766,110 @@ class MemoryTransformerForCausalLM(nn.Module):
             "deltas": torch.stack(deltas),
             "teacher_logits": F.linear(states[-1], self.lm_head.weight),
         }
+
+    @torch.inference_mode()
+    def joint_rollout(
+        self, input_ids: Tensor, attention_mask: Optional[Tensor] = None
+    ) -> dict[str, Tensor]:
+        """Full-depth no-grad pass collecting phase-A inputs for joint training.
+
+        Like :meth:`exit_rollout` but additionally caches the last-position
+        ``W h`` products (the ``lm_head`` base logits at each depth) so the
+        phase-A halting losses never re-run the vocabulary matmul, and the
+        per-cycle router losses needed by the phase-B CE objective.
+        """
+        if input_ids.ndim != 2:
+            raise ValueError("input_ids must have shape [batch, sequence]")
+        if attention_mask is not None:
+            if attention_mask.shape != input_ids.shape:
+                raise ValueError("attention_mask must have the same shape as input_ids")
+            attention_mask = attention_mask.bool()
+        x = self.embed_tokens(input_ids)
+        if attention_mask is not None:
+            x = x * attention_mask.unsqueeze(-1).to(x.dtype)
+        states: list[Tensor] = []
+        deltas: list[Tensor] = []
+        router_losses: list[Tensor] = []
+        prev_normed: Optional[Tensor] = None
+        for layer in self.layers:
+            x, indices, _weights, probabilities = layer(
+                x, self.memory, attention_mask=attention_mask
+            )
+            if attention_mask is not None:
+                x = x * attention_mask.unsqueeze(-1).to(x.dtype)
+            router_losses.append(
+                self.load_balance_loss(indices, probabilities, attention_mask)
+            )
+            normed = self.norm(x)
+            states.append(normed[:, -1, :])
+            if prev_normed is None:
+                deltas.append(x.new_zeros(x.shape[0]))
+            else:
+                difference = normed.float() - prev_normed
+                denominator = normed.float().norm(dim=-1).clamp_min(1e-6)
+                per_position = difference.norm(dim=-1) / denominator
+                if attention_mask is not None:
+                    mask = attention_mask.to(per_position.dtype)
+                    deltas.append(
+                        (per_position * mask).sum(-1) / mask.sum(-1).clamp_min(1.0)
+                    )
+                else:
+                    deltas.append(per_position.mean(-1))
+            prev_normed = normed.detach()
+        stacked = torch.stack(states)
+        return {
+            "states": stacked,
+            "deltas": torch.stack(deltas),
+            "base_logits": F.linear(stacked, self.lm_head.weight),
+            "router_losses": torch.stack(router_losses),
+        }
+
+    def forward_until(
+        self,
+        input_ids: Tensor,
+        num_cycles: int,
+        attention_mask: Optional[Tensor] = None,
+        collect_states: bool = False,
+    ) -> dict[str, Tensor]:
+        """Gradient pass through the first ``num_cycles`` reasoner cycles.
+
+        Phase-B half of joint training: runs only the deployed prefix of the
+        recurrent loop so the autograd graph (and the backward cost) scales
+        with the selected exit depth instead of the full 24 cycles.  Returns
+        the final-normed full-sequence state and, optionally, the per-cycle
+        router losses and the intermediate normed states.
+        """
+        if not 1 <= num_cycles <= self.config.num_layers:
+            raise ValueError(
+                f"num_cycles must be in [1, {self.config.num_layers}]"
+            )
+        if attention_mask is not None:
+            if attention_mask.shape != input_ids.shape:
+                raise ValueError("attention_mask must have the same shape as input_ids")
+            attention_mask = attention_mask.bool()
+        x = self.embed_tokens(input_ids)
+        if attention_mask is not None:
+            x = x * attention_mask.unsqueeze(-1).to(x.dtype)
+        router_losses: list[Tensor] = []
+        normed_states: list[Tensor] = []
+        for layer in self.layers[:num_cycles]:
+            x, indices, _weights, probabilities = layer(
+                x, self.memory, attention_mask=attention_mask
+            )
+            if attention_mask is not None:
+                x = x * attention_mask.unsqueeze(-1).to(x.dtype)
+            router_losses.append(
+                self.load_balance_loss(indices, probabilities, attention_mask)
+            )
+            if collect_states:
+                normed_states.append(self.norm(x))
+        result: dict[str, Tensor] = {
+            "final_normed": self.norm(x),
+            "router_losses": torch.stack(router_losses),
+        }
+        if collect_states:
+            result["normed_states"] = torch.stack(normed_states)
+        return result
 
     @torch.no_grad()
     def generate(

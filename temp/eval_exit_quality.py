@@ -35,7 +35,7 @@ from pretrain_data import TokenStore  # noqa: E402
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, default=Path("data/checkpoints/exit-readout-v1.pt"))
-    parser.add_argument("--dataset-dir", type=Path, default=Path("data/tokens"))
+    parser.add_argument("--dataset-dir", type=Path, default=Path("data/tokens_v2"))
     parser.add_argument("--windows", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--sequence-length", type=int, default=2048)
