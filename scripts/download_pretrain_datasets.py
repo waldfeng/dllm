@@ -1,8 +1,14 @@
-"""Download a reproducible ~20B-token pretraining corpus from ModelScope.
+"""Download a reproducible ~12B-token classic pretraining corpus from ModelScope.
 
-ModelScope repositories expose byte sizes, not tokenizer token counts. The
-manifest therefore uses a conservative byte budget and records the files used;
-run ``--count-tokens`` after downloading for the exact Qwen2.5 token count.
+Sources are classic, high-quality pretraining corpora ranked by training-set
+quality (FineWeb-Edu > DCLM-baseline > RefinedWeb > The Stack > peS2o > MAP-CC
+> WuDaoCorpus > MathPile) and are disjoint from the previously prepared data
+(English Wikipedia-derived WIT text plus SkyPile-150B and chinese-c4).
+
+ModelScope repositories expose byte sizes, not tokenizer token counts. Each
+source therefore carries a byte budget; run ``--count-tokens`` or
+``scripts/estimate_token_count.py`` after downloading for the exact Qwen2.5
+token count.
 """
 
 from __future__ import annotations
@@ -19,78 +25,229 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+GIB = 1024**3
 
-# Chinese web text commonly yields materially fewer Qwen tokens than raw UTF-8
-# bytes. A 55 GiB raw-text budget is a practical 20-25B-token target.
-TARGET_BYTES = 55 * 1024**3
+# (repo_id, source_name, path_prefixes, name_contains, path_suffix, byte_budget)
 DATASETS = (
-    ("modelscope/SkyPile-150B", "skypile", "data/*.jsonl"),
-    ("swift/chinese-c4", "chinese-c4", "data/*.jsonl.zst"),
+    (
+        "AI-ModelScope/fineweb-edu",
+        "fineweb-edu",
+        ("data/CC-MAIN-",),
+        "train-",
+        ".parquet",
+        7 * GIB,
+    ),
+    (
+        "AI-ModelScope/dclm-baseline-1.0",
+        "dclm-baseline",
+        ("global-shard_",),
+        "",
+        ".jsonl.zst",
+        4 * GIB,
+    ),
+    (
+        "tiiuae/falcon-refinedweb",
+        "refinedweb",
+        ("data/",),
+        "train-",
+        ".parquet",
+        4 * GIB,
+    ),
+    (
+        "AI-ModelScope/starcoderdata",
+        "starcoder",
+        (
+            "python/",
+            "javascript/",
+            "java/",
+            "cpp/",
+            "c/",
+            "typescript/",
+            "go/",
+            "rust/",
+            "php/",
+            "c-sharp/",
+            "markdown/",
+            "github-issues-filtered-structured/",
+            "git-commits-cleaned/",
+            "jupyter-structured-clean-dedup/",
+        ),
+        "",
+        ".parquet",
+        7 * GIB,
+    ),
+    (
+        "allenai/peS2o",
+        "pes2o",
+        ("data/v3/",),
+        "",
+        ".zst",
+        4 * GIB,
+    ),
+    (
+        "m-a-p/MAP-CC",
+        "map-cc",
+        ("",),
+        "zh_",
+        ".gz.part",
+        4 * GIB,
+    ),
+    (
+        "whynlp/WuDaoCorpus-200G-shuffled",
+        "wudao",
+        ("data/",),
+        "",
+        ".json.zst",
+        3 * GIB,
+    ),
+    (
+        "GAIR/MathPile",
+        "mathpile",
+        ("train/",),
+        "",
+        ".jsonl.gz",
+        2 * GIB,
+    ),
 )
 
 
-def files_for(repo_id: str, pattern: str) -> list[dict]:
-    files = []
+def _page_files(repo_id: str) -> list[dict]:
+    files: list[dict] = []
     api = HubApi()
     page_number = 1
-    suffix = pattern.split("*")[-1]
     while True:
-        page = api.get_dataset_files(
-            repo_id, page_number=page_number, page_size=100
-        )
+        page = api.get_dataset_files(repo_id, page_number=page_number, page_size=100)
         if not page:
             break
         for item in page:
             path = item.get("Path", "")
-            if path.startswith("data/") and path.endswith(suffix):
-                files.append(
-                    {
-                        "path": path,
-                        "size": int(item.get("Size") or 0),
-                        "sha256": item.get("Sha256", ""),
-                    }
-                )
+            if path:
+                files.append(item)
         if len(page) < 100:
             break
         page_number += 1
     return files
 
 
+def _matches(path: str, prefixes: tuple[str, ...], contains: str, suffix: str) -> bool:
+    if not any(path.startswith(prefix) for prefix in prefixes):
+        return False
+    if suffix.endswith(".part"):
+        _, _, tail = path.rpartition(".part")
+        return tail.isdigit() and contains in path
+    if not path.endswith(suffix):
+        return False
+    return contains in Path(path).name
+
+
+def _group_split_archives(items: list[dict]) -> list[dict]:
+    """Merge `x.jsonl.gz.partNN` listings into single logical files."""
+    groups: dict[str, list[dict]] = {}
+    plain: list[dict] = []
+    for raw in items:
+        path = raw.get("path") or raw.get("Path") or ""
+        item = {
+            "path": path,
+            "size": int(raw.get("Size") or 0),
+            "sha256": raw.get("Sha256", ""),
+        }
+        head, _, tail = path.rpartition(".part")
+        if head and tail.isdigit():
+            groups.setdefault(head, []).append(item)
+        else:
+            plain.append(item)
+    merged: list[dict] = []
+    for base, members in sorted(groups.items()):
+        merged.append(
+            {
+                "path": base,
+                "size": sum(int(m["size"]) for m in members),
+                "parts": [m["path"] for m in sorted(members, key=lambda m: m["path"])],
+                "sha256": "",
+            }
+        )
+    plain.extend(merged)
+    return plain
+
+
+def files_for(repo_id: str, prefixes: tuple[str, ...], contains: str, suffix: str) -> list[dict]:
+    if suffix.endswith(".part"):
+        items = _group_split_archives(
+            [
+                item
+                for item in _page_files(repo_id)
+                if _matches(item.get("Path", ""), prefixes, contains, suffix)
+            ]
+        )
+    else:
+        items = []
+        for item in _page_files(repo_id):
+            path = item.get("Path", "")
+            if _matches(path, prefixes, contains, suffix):
+                items.append(
+                    {
+                        "path": path,
+                        "size": int(item.get("Size") or 0),
+                        "sha256": item.get("Sha256", ""),
+                    }
+                )
+    return items
+
+
 def select_files(
-    target_bytes: int = TARGET_BYTES,
+    target_bytes: int | None = None,
     excluded: set[tuple[str, str]] | None = None,
     source_filter: set[str] | None = None,
 ) -> list[dict]:
+    """Round-robin one file per source until every source budget is filled.
+
+    Files that would overshoot a source budget by more than 5% are skipped so
+    a single oversized archive cannot blow up the download total.
+    """
     excluded = excluded or set()
     selected: list[dict] = []
     candidates: dict[str, list[dict]] = {}
-    for repo_id, name, pattern in DATASETS:
+    budgets: dict[str, int] = {}
+    for repo_id, name, prefixes, contains, suffix, budget in DATASETS:
         if source_filter is not None and name not in source_filter:
             continue
-        for item in files_for(repo_id, pattern):
+        items = []
+        for item in files_for(repo_id, prefixes, contains, suffix):
             if (repo_id, item["path"]) in excluded:
                 continue
             item.update(repo_id=repo_id, source=name)
-            candidates.setdefault(name, []).append(item)
-    for source in candidates:
-        candidates[source].sort(key=lambda x: x["path"])
-    total = 0
+            items.append(item)
+        items.sort(key=lambda x: x["path"])
+        candidates[name] = items
+        budgets[name] = budget
+    spent: dict[str, int] = {name: 0 for name in candidates}
+    positions = {name: 0 for name in candidates}
     source_names = sorted(candidates)
-    positions = {source: 0 for source in source_names}
-    while total < target_bytes and source_names:
-        made_progress = False
-        for source in source_names:
-            position = positions[source]
-            if position >= len(candidates[source]):
-                continue
-            item = candidates[source][position]
-            positions[source] += 1
-            selected.append(item)
-            total += item["size"]
-            made_progress = True
-            if total >= target_bytes:
-                break
-        if not made_progress:
+    while True:
+        progressed_any = False
+        for source in list(source_names):
+            items = candidates[source]
+            progressed_source = False
+            while positions[source] < len(items):
+                item = items[positions[source]]
+                positions[source] += 1
+                size = int(item["size"])
+                if spent[source] + size > budgets[source] * 1.05:
+                    continue
+                if target_bytes is not None and sum(
+                    x["size"] for x in selected
+                ) + size > target_bytes:
+                    source_names.remove(source)
+                    break
+                selected.append(item)
+                spent[source] += size
+                progressed_source = True
+                if spent[source] >= budgets[source]:
+                    break
+            if positions[source] >= len(items) or spent[source] >= budgets[source]:
+                source_names.remove(source)
+            progressed_any = progressed_any or progressed_source
+        if not progressed_any:
             break
     return selected
 
@@ -106,14 +263,18 @@ def write_manifest(output: Path, manifest: dict) -> None:
 def download(selected: list[dict], output: Path, workers: int) -> None:
     output.mkdir(parents=True, exist_ok=True)
     for repo_id in sorted({x["repo_id"] for x in selected}):
-        paths = [x["path"] for x in selected if x["repo_id"] == repo_id]
+        patterns = []
+        for item in selected:
+            if item["repo_id"] != repo_id:
+                continue
+            patterns.extend(item.get("parts") or [item["path"]])
         local = output / repo_id.replace("/", "__")
-        print(f"Downloading {repo_id}: {len(paths)} files -> {local}", flush=True)
+        print(f"Downloading {repo_id}: {len(patterns)} files -> {local}", flush=True)
         snapshot_download(
             repo_id=repo_id,
             repo_type="dataset",
             local_dir=str(local),
-            allow_patterns=paths,
+            allow_patterns=patterns,
             max_workers=workers,
         )
 
@@ -131,7 +292,11 @@ def main() -> None:
     parser.add_argument("--count-tokens", action="store_true")
     parser.add_argument("--tokenizer", default="tokenizer/qwen")
     parser.add_argument("--max-tokens", type=int)
-    parser.add_argument("--target-bytes", type=int, default=TARGET_BYTES)
+    parser.add_argument(
+        "--target-bytes",
+        type=int,
+        help="optional global cap on the selected byte total",
+    )
     parser.add_argument(
         "--supplement-bytes",
         type=int,
@@ -140,8 +305,8 @@ def main() -> None:
     parser.add_argument(
         "--sources",
         nargs="+",
-        choices=[name for _, name, _ in DATASETS],
-        help="restrict selection to named sources, useful for uncompressed estimates",
+        choices=[name for _, name, _, _, _, _ in DATASETS],
+        help="restrict selection to named sources",
     )
     args = parser.parse_args()
     if args.workers <= 0:
@@ -172,12 +337,18 @@ def main() -> None:
         manifest = {
             "target_bytes": args.target_bytes,
             "selected_bytes": sum(x["size"] for x in selected),
+            "source_budgets": {name: budget for _, name, _, _, _, budget in DATASETS},
             "files": selected,
             "tokenizer": "Qwen/Qwen2.5-0.5B",
             "token_count": None,
         }
     write_manifest(output, manifest)
-    print(f"Selected {len(selected)} files, {manifest['selected_bytes'] / 1024**3:.2f} GiB", flush=True)
+    per_source: dict[str, int] = {}
+    for item in selected:
+        per_source[item["source"]] = per_source.get(item["source"], 0) + item["size"]
+    for source, size in sorted(per_source.items()):
+        print(f"  {source:16s} {size / GIB:8.2f} GiB", flush=True)
+    print(f"Selected {len(selected)} files, {manifest['selected_bytes'] / GIB:.2f} GiB", flush=True)
     if args.dry_run:
         return
     download(selected, output, args.workers)

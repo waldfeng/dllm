@@ -6,8 +6,10 @@ import gzip
 import io
 import json
 import math
+import os
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import BinaryIO, Iterator, Optional
 
 import numpy as np
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
@@ -33,27 +35,204 @@ def _open_text(path: Path) -> io.TextIOBase:
     return path.open("r", encoding="utf-8")
 
 
+class _ConcatReader(io.RawIOBase):
+    """File-like object that concatenates split archive parts for streaming."""
+
+    def __init__(self, paths: list[Path]) -> None:
+        self.paths = paths
+        self.index = 0
+        self.current: Optional[BinaryIO] = None
+
+    def readable(self) -> bool:
+        return True
+
+    def _next_part(self) -> bool:
+        if self.current is not None:
+            self.current.close()
+            self.current = None
+        while self.index < len(self.paths):
+            self.current = self.paths[self.index].open("rb")
+            self.index += 1
+            return True
+        return False
+
+    def read(self, size: int = -1) -> bytes:
+        chunks = []
+        remaining = size
+        while remaining != 0:
+            if self.current is None and not self._next_part():
+                break
+            data = self.current.read(size if size < 0 else remaining)
+            if not data:
+                self._next_part()
+                continue
+            chunks.append(data)
+            if remaining > 0:
+                remaining -= len(data)
+                if remaining <= 0:
+                    break
+        return b"".join(chunks)
+
+    def close(self) -> None:
+        if self.current is not None:
+            self.current.close()
+            self.current = None
+        super().close()
+
+
+def _iter_part_groups(paths: list[Path]) -> list[Path]:
+    """Return one representative path per split-archive group (e.g. MAP-CC)."""
+    groups: dict[str, Path] = {}
+    plain: list[Path] = []
+    for path in paths:
+        name = path.name
+        if ".part" in name and name.rsplit(".part", 1)[-1].isdigit():
+            base = name.rsplit(".part", 1)[0]
+            existing = groups.get(base)
+            if existing is None or path.name < existing.name:
+                groups[base] = path
+        else:
+            plain.append(path)
+    return plain + list(groups.values())
+
+
+def _parquet_texts(path: Path) -> Iterator[str]:
+    import pyarrow.parquet as pq
+
+    parquet_file = pq.ParquetFile(path)
+    names = parquet_file.schema_arrow.names
+    for column in ("text", "content"):
+        if column in names:
+            break
+    else:
+        raise ValueError(
+            f"missing string field 'text' or 'content' in parquet {path}"
+        )
+    for row_group in range(parquet_file.num_row_groups):
+        table = parquet_file.read_row_group(row_group, columns=[column])
+        for value in table.column(0).to_pylist():
+            if isinstance(value, str) and value:
+                yield value
+
+
+def _json_array_zst_texts(path: Path) -> Iterator[str]:
+    import zstandard
+
+    raw = zstandard.ZstdDecompressor().stream_reader(path.open("rb"))
+    with io.TextIOWrapper(raw, encoding="utf-8") as stream:
+        records = json.load(stream)
+    if not isinstance(records, list):
+        raise ValueError(f"expected a JSON array in {path}")
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        title = record.get("title")
+        content = record.get("content")
+        if isinstance(content, str) and content:
+            if isinstance(title, str) and title:
+                yield f"{title}\n{content}"
+            else:
+                yield content
+
+
+def _concat_gzip_texts(parts: list[Path]) -> Iterator[str]:
+    """Stream JSONL records from a gzip stream split across multiple files."""
+    with gzip.open(_ConcatReader(parts), "rt", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                base = parts[0].name.rsplit(".part", 1)[0]
+                raise ValueError(
+                    f"invalid JSON in {parts[0].parent / base}:{line_number}"
+                ) from exc
+            text = record.get("text") if isinstance(record, dict) else None
+            if not isinstance(text, str):
+                base = parts[0].name.rsplit(".part", 1)[0]
+                raise ValueError(
+                    f"missing string field 'text' in {parts[0].parent / base}:{line_number}"
+                )
+            yield text
+
+
+def _mathpile_stackexchange_texts(record: dict) -> Optional[str]:
+    question = record.get("question")
+    answers = record.get("answers")
+    if not isinstance(question, dict):
+        return None
+    title = question.get("Title")
+    body = question.get("Body")
+    parts = []
+    if isinstance(title, str) and title:
+        parts.append(title)
+    if isinstance(body, str) and body:
+        parts.append(body)
+    if isinstance(answers, list):
+        for answer in answers:
+            if isinstance(answer, dict) and isinstance(answer.get("Body"), str):
+                parts.append(answer["Body"])
+    if not parts:
+        return None
+    return "\n\n".join(parts)
+
+
+def _jsonl_texts(path: Path) -> Iterator[str]:
+    with _open_text(path) as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSON in {path}:{line_number}") from exc
+            text = record.get("text") if isinstance(record, dict) else None
+            if not isinstance(text, str) and isinstance(record, dict):
+                text = _mathpile_stackexchange_texts(record)
+            if not isinstance(text, str):
+                raise ValueError(f"missing string field 'text' in {path}:{line_number}")
+            yield text
+
+
 def jsonl_paths(input_dir: Path) -> list[Path]:
     paths = list(input_dir.rglob("*.jsonl"))
     paths.extend(input_dir.rglob("*.jsonl.zst"))
     paths.extend(input_dir.rglob("*.jsonl.gz"))
-    return sorted(path for path in paths if path.is_file())
+    paths.extend(input_dir.rglob("*.parquet"))
+    paths.extend(input_dir.rglob("*.zst"))
+    paths.extend(input_dir.rglob("*.part*"))
+    paths = [
+        path
+        for path in paths
+        if path.is_file()
+        and (
+            ".part" not in path.name
+            or path.name.rsplit(".part", 1)[-1].isdigit()
+        )
+    ]
+    return sorted(set(_iter_part_groups(paths)), key=lambda path: str(path))
 
 
 def iter_text_records(input_dir: Path) -> Iterator[tuple[Path, str]]:
     for path in jsonl_paths(input_dir):
-        with _open_text(path) as stream:
-            for line_number, line in enumerate(stream, 1):
-                if not line.strip():
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"invalid JSON in {path}:{line_number}") from exc
-                text = record.get("text") if isinstance(record, dict) else None
-                if not isinstance(text, str):
-                    raise ValueError(f"missing string field 'text' in {path}:{line_number}")
-                yield path, text
+        if path.name.endswith(".parquet"):
+            texts = _parquet_texts(path)
+        elif path.name.endswith(".json.zst"):
+            texts = _json_array_zst_texts(path)
+        elif ".part" in path.name and path.name.rsplit(".part", 1)[-1].isdigit():
+            base = path.name.rsplit(".part", 1)[0]
+            siblings = sorted(
+                entry
+                for entry in path.parent.iterdir()
+                if entry.name.startswith(base + ".part")
+                and entry.name.rsplit(".part", 1)[-1].isdigit()
+            )
+            texts = _concat_gzip_texts(siblings)
+        else:
+            texts = _jsonl_texts(path)
+        for text in texts:
+            yield path, text
 
 
 def _batched_records(
@@ -81,6 +260,7 @@ class TokenShardWriter:
         self.buffer = np.empty(shard_tokens, dtype=np.uint32)
         self.filled = 0
         self.shard_index = 0
+        self.prefix = ""
         self.shards: list[dict[str, int | str]] = []
 
     def append(self, tokens: np.ndarray) -> None:
@@ -97,7 +277,7 @@ class TokenShardWriter:
     def flush(self) -> None:
         if self.filled == 0:
             return
-        path = self.output_dir / f"train-{self.shard_index:05d}.bin"
+        path = self.output_dir / f"{self.prefix}train-{self.shard_index:05d}.bin"
         self.buffer[: self.filled].tofile(path)
         self.shards.append({"path": path.name, "tokens": self.filled})
         self.shard_index += 1
@@ -230,6 +410,186 @@ def prepare_token_shards(
     }
     _write_manifest(output_dir, manifest)
     if total_tokens < min_tokens:
+        raise ValueError(
+            f"only {total_tokens:,} tokens were prepared; expected at least "
+            f"{min_tokens:,}. Check the dataset directory or use --min-tokens 0 "
+            "for a smoke dataset."
+        )
+    return manifest
+
+
+def _tokenize_source_file(
+    path_str: str,
+    input_dir_str: str,
+    output_dir_str: str,
+    shard_tokens: int,
+    tokenizer_name: str,
+    tokenizer_batch_size: int,
+    max_tokens: Optional[int],
+) -> dict:
+    """Tokenize one logical source file into its own uint32 shards.
+
+    Runs in a worker process; returns stats and the written shard files in
+    order so the caller can concatenate them deterministically.
+    """
+    input_dir = Path(input_dir_str)
+    output_dir = Path(output_dir_str)
+    path = Path(path_str)
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name, local_files_only=True, use_fast=True
+    )
+    eos_id = tokenizer.eos_token_id
+    if eos_id is None:
+        raise ValueError("tokenizer must define eos_token_id")
+
+    stem = path.relative_to(input_dir).as_posix().replace("/", "__")
+    work_dir = output_dir / "_work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    writer = TokenShardWriter(work_dir, shard_tokens)
+    writer.prefix = f"{stem}__"
+
+    total_tokens = 0
+    documents = 0
+    stopped = False
+    if path.name.endswith(".parquet"):
+        text_iter = _parquet_texts(path)
+    elif path.name.endswith(".json.zst"):
+        text_iter = _json_array_zst_texts(path)
+    elif ".part" in path.name and path.name.rsplit(".part", 1)[-1].isdigit():
+        base = path.name.rsplit(".part", 1)[0]
+        siblings = sorted(
+            entry
+            for entry in path.parent.iterdir()
+            if entry.name.startswith(base + ".part")
+            and entry.name.rsplit(".part", 1)[-1].isdigit()
+        )
+        text_iter = _concat_gzip_texts(siblings)
+    else:
+        text_iter = _jsonl_texts(path)
+
+    batch: list[str] = []
+    while not stopped:
+        for text in text_iter:
+            batch.append(text)
+            if len(batch) >= tokenizer_batch_size:
+                break
+        if not batch:
+            break
+        encoded_batch = tokenizer(
+            batch, add_special_tokens=False, return_attention_mask=False
+        )["input_ids"]
+        for encoded in encoded_batch:
+            tokens = np.asarray((*encoded, eos_id), dtype=np.uint32)
+            if max_tokens is not None and total_tokens + len(tokens) > max_tokens:
+                tokens = tokens[: max_tokens - total_tokens]
+                stopped = True
+            if len(tokens) == 0:
+                stopped = True
+                break
+            writer.append(tokens)
+            total_tokens += len(tokens)
+            documents += 1
+        batch = []
+    writer.close()
+    return {
+        "path": path_str,
+        "relative": stem,
+        "documents": documents,
+        "tokens": total_tokens,
+        "shards": writer.shards,
+    }
+
+
+def prepare_token_shards_parallel(
+    input_dir: Path,
+    output_dir: Path,
+    tokenizer_name: str,
+    shard_tokens: int = 100_000_000,
+    min_tokens: int = 0,
+    max_tokens: Optional[int] = None,
+    tokenizer_batch_size: int = 256,
+    workers: int = 8,
+) -> dict:
+    """Parallel variant of prepare_token_shards.
+
+    Each logical source file is tokenized in its own process into private
+    shard files (written under output_dir/_work with a per-source prefix).
+    The partial shards are then concatenated in manifest order into the final
+    train-*.bin sequence, so the on-disk format and TokenStore stay identical
+    to the sequential implementation.
+    """
+    paths = jsonl_paths(input_dir)
+    if not paths:
+        raise ValueError(f"no source files found under {input_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    workers = max(1, min(workers, len(paths)))
+    jobs = [
+        (
+            str(path),
+            str(input_dir),
+            str(output_dir),
+            shard_tokens,
+            tokenizer_name,
+            tokenizer_batch_size,
+            max_tokens,
+        )
+        for path in paths
+    ]
+    results: list[dict] = []
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for result in pool.map(_tokenize_source_file, *zip(*jobs)):
+            results.append(result)
+            print(
+                f"tokenized source={result['relative']} "
+                f"documents={result['documents']} tokens={result['tokens']}",
+                flush=True,
+            )
+
+    work_dir = output_dir / "_work"
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name, local_files_only=True, use_fast=True
+    )
+    eos_id = int(tokenizer.eos_token_id)
+    vocab_size = len(tokenizer)
+
+    total_tokens = 0
+    documents = 0
+    source_documents: dict[str, int] = {}
+    source_tokens: dict[str, int] = {}
+    writer = TokenShardWriter(output_dir, shard_tokens)
+    for result in results:
+        key = result["relative"]
+        source_documents[key] = result["documents"]
+        source_tokens[key] = result["tokens"]
+        documents += result["documents"]
+        total_tokens += result["tokens"]
+        for shard in result["shards"]:
+            data = np.fromfile(work_dir / shard["path"], dtype=np.uint32)
+            writer.append(data)
+            (work_dir / shard["path"]).unlink()
+    writer.close()
+    work_dir.rmdir()
+
+    manifest = {
+        "format": "uint32_token_shards_v1",
+        "tokenizer": tokenizer_name,
+        "vocab_size": vocab_size,
+        "eos_token_id": eos_id,
+        "input_dir": str(input_dir),
+        "total_tokens": total_tokens,
+        "documents": documents,
+        "min_tokens": min_tokens,
+        "max_tokens": max_tokens,
+        "shards": writer.shards,
+        "source_documents": source_documents,
+        "source_tokens": source_tokens,
+    }
+    _write_manifest(output_dir, manifest)
+    if min_tokens and total_tokens < min_tokens:
         raise ValueError(
             f"only {total_tokens:,} tokens were prepared; expected at least "
             f"{min_tokens:,}. Check the dataset directory or use --min-tokens 0 "
