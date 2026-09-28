@@ -14,6 +14,7 @@ from typing import Iterator
 
 import numpy as np
 import torch
+import torch.utils.checkpoint
 import torch.distributed as dist
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -1150,6 +1151,7 @@ def train_joint_exit(args: argparse.Namespace) -> None:
     accumulated_stats: dict[str, float] = {}
     accumulated_depths: list[int] = []
     skipped_steps = 0
+    oom_skips = 0
     optimizer_b.zero_grad(set_to_none=True)
     for local_step, (inputs, labels) in enumerate(iterator):
         global_step = start_step + local_step // args.gradient_accumulation
@@ -1158,55 +1160,70 @@ def train_joint_exit(args: argparse.Namespace) -> None:
         target_last = labels_tensor[:, -1]
 
         # Phase A: halting losses (readout + loss weights only).
-        with autocast:
-            rollout = model.joint_rollout(input_tensor)
-        states = rollout["states"].clone()
-        deltas = rollout["deltas"].clone()
-        base_logits = rollout["base_logits"].clone()
-        router_all = rollout["router_losses"].clone()
-        del rollout
-        phase_a_rollout = {"states": states, "deltas": deltas}
-        term_rows, _, depths_range = assemble_exit_terms(
-            model, phase_a_rollout, target_last, args, config.num_layers,
-            base_logits=base_logits,
-        )
-        weights = loss_weights_raw.softmax(dim=0)
-        term_means = term_rows.mean(dim=(1, 2))
-        weighted_terms = weights * term_means
-        prior_now = prior.to(device)
-        alignment = torch.sigmoid(
-            torch.nn.functional.cross_entropy(
-                torch.log(weighted_terms.clamp_min(1e-12)).unsqueeze(0),
-                prior_now.unsqueeze(0),
+        # On OOM the micro-batch is skipped, but the collective skeleton
+        # (phase-A all-reduce + the gate's backbone all-reduce) must still
+        # run with identical call counts on every rank or NCCL deadlocks:
+        # a lone `continue` is what killed the B=20 run.
+        rollout = None
+        try:
+            with autocast:
+                rollout = model.joint_rollout(input_tensor)
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            oom_skips += 1
+        phase_a_ok = rollout is not None
+        if phase_a_ok:
+            states = rollout["states"].clone()
+            deltas = rollout["deltas"].clone()
+            base_logits = rollout["base_logits"].clone()
+            router_all = rollout["router_losses"].clone()
+            del rollout
+            phase_a_rollout = {"states": states, "deltas": deltas}
+            term_rows, _, depths_range = assemble_exit_terms(
+                model, phase_a_rollout, target_last, args, config.num_layers,
+                base_logits=base_logits,
             )
-        )
-        selection_logits_a = -(
-            (weights[:, None, None] * term_rows).sum(dim=0).mean(dim=1)
-        )
-        selection_a = torch.softmax(selection_logits_a / temperature, dim=0)
-        sparsity = -(selection_a * selection_a.clamp_min(1e-12).log()).sum() / max(
-            1e-6, float(np.log(config.num_layers))
-        )
-        loss_a = weighted_terms.sum() + alignment + args.exit_sparsity_weight * sparsity
-        if not torch.isfinite(loss_a):
-            diagnostics = {
-                "weighted_terms": weighted_terms.detach().tolist(),
-                "weights": weights.detach().tolist(),
-                "term_means": term_means.detach().tolist(),
-                "alignment": float(alignment),
-                "sparsity": float(sparsity),
-                "temperature_max": float(
-                    model.exit_readout.temperature.detach().abs().max()
-                ),
-                "corrections_absmax": float(
-                    term_rows.detach().abs().max()
-                ),
-            }
-            raise FloatingPointError(
-                f"non-finite phase-A loss at step {global_step}: {diagnostics}"
+        if phase_a_ok:
+            weights = loss_weights_raw.softmax(dim=0)
+            term_means = term_rows.mean(dim=(1, 2))
+            weighted_terms = weights * term_means
+            prior_now = prior.to(device)
+            alignment = torch.sigmoid(
+                torch.nn.functional.cross_entropy(
+                    torch.log(weighted_terms.clamp_min(1e-12)).unsqueeze(0),
+                    prior_now.unsqueeze(0),
+                )
             )
+            selection_logits_a = -(
+                (weights[:, None, None] * term_rows).sum(dim=0).mean(dim=1)
+            )
+            selection_a = torch.softmax(selection_logits_a / temperature, dim=0)
+            sparsity = -(selection_a * selection_a.clamp_min(1e-12).log()).sum() / max(
+                1e-6, float(np.log(config.num_layers))
+            )
+            loss_a = weighted_terms.sum() + alignment + args.exit_sparsity_weight * sparsity
+            if not torch.isfinite(loss_a):
+                diagnostics = {
+                    "weighted_terms": weighted_terms.detach().tolist(),
+                    "weights": weights.detach().tolist(),
+                    "term_means": term_means.detach().tolist(),
+                    "alignment": float(alignment),
+                    "sparsity": float(sparsity),
+                    "temperature_max": float(
+                        model.exit_readout.temperature.detach().abs().max()
+                    ),
+                    "corrections_absmax": float(
+                        term_rows.detach().abs().max()
+                    ),
+                }
+                raise FloatingPointError(
+                    f"non-finite phase-A loss at step {global_step}: {diagnostics}"
+                )
         optimizer_a.zero_grad(set_to_none=True)
-        loss_a.backward()
+        if phase_a_ok:
+            loss_a.backward()
+        # this all-reduce is unconditional: ranks that OOMed participate with
+        # zero grads so every rank issues the same collective sequence
         if distributed:
             phase_a_group = readout_parameters + [loss_weights_raw]
             for parameter in phase_a_group:
@@ -1222,7 +1239,7 @@ def train_joint_exit(args: argparse.Namespace) -> None:
             parameter.grad is None or torch.isfinite(parameter.grad).all()
             for parameter in readout_parameters + [loss_weights_raw]
         )
-        if phase_a_grads_finite:
+        if phase_a_grads_finite and phase_a_ok:
             optimizer_a.step()
             scheduler_a.step()
         else:
@@ -1231,64 +1248,89 @@ def train_joint_exit(args: argparse.Namespace) -> None:
 
         # Depth selection with the updated halting parameters (#10 formula).
         optimizer_b.zero_grad(set_to_none=True)
-        with torch.no_grad():
-            fresh = loss_weights_raw.detach().softmax(dim=0)
-            depth, selection, _, _ = _joint_select_depth(
-                model,
-                {"states": states, "deltas": deltas, "base_logits": base_logits},
-                target_last,
-                fresh,
-                args,
-                temperature,
-                config.num_layers,
-            )
-        accumulated_depths.append(depth)
+        if phase_a_ok:
+            with torch.no_grad():
+                fresh = loss_weights_raw.detach().softmax(dim=0)
+                depth, selection, _, _ = _joint_select_depth(
+                    model,
+                    {"states": states, "deltas": deltas, "base_logits": base_logits},
+                    target_last,
+                    fresh,
+                    args,
+                    temperature,
+                    config.num_layers,
+                )
+            accumulated_depths.append(depth)
 
         # Phase B: backbone CE at the selected depth (readout detached).
+        skip_phase_b = not phase_a_ok
         for parameter in readout_parameters:
             parameter.requires_grad_(False)
-        with autocast:
-            forward = model.forward_until(
-                input_tensor, num_cycles=depth, collect_states=False
-            )
-            calibrated = model.exit_readout.logits_at(
-                depth - 1, forward["final_normed"], model.lm_head.weight
-            )
-            # fp32 softmax/CE: shallow-depth logits are large-magnitude and
-            # bf16 log-softmax over 151k classes loses precision
-            shifted_logits = calibrated[:, :-1].contiguous().float()
-            shifted_labels = labels_tensor[:, 1:].contiguous()
-            loss_b = torch.nn.functional.cross_entropy(
-                shifted_logits.reshape(-1, shifted_logits.size(-1)),
-                shifted_labels.reshape(-1),
-                ignore_index=-100,
-            ) + args.router_weight * forward["router_losses"][:depth].mean()
-        if not torch.isfinite(loss_b):
-            raise FloatingPointError(f"non-finite phase-B loss at step {global_step}")
-        (loss_b / args.gradient_accumulation).backward()
+        if phase_a_ok:
+            try:
+                with autocast:
+                    forward = model.forward_until(
+                        input_tensor, num_cycles=depth, collect_states=False
+                    )
+                # fp32 softmax/CE: shallow-depth logits are large-magnitude and
+                # bf16 log-softmax over 151k classes loses precision.  The CE is
+                # chunked with per-chunk checkpointing so the fp32 copy and its
+                # backward grads never span the whole batch: a monolithic
+                # [B*(T-1), vocab] fp32 tensor is ~9.3 GiB (plus ~15 GiB of bf16
+                # intermediates) and OOMs both ranks when the selected depth
+                # runs deep.
+                hidden = forward["final_normed"][:, :-1]
+                flat_hidden = hidden.reshape(-1, hidden.size(-1))
+                flat_labels = labels_tensor[:, 1:].reshape(-1)
+                masked_count = flat_labels.ne(-100).sum().clamp_min(1)
+                ce_sum = flat_hidden.new_zeros((), dtype=torch.float32)
+
+                def chunk_ce(h_rows: Tensor, y_rows: Tensor) -> Tensor:
+                    logits = model.exit_readout.logits_at(
+                        depth - 1, h_rows, model.lm_head.weight
+                    )
+                    return torch.nn.functional.cross_entropy(
+                        logits.float(), y_rows, ignore_index=-100, reduction="sum"
+                    )
+
+                chunk_size = 8192
+                for start in range(0, flat_hidden.size(0), chunk_size):
+                    ce_sum = ce_sum + torch.utils.checkpoint.checkpoint(
+                        chunk_ce,
+                        flat_hidden[start : start + chunk_size],
+                        flat_labels[start : start + chunk_size],
+                        use_reentrant=False,
+                    )
+                ce_mean = ce_sum / masked_count
+                loss_b = ce_mean + args.router_weight * forward["router_losses"][:depth].mean()
+                if not torch.isfinite(loss_b):
+                    raise FloatingPointError(f"non-finite phase-B loss at step {global_step}")
+                (loss_b / args.gradient_accumulation).backward()
+            except torch.OutOfMemoryError:
+                # deep selected depth spikes the grad-graph transients; drop
+                # this micro-batch's CE.  No `continue` here: the gate below
+                # (and its backbone all-reduce) must run on every rank.
+                torch.cuda.empty_cache()
+                oom_skips += 1
+                optimizer_b.zero_grad(set_to_none=True)
+                skip_phase_b = True
         for parameter in readout_parameters:
             parameter.requires_grad_(True)
         micro_step_in_step += 1
-
-        with torch.no_grad():
-            masked = shifted_labels.ne(-100)
-            token_ce = torch.nn.functional.cross_entropy(
-                shifted_logits.reshape(-1, shifted_logits.size(-1)),
-                shifted_labels.reshape(-1),
-                ignore_index=-100,
-                reduction="sum",
-            ) / masked.sum().clamp_min(1)
-            accumulated_stats["ce_at_depth"] = (
-                accumulated_stats.get("ce_at_depth", 0.0) + float(token_ce)
-            )
-            accumulated_stats["loss_a"] = (
-                accumulated_stats.get("loss_a", 0.0) + float(loss_a.detach())
-            )
-            accumulated_stats["expected_depth"] = (
-                accumulated_stats.get("expected_depth", 0.0)
-                + float((selection * (depths_range + 1.0)).sum())
-            )
-        del forward, calibrated, shifted_logits
+        if not skip_phase_b:
+            with torch.no_grad():
+                token_ce = ce_mean.detach()
+                accumulated_stats["ce_at_depth"] = (
+                    accumulated_stats.get("ce_at_depth", 0.0) + float(token_ce)
+                )
+                accumulated_stats["loss_a"] = (
+                    accumulated_stats.get("loss_a", 0.0) + float(loss_a.detach())
+                )
+                accumulated_stats["expected_depth"] = (
+                    accumulated_stats.get("expected_depth", 0.0)
+                    + float((selection * (depths_range + 1.0)).sum())
+                )
+            del forward, flat_hidden
 
         if micro_step_in_step == args.gradient_accumulation:
             if distributed:
@@ -1318,7 +1360,11 @@ def train_joint_exit(args: argparse.Namespace) -> None:
             completed_step = global_step + 1
             divisor = args.gradient_accumulation
             means = {key: value / divisor for key, value in accumulated_stats.items()}
-            mean_depth = sum(accumulated_depths) / len(accumulated_depths)
+            mean_depth = (
+                sum(accumulated_depths) / len(accumulated_depths)
+                if accumulated_depths
+                else 0.0
+            )
             if rank == 0 and completed_step % args.log_steps == 0:
                 peak_note = ""
                 if device.type == "cuda":
@@ -1326,14 +1372,25 @@ def train_joint_exit(args: argparse.Namespace) -> None:
                     peak_note = f" peak={peak_gib:.1f}GiB"
                     torch.cuda.reset_peak_memory_stats(device)
                 weights_display = loss_weights_raw.detach().softmax(dim=0).cpu()
+                mem_note = ""
+                if device.type == "cuda":
+                    used_gib = torch.cuda.memory_allocated(device) / 2**30
+                    total_gib = (
+                        torch.cuda.get_device_properties(device).total_memory / 2**30
+                    )
+                    mem_note = (
+                        f" mem={used_gib:.1f}/{total_gib:.0f}GiB"
+                        f"({100.0 * used_gib / total_gib:.0f}%)"
+                    )
                 print(
-                    f"joint step={completed_step} lossB_ce={means['ce_at_depth']:.5f} "
-                    f"lossA={means['loss_a']:.5f} depth={mean_depth:.2f} "
-                    f"E[t]={means['expected_depth']:.2f} "
+                    f"joint step={completed_step} lossB_ce={means.get('ce_at_depth', 0.0):.5f} "
+                    f"lossA={means.get('loss_a', 0.0):.5f} depth={mean_depth:.2f} "
+                    f"E[t]={means.get('expected_depth', 0.0):.2f} "
                     f"w={','.join(f'{value:.3f}' for value in weights_display.tolist())} "
                     f"grad={grad_norm_value:.3f} skipped={skipped_steps} "
+                    f"oom={oom_skips} "
                     f"lrB={scheduler_b.get_last_lr()[0]:.3e} "
-                    f"lrA={scheduler_a.get_last_lr()[0]:.3e}{peak_note} "
+                    f"lrA={scheduler_a.get_last_lr()[0]:.3e}{peak_note}{mem_note} "
                     f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
                     flush=True,
                 )
