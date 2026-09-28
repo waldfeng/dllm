@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import os
 import random
+import sys
 import tempfile
 import time
 from dataclasses import asdict
@@ -1151,7 +1152,11 @@ def train_joint_exit(args: argparse.Namespace) -> None:
     accumulated_stats: dict[str, float] = {}
     accumulated_depths: list[int] = []
     skipped_steps = 0
+    grad_norm_value = 0.0
     oom_skips = 0
+    oom_window_micros = 0
+    oom_window_skips = 0
+    window_oom_skips = 0
     optimizer_b.zero_grad(set_to_none=True)
     for local_step, (inputs, labels) in enumerate(iterator):
         global_step = start_step + local_step // args.gradient_accumulation
@@ -1171,6 +1176,7 @@ def train_joint_exit(args: argparse.Namespace) -> None:
         except torch.OutOfMemoryError:
             torch.cuda.empty_cache()
             oom_skips += 1
+            window_oom_skips += 1
         phase_a_ok = rollout is not None
         if phase_a_ok:
             states = rollout["states"].clone()
@@ -1312,6 +1318,7 @@ def train_joint_exit(args: argparse.Namespace) -> None:
                 # (and its backbone all-reduce) must run on every rank.
                 torch.cuda.empty_cache()
                 oom_skips += 1
+                window_oom_skips += 1
                 optimizer_b.zero_grad(set_to_none=True)
                 skip_phase_b = True
         for parameter in readout_parameters:
@@ -1356,87 +1363,109 @@ def train_joint_exit(args: argparse.Namespace) -> None:
             else:
                 optimizer_b.step()
                 scheduler_b.step()
-            optimizer_b.zero_grad(set_to_none=True)
-            completed_step = global_step + 1
-            divisor = args.gradient_accumulation
-            means = {key: value / divisor for key, value in accumulated_stats.items()}
-            mean_depth = (
-                sum(accumulated_depths) / len(accumulated_depths)
-                if accumulated_depths
-                else 0.0
-            )
-            if rank == 0 and completed_step % args.log_steps == 0:
-                peak_note = ""
-                if device.type == "cuda":
-                    peak_gib = torch.cuda.max_memory_allocated(device) / 2**30
-                    peak_note = f" peak={peak_gib:.1f}GiB"
-                    torch.cuda.reset_peak_memory_stats(device)
-                weights_display = loss_weights_raw.detach().softmax(dim=0).cpu()
-                mem_note = ""
-                if device.type == "cuda":
-                    used_gib = torch.cuda.memory_allocated(device) / 2**30
-                    total_gib = (
-                        torch.cuda.get_device_properties(device).total_memory / 2**30
-                    )
-                    mem_note = (
-                        f" mem={used_gib:.1f}/{total_gib:.0f}GiB"
-                        f"({100.0 * used_gib / total_gib:.0f}%)"
-                    )
+        optimizer_b.zero_grad(set_to_none=True)
+        completed_step = global_step + 1
+        # circuit breaker: silent OOM-skip storms look healthy to any process
+        # check (no traceback, log keeps rolling) while the run does no work;
+        # if >20% of the last window's micro-batches were skipped, abort with
+        # a distinctive exit code so the watchdog wakes the operator instead
+        # of burning GPU hours on a stalled run
+        oom_window_micros += args.gradient_accumulation
+        oom_window_skips += window_oom_skips
+        skip_rate = oom_window_skips / max(1, oom_window_micros)
+        if skip_rate > 0.2:
+            if rank == 0:
                 print(
-                    f"joint step={completed_step} lossB_ce={means.get('ce_at_depth', 0.0):.5f} "
-                    f"lossA={means.get('loss_a', 0.0):.5f} depth={mean_depth:.2f} "
-                    f"E[t]={means.get('expected_depth', 0.0):.2f} "
-                    f"w={','.join(f'{value:.3f}' for value in weights_display.tolist())} "
-                    f"grad={grad_norm_value:.3f} skipped={skipped_steps} "
-                    f"oom={oom_skips} "
-                    f"lrB={scheduler_b.get_last_lr()[0]:.3e} "
-                    f"lrA={scheduler_a.get_last_lr()[0]:.3e}{peak_note}{mem_note} "
+                    f"OOM-STORM skip_rate={skip_rate:.0%} "
+                    f"window_skips={oom_window_skips} "
+                    f"window_micros={oom_window_micros} "
+                    f"batch={args.batch_size} step={completed_step} "
+                    f"oom_total={oom_skips}",
+                    flush=True,
+                )
+            sys.exit(42)
+        oom_window_micros = 0
+        oom_window_skips = 0
+        window_oom_skips = 0
+        divisor = max(1, len(accumulated_depths))
+        means = {key: value / divisor for key, value in accumulated_stats.items()}
+        mean_depth = (
+            sum(accumulated_depths) / len(accumulated_depths)
+            if accumulated_depths
+            else 0.0
+        )
+        if rank == 0 and completed_step % args.log_steps == 0:
+            peak_note = ""
+            if device.type == "cuda":
+                peak_gib = torch.cuda.max_memory_allocated(device) / 2**30
+                peak_note = f" peak={peak_gib:.1f}GiB"
+                torch.cuda.reset_peak_memory_stats(device)
+            weights_display = loss_weights_raw.detach().softmax(dim=0).cpu()
+            mem_note = ""
+            if device.type == "cuda":
+                used_gib = torch.cuda.memory_allocated(device) / 2**30
+                total_gib = (
+                    torch.cuda.get_device_properties(device).total_memory / 2**30
+                )
+                mem_note = (
+                    f" mem={used_gib:.1f}/{total_gib:.0f}GiB"
+                    f"({100.0 * used_gib / total_gib:.0f}%)"
+                )
+            print(
+                f"joint step={completed_step} lossB_ce={means.get('ce_at_depth', 0.0):.5f} "
+                f"lossA={means.get('loss_a', 0.0):.5f} depth={mean_depth:.2f} "
+                f"E[t]={means.get('expected_depth', 0.0):.2f} "
+                f"w={','.join(f'{value:.3f}' for value in weights_display.tolist())} "
+                f"grad={grad_norm_value:.3f} skipped={skipped_steps} "
+                f"oom={oom_skips} "
+                f"lrB={scheduler_b.get_last_lr()[0]:.3e} "
+                f"lrA={scheduler_a.get_last_lr()[0]:.3e}{peak_note}{mem_note} "
+                f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
+                flush=True,
+            )
+        micro_step_in_step = 0
+        accumulated_stats = {}
+        accumulated_depths = []
+        if args.save_steps > 0 and completed_step % args.save_steps == 0:
+            if rank == 0:
+                atomic_torch_save(
+                    {
+                        "step": completed_step,
+                        "model": {
+                            key: value.cpu()
+                            for key, value in model.state_dict().items()
+                        },
+                        "optimizer": optimizer_b.state_dict(),
+                        "optimizer_readout": optimizer_a.state_dict(),
+                        "loss_weights_raw": loss_weights_raw.detach().cpu(),
+                        "exit_loss_weights": weights_display
+                        if completed_step % args.log_steps == 0
+                        else loss_weights_raw.detach().softmax(dim=0).cpu(),
+                        "exit_temperature": temperature,
+                        "exit_readout_rank": model.exit_readout.rank,
+                        "scheduler": scheduler_b.state_dict(),
+                        "scheduler_readout": scheduler_a.state_dict(),
+                        "config": asdict(config),
+                    },
+                    args.checkpoint,
+                )
+                print(
+                    f"joint_saved step={completed_step} path={args.checkpoint} "
                     f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
                     flush=True,
                 )
-            micro_step_in_step = 0
-            accumulated_stats = {}
-            accumulated_depths = []
-            if args.save_steps > 0 and completed_step % args.save_steps == 0:
-                if rank == 0:
-                    atomic_torch_save(
-                        {
-                            "step": completed_step,
-                            "model": {
-                                key: value.cpu()
-                                for key, value in model.state_dict().items()
-                            },
-                            "optimizer": optimizer_b.state_dict(),
-                            "optimizer_readout": optimizer_a.state_dict(),
-                            "loss_weights_raw": loss_weights_raw.detach().cpu(),
-                            "exit_loss_weights": weights_display
-                            if completed_step % args.log_steps == 0
-                            else loss_weights_raw.detach().softmax(dim=0).cpu(),
-                            "exit_temperature": temperature,
-                            "exit_readout_rank": model.exit_readout.rank,
-                            "scheduler": scheduler_b.state_dict(),
-                            "scheduler_readout": scheduler_a.state_dict(),
-                            "config": asdict(config),
-                        },
-                        args.checkpoint,
-                    )
-                    print(
-                        f"joint_saved step={completed_step} path={args.checkpoint} "
-                        f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
-                        flush=True,
-                    )
-                if distributed:
-                    dist.barrier()
-            if args.max_runtime_hours > 0 and (
-                (time.monotonic() - run_started) / 3600.0 >= args.max_runtime_hours
-            ):
-                if rank == 0:
-                    print(
-                        f"max_runtime_stopped step={completed_step} "
-                        f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
-                        flush=True,
-                    )
-                break
+            if distributed:
+                dist.barrier()
+        if args.max_runtime_hours > 0 and (
+            (time.monotonic() - run_started) / 3600.0 >= args.max_runtime_hours
+        ):
+            if rank == 0:
+                print(
+                    f"max_runtime_stopped step={completed_step} "
+                    f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
+                    flush=True,
+                )
+            break
     if rank == 0 and micro_step_in_step == 0 and not args.no_final_save:
         atomic_torch_save(
             {

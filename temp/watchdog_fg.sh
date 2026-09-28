@@ -1,80 +1,88 @@
 #!/bin/bash
-# FOREGROUND watchdog: streams every logged training step (log-steps=10),
-# enforces >=85% GPU memory utilization (nvidia-smi), repairs the run if it
-# dies/hangs/under-utilizes, then EXITS so the caller wakes up and re-arms.
-# Exit codes: 7 = wake caller (repaired or adjustment needed), 8 = fatal.
+# FOREGROUND watchdog for the joint exit training run.
+# Streams every logged step line, enforces >=85% GPU memory (torch-side mem=
+# field, not nvidia-smi which over-reports due to allocator cache), and on
+# crash/hang/OOM-storm STOPS and wakes the operator (exit codes below).
+# Policy (operator decision): an OOM storm is a CONFIG problem — never
+# auto-restart; crash without storm signature gets ONE resume attempt.
+# Exit codes: 7 = repaired-and-recovered or utilization below floor (re-arm),
+#             8 = OOM storm / fatal, operator must fix before relaunching.
 cd /home/src/dllm
 LOG=logs/train_joint_exit_41k.log
 stamp() { date "+%F %T"; }
-gpu_mem_pct() {
-  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits \
-    | awk -v t=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1) \
-    'BEGIN{m=999} {p=$1/t*100; if(p<m)m=p} END{print int(m)}'
-}
 off=$(stat -c %s "$LOG")
 last_step_time=$(date +%s)
-last_healthy=$(date +%s)
-
-# startup grace: model load + first step can take ~8 min
 GRACE=${WATCHDOG_GRACE:-540}
-
+storm_report() {
+  echo "[$(stamp)] ===== OOM-STORM / FATAL REPORT ====="
+  grep "OOM-STORM" "$LOG" | tail -3
+  grep "^joint step" "$LOG" | tail -5
+  tail -30 "$LOG" | grep -vE "^joint step" | tail -12
+  echo "[$(stamp)] training stopped; fix config (batch size) before relaunch"
+}
 while true; do
   new=$(stat -c %s "$LOG")
   if [ "$new" -gt "$off" ]; then
-    tail -c +"$((off + 1))" "$LOG" | grep "^joint step"
+    tail -c +"$((off + 1))" "$LOG" | grep -E "^joint step|OOM-STORM|max_runtime_stopped"
     off=$new
     last_step_time=$(date +%s)
-    # memory gate: only after grace period and only when training is mid-run
-    now=$(date +%s)
-    if [ $((now - last_healthy)) -gt "$GRACE" ]; then
-      pct=$(gpu_mem_pct)
-      if [ "$pct" -lt 85 ]; then
-        echo "[$(stamp)] ALERT: GPU mem utilization ${pct}% < 85% (run needs a bigger batch)"
-        grep "^joint step" "$LOG" | tail -1
-        exit 7
-      fi
+    # OOM storm circuit breaker fired inside the trainer (exit 42)
+    if tail -40 "$LOG" | grep -q "OOM-STORM"; then
+      echo "[$(stamp)] ALERT: trainer aborted itself on OOM storm (exit 42)"
+      storm_report
+      pkill -9 -f "torchrun" 2>/dev/null
+      exit 8
+    fi
+    # empty-stats signature: two consecutive dead windows (no CE at all)
+    if [ "$(tail -2 "$LOG" | grep -c 'lossB_ce=0.00000 .*E\[t\]=0.00')" -eq 2 ]; then
+      echo "[$(stamp)] ALERT: two consecutive steps with empty stats (every micro OOM-skipped)"
+      storm_report
+      pkill -9 -f "torchrun" 2>/dev/null
+      exit 8
+    fi
+    # memory floor: torch-side utilization from the mem= field
+    last_mem=$(grep "^joint step" "$LOG" | tail -1 | grep -oE "mem=[0-9.]+/[0-9]+GiB\(([0-9]+)%\)" | grep -oE "\([0-9]+%\)" | tr -d '(%)')
+    if [ -n "$last_mem" ] && [ "$last_mem" -lt 85 ] && [ "$(grep -c "^joint step" "$LOG")" -gt 3 ]; then
+      echo "[$(stamp)] ALERT: torch-side GPU memory ${last_mem}% < 85% floor"
+      grep "^joint step" "$LOG" | tail -1
+      exit 7
     fi
   fi
   if ! pgrep -f "train.py" > /dev/null; then
     now=$(date +%s)
-    if [ $((now - last_healthy)) -lt "$GRACE" ]; then
-      echo "[$(stamp)] still starting up (grace), process vanished pre-first-step: relaunching"
-      bash temp/launch_joint.sh 20
-      sleep "$GRACE"
-      last_healthy=$(date +%s)
+    if [ $((now - last_step_time)) -lt "$GRACE" ] && [ "$(grep -c '^joint step' "$LOG")" -le 3 ]; then
+      sleep 30   # still within startup grace; torchrun may just be loading weights
       continue
     fi
     echo "[$(stamp)] ALERT: trainer process gone"
-    grep "^joint step" "$LOG" | tail -1
-    reason="unknown"; b=20
-    if tail -120 "$LOG" | grep -q "OutOfMemoryError"; then b=16; reason=oom; fi
-    echo "[$(stamp)] repairing: relaunch batch=$b reason=$reason"
-    bash temp/launch_joint.sh "$b"
+    if tail -60 "$LOG" | grep -qE "OOM-STORM|exitcode  : 42"; then
+      storm_report
+      exit 8
+    fi
+    # non-storm crash (e.g. transient NCCL): one silent resume attempt
+    echo "[$(stamp)] non-storm crash: one resume attempt from latest checkpoint"
+    bash temp/launch_joint.sh 14
     for i in $(seq 1 80); do
       sleep 7
       if [ "$(stat -c %s "$LOG")" -gt "$off" ] && pgrep -f "train.py" > /dev/null; then
         sleep 30
-        echo "[$(stamp)] RECOVERED (batch=$b)"
+        echo "[$(stamp)] RECOVERED (resumed from checkpoint)"
         grep "^joint step" "$LOG" | tail -1
         exit 7
       fi
       pgrep -f "train.py" > /dev/null || break
     done
-    echo "[$(stamp)] FATAL: relaunch produced no progress in ~9min"
+    echo "[$(stamp)] FATAL: resume attempt made no progress in ~9min"
+    storm_report
     exit 8
   fi
   now=$(date +%s)
   if [ $((now - last_step_time)) -gt 420 ]; then
-    echo "[$(stamp)] ALERT: no new logged step for >7min while process alive (hang/oom-skip loop)"
+    echo "[$(stamp)] ALERT: no new logged step for >7min while process alive (hang)"
     grep "^joint step" "$LOG" | tail -1
-    echo "[$(stamp)] hang-repair: killing and resuming"
+    storm_report
     pkill -9 -f "torchrun" 2>/dev/null
-    sleep 5
-    bash temp/launch_joint.sh 20
-    sleep 420
-    echo "[$(stamp)] hang-repair done"
-    grep "^joint step" "$LOG" | tail -1
-    exit 7
+    exit 8
   fi
   sleep 5
 done

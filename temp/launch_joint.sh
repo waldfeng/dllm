@@ -2,7 +2,7 @@
 # Launch the joint exit training in the background, resuming from the latest
 # checkpoint.  Usage: launch_joint.sh [batch_size]
 cd /home/src/dllm
-B=${1:-20}
+B=${1:-14}
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid nohup \
   .venv/bin/torchrun --standalone --nproc_per_node=2 train.py \
   --train-exit-joint \
