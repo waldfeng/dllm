@@ -8,3 +8,7 @@ data/
 logs/
 checkpoints/
 *.log
+
+temp/*.pid
+temp/*.out
+temp/*.state.json

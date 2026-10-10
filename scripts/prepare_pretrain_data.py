@@ -20,8 +20,10 @@ from pretrain_data import (
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input-dir", type=Path, default=Path("datasets"))
-    parser.add_argument("--output-dir", type=Path, default=Path("datasets/tokens"))
+    parser.add_argument("--input-dir", type=Path, default=Path("/home/datasets/dllm/datasets"))
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("/home/datasets/dllm/datasets/tokens")
+    )
     parser.add_argument(
         "--tokenizer",
         default="tokenizer/qwen",

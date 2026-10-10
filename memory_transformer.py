@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 
 import torch
+import torch.utils.checkpoint
 from torch import Tensor, nn
 import torch.nn.functional as F
 
@@ -188,13 +189,18 @@ class SharedMemory(nn.Module):
         self.k_proj = nn.Parameter(torch.empty(n, h, kv))
         self.v_proj = nn.Parameter(torch.empty(n, h, kv))
         self.o_proj = nn.Parameter(torch.empty(n, h, h))
+        # Expert dispatch implementation: "loop" (per-expert nonzero scan,
+        # legacy), "sorted" (one-pass argsort+bincount partition, per-expert
+        # GEMMs, single accumulation) or "grouped" (sorted partition plus
+        # torch._grouped_mm fused group GEMMs).  "loop" keeps the reference
+        # behavior; the alternatives remove the 24-per-bank host syncs.
+        self.dispatch_mode = "loop"
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         # Initialize each addressable matrix separately. Initializing the whole
         # 3-D tensor makes PyTorch treat the block dimension as a kernel axis.
         for bank in (
-            self.ffn_gate,
             self.ffn_up,
             self.ffn_down,
             self.q_proj,
@@ -204,6 +210,11 @@ class SharedMemory(nn.Module):
         ):
             for block in bank:
                 nn.init.xavier_uniform_(block)
+        # SiLU's input branch uses the common ReLU-gain Kaiming approximation.
+        # Banks are [input, output]; transpose for PyTorch's fan-in convention.
+        with torch.no_grad():
+            for block in self.ffn_gate:
+                nn.init.kaiming_uniform_(block.transpose(0, 1), nonlinearity="relu")
 
     @staticmethod
     def _locations(indices: Tensor, block_id: int) -> Tensor:
@@ -212,6 +223,212 @@ class SharedMemory(nn.Module):
         return (indices.reshape(-1, indices.shape[-1]) == block_id).nonzero(
             as_tuple=False
         )
+
+    @staticmethod
+    def _partition(indices: Tensor, weights: Tensor, num_blocks: int):
+        """One-pass expert partition; ONE host sync replaces 24 nonzero syncs.
+
+        ``indices``/``weights`` have shape ``[..., top_k]``.  Returns
+        ``(tokens_sorted, weights_sorted, counts_cpu, starts)`` where
+        ``tokens_sorted`` are token ids grouped by expert (stable sort keeps
+        the original order inside each group) and ``starts[i]`` is group i's
+        start row in the sorted arrays.
+        """
+        top_k = indices.shape[-1]
+        idx_flat = indices.reshape(-1)
+        w_flat = weights.reshape(-1)
+        order = torch.argsort(idx_flat, stable=True)
+        counts = torch.bincount(idx_flat, minlength=num_blocks)
+        counts_cpu = counts.tolist()
+        starts = [0]
+        for count in counts_cpu:
+            starts.append(starts[-1] + count)
+        tokens_sorted = order.div(top_k, rounding_mode="floor")
+        weights_sorted = w_flat[order]
+        return tokens_sorted, weights_sorted, counts_cpu, starts
+
+    @staticmethod
+    def _routed_linear_sorted(
+        x: Tensor,
+        bank: Tensor,
+        tokens_sorted: Tensor,
+        weights_sorted: Tensor,
+        starts: list[int],
+    ) -> Tensor:
+        """Sorted dispatch: partition once (one host sync), per-expert gather,
+        per-expert GEMMs, IN-PLACE accumulation.
+
+        Versus the legacy loop: 24 nonzero host syncs become one argsort +
+        bincount + tolist; the chained out-of-place scatter_adds (which keep
+        every intermediate output alive in the autograd graph, ~1 GiB each for
+        the FFN bank) become in-place index_add_ on a plain buffer.
+        """
+        x_flat = x.reshape(-1, x.shape[-1])
+        output = x_flat.new_zeros((x_flat.shape[0], bank.shape[-1]))
+        for block_id in range(bank.shape[0]):
+            s, e = starts[block_id], starts[block_id + 1]
+            if e <= s:
+                continue
+            token_ids = tokens_sorted[s:e]
+            block_input = x_flat.index_select(0, token_ids)
+            block_output = F.linear(block_input, bank[block_id].transpose(0, 1))
+            block_output = block_output * weights_sorted[s:e].to(
+                block_output.dtype
+            ).unsqueeze(-1)
+            # index_add_ enforces same dtype even under autocast (scatter_add
+            # does not); cast the source to the accumulator dtype.
+            output.index_add_(0, token_ids, block_output.to(output.dtype))
+        return output.reshape(*x.shape[:-1], bank.shape[-1])
+
+    @staticmethod
+    def _grouped_mm_chunked_rows(
+        grouped_rows: Tensor, weight_stack: Tensor, starts: list[int], chunk_rows: int = 262144
+    ) -> Tensor:
+        """torch._grouped_mm over rows ALREADY in sorted routed-row order.
+
+        Slices ``grouped_rows[lo:hi]`` per chunk (no gather): for chains where
+        the input is a previous grouped GEMM's output (e.g. the FFN down
+        projection consuming ``silu(gate)*up``), the rows are already in
+        routed-row order and re-gathering with token ids would index the
+        wrong rows entirely.
+        """
+        total = grouped_rows.shape[0]
+        num_groups = weight_stack.shape[0]
+        outputs: list[Tensor] = []
+        lo = 0
+        g = 0
+        while lo < total:
+            hi = min(lo + chunk_rows, total)
+            sub = grouped_rows[lo:hi]
+            while g < num_groups and starts[g + 1] <= lo:
+                g += 1
+            g_end = g
+            while g_end < num_groups and starts[g_end] < hi:
+                g_end += 1
+            offs = torch.tensor(
+                [min(starts[k + 1], hi) - lo for k in range(g, g_end)],
+                dtype=torch.int32,
+                device=sub.device,
+            )
+            outputs.append(torch._grouped_mm(sub, weight_stack[g:g_end], offs=offs))
+            lo = hi
+        return torch.cat(outputs, dim=0)
+
+    @staticmethod
+    def _grouped_mm_chunked(
+        x_flat: Tensor, tokens_sorted: Tensor, weight_stack: Tensor,
+        starts: list[int], chunk_rows: int = 262144,
+    ) -> Tensor:
+        """torch._grouped_mm over sorted routed rows, chunked to cap memory.
+
+        The fused group GEMM materializes [routed_rows, out] outputs; at
+        production batch (983k routed rows) a single call would hold ~8 GiB
+        per bank tensor.  Chunking the sorted rows splits each expert's GEMM
+        across chunks (relative offsets), keeping transients ~2 GiB.  Rows are
+        gathered per chunk so no full [983k, hidden] copy is retained.
+        """
+        total = tokens_sorted.shape[0]
+        num_groups = weight_stack.shape[0]
+        outputs: list[Tensor] = []
+        lo = 0
+        g = 0
+        while lo < total:
+            hi = min(lo + chunk_rows, total)
+            sub = x_flat.index_select(0, tokens_sorted[lo:hi])
+            while g < num_groups and starts[g + 1] <= lo:
+                g += 1
+            g_end = g
+            while g_end < num_groups and starts[g_end] < hi:
+                g_end += 1
+            offs = torch.tensor(
+                [min(starts[k + 1], hi) - lo for k in range(g, g_end)],
+                dtype=torch.int32,
+                device=sub.device,
+            )
+            outputs.append(torch._grouped_mm(sub, weight_stack[g:g_end], offs=offs))
+            lo = hi
+        return torch.cat(outputs, dim=0)
+
+    @staticmethod
+    def _routed_linear_grouped(
+        x: Tensor,
+        bank: Tensor,
+        tokens_sorted: Tensor,
+        weights_sorted: Tensor,
+        starts: list[int],
+    ) -> Tensor:
+        """Sorted dispatch with fused group GEMMs (torch._grouped_mm)."""
+        x_flat = x.reshape(-1, x.shape[-1])
+        grouped_output = SharedMemory._grouped_mm_chunked(
+            x_flat, tokens_sorted, bank.to(torch.bfloat16), starts
+        )
+        grouped_output = grouped_output * weights_sorted.to(
+            grouped_output.dtype
+        ).unsqueeze(-1)
+        output = x_flat.new_zeros(
+            (x_flat.shape[0], grouped_output.shape[-1]), dtype=grouped_output.dtype
+        )
+        output = output.index_add(0, tokens_sorted, grouped_output)
+        return output.to(x.dtype).reshape(*x.shape[:-1], -1)
+
+    @staticmethod
+    def _routed_ffn_sorted(
+        x: Tensor,
+        gate_bank: Tensor,
+        up_bank: Tensor,
+        down_bank: Tensor,
+        tokens_sorted: Tensor,
+        weights_sorted: Tensor,
+        starts: list[int],
+    ) -> Tensor:
+        """Sorted FFN dispatch: partition once, per-expert gather and
+        gate/up/down GEMMs, IN-PLACE accumulation."""
+        x_flat = x.reshape(-1, x.shape[-1])
+        hidden_size = down_bank.shape[-1]
+        output = x_flat.new_zeros((x_flat.shape[0], hidden_size))
+        for block_id in range(gate_bank.shape[0]):
+            s, e = starts[block_id], starts[block_id + 1]
+            if e <= s:
+                continue
+            token_ids = tokens_sorted[s:e]
+            block_input = x_flat.index_select(0, token_ids)
+            gate = F.linear(block_input, gate_bank[block_id].transpose(0, 1))
+            up = F.linear(block_input, up_bank[block_id].transpose(0, 1))
+            hidden = F.silu(gate) * up
+            block_output = F.linear(hidden, down_bank[block_id].transpose(0, 1))
+            block_output = block_output * weights_sorted[s:e].to(
+                block_output.dtype
+            ).unsqueeze(-1)
+            output.index_add_(0, token_ids, block_output.to(output.dtype))
+        return output.reshape(*x.shape[:-1], hidden_size)
+
+    @staticmethod
+    def _routed_ffn_grouped(
+        x: Tensor,
+        gate_bank: Tensor,
+        up_bank: Tensor,
+        down_bank: Tensor,
+        tokens_sorted: Tensor,
+        weights_sorted: Tensor,
+        starts: list[int],
+    ) -> Tensor:
+        """Sorted FFN dispatch with fused group GEMMs (torch._grouped_mm)."""
+        x_flat = x.reshape(-1, x.shape[-1])
+        gate = SharedMemory._grouped_mm_chunked(x_flat, tokens_sorted, gate_bank.to(torch.bfloat16), starts)
+        up = SharedMemory._grouped_mm_chunked(x_flat, tokens_sorted, up_bank.to(torch.bfloat16), starts)
+        hidden = F.silu(gate) * up
+        del gate, up
+        # hidden is already in routed-row order: slice it, don't re-gather
+        block_output = SharedMemory._grouped_mm_chunked_rows(hidden, down_bank.to(torch.bfloat16), starts)
+        del hidden
+        block_output = block_output * weights_sorted.to(
+            block_output.dtype
+        ).unsqueeze(-1)
+        output = x_flat.new_zeros(
+            (x_flat.shape[0], block_output.shape[-1]), dtype=block_output.dtype
+        )
+        output = output.index_add(0, tokens_sorted, block_output)
+        return output.to(x.dtype).reshape(*x.shape[:-1], -1)
 
     @staticmethod
     def routed_linear(
@@ -266,6 +483,22 @@ class SharedMemory(nn.Module):
         return output.reshape(*x.shape[:-1], down_bank.shape[-1])
 
     def ffn(self, x: Tensor, indices: Tensor, weights: Tensor) -> Tensor:
+        mode = getattr(self, "dispatch_mode", "loop")
+        if mode != "loop":
+            tokens_sorted, weights_sorted, _, starts = self._partition(
+                indices, weights, self.ffn_gate.shape[0]
+            )
+            if mode == "sorted":
+                return self._routed_ffn_sorted(
+                    x, self.ffn_gate, self.ffn_up, self.ffn_down,
+                    tokens_sorted, weights_sorted, starts,
+                )
+            if mode == "grouped":
+                return self._routed_ffn_grouped(
+                    x, self.ffn_gate, self.ffn_up, self.ffn_down,
+                    tokens_sorted, weights_sorted, starts,
+                )
+            raise ValueError(f"unknown dispatch mode: {mode}")
         return self.routed_ffn(
             x,
             self.ffn_gate,
@@ -284,6 +517,20 @@ class SharedMemory(nn.Module):
         bank = getattr(self, f"{operation}_proj", None)
         if bank is None or operation not in {"q", "k", "v", "o"}:
             raise ValueError(f"unknown shared-memory operation: {operation}")
+        mode = getattr(self, "dispatch_mode", "loop")
+        if mode != "loop":
+            tokens_sorted, weights_sorted, _, starts = self._partition(
+                indices, weights, bank.shape[0]
+            )
+            if mode == "sorted":
+                return self._routed_linear_sorted(
+                    x, bank, tokens_sorted, weights_sorted, starts
+                )
+            if mode == "grouped":
+                return self._routed_linear_grouped(
+                    x, bank, tokens_sorted, weights_sorted, starts
+                )
+            raise ValueError(f"unknown dispatch mode: {mode}")
         return self.routed_linear(x, bank, indices, weights)
 
 
@@ -311,7 +558,7 @@ class CalibratedExitReadout(nn.Module):
         self.bias = nn.Parameter(torch.zeros(num_depths, vocab_size))
         self.temperature = nn.Parameter(torch.ones(num_depths))
         for depth in range(num_depths):
-            nn.init.kaiming_uniform_(self.project[depth], a=5**0.5)
+            nn.init.xavier_uniform_(self.project[depth])
 
     def reset_identity(self) -> None:
         """Restore the exact identity initialization (B = c = 0, T = 1)."""
@@ -319,7 +566,7 @@ class CalibratedExitReadout(nn.Module):
         nn.init.zeros_(self.bias)
         nn.init.ones_(self.temperature)
         for depth in range(self.num_depths):
-            nn.init.kaiming_uniform_(self.project[depth], a=5**0.5)
+            nn.init.xavier_uniform_(self.project[depth])
 
     def logits_at(self, depth_index: int, states: Tensor, head_weight: Tensor) -> Tensor:
         """Calibrated logits for normed states ``[..., hidden]`` at one depth."""
@@ -420,6 +667,10 @@ class MemoryReasoner(nn.Module):
         )
         self.rotary = RotaryEmbedding(config)
         self.dropout = nn.Dropout(config.dropout)
+        # GQA attention: True passes k/v to SDPA with enable_gqa=True instead
+        # of materializing repeat_interleave'd copies ([B, heads, T, head_dim]
+        # each); outputs agree to kernel-level precision.
+        self.use_gqa = False
 
     def route(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         logits = self.router(x).view(
@@ -446,33 +697,47 @@ class MemoryReasoner(nn.Module):
         v = v.view(x.shape[0], x.shape[1], self.config.num_key_value_heads, -1)
         q, k = self.rotary(q.transpose(1, 2), k.transpose(1, 2))
         v = v.transpose(1, 2)
-        k = k.repeat_interleave(
-            self.config.num_attention_heads // self.config.num_key_value_heads, dim=1
-        )
-        v = v.repeat_interleave(
-            self.config.num_attention_heads // self.config.num_key_value_heads, dim=1
-        )
-        causal = torch.tril(
-            torch.ones(x.shape[1], x.shape[1], device=x.device, dtype=torch.bool)
-        )
-        allowed = causal[None, None, :, :]
-        if attention_mask is not None:
-            allowed = allowed & attention_mask[:, None, None, :].bool()
-            attn = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=allowed,
-                dropout_p=self.dropout.p if self.training else 0.0,
-            )
+        dropout_p = self.dropout.p if self.training else 0.0
+        if getattr(self, "use_gqa", False):
+            if attention_mask is not None:
+                allowed = torch.tril(
+                    torch.ones(x.shape[1], x.shape[1], device=x.device, dtype=torch.bool)
+                ) & attention_mask[:, None, None, :].bool()
+                attn = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=allowed, dropout_p=dropout_p, enable_gqa=True
+                )
+            else:
+                attn = F.scaled_dot_product_attention(
+                    q, k, v, is_causal=True, dropout_p=dropout_p, enable_gqa=True
+                )
         else:
-            attn = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                is_causal=True,
-                dropout_p=self.dropout.p if self.training else 0.0,
+            k = k.repeat_interleave(
+                self.config.num_attention_heads // self.config.num_key_value_heads, dim=1
             )
+            v = v.repeat_interleave(
+                self.config.num_attention_heads // self.config.num_key_value_heads, dim=1
+            )
+            causal = torch.tril(
+                torch.ones(x.shape[1], x.shape[1], device=x.device, dtype=torch.bool)
+            )
+            allowed = causal[None, None, :, :]
+            if attention_mask is not None:
+                allowed = allowed & attention_mask[:, None, None, :].bool()
+                attn = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=allowed,
+                    dropout_p=dropout_p,
+                )
+            else:
+                attn = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    is_causal=True,
+                    dropout_p=dropout_p,
+                )
         attn = attn.transpose(1, 2).reshape_as(x)
         attn = memory("o", attn, indices[..., 3, :], weights[..., 3, :])
         x = x + self.dropout(attn)
@@ -494,6 +759,12 @@ class MemoryTransformerForCausalLM(nn.Module):
         self.norm = RMSNorm(self.config.hidden_size, self.config.rms_norm_eps)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.exit_readout: Optional[CalibratedExitReadout] = None
+        # Training-time memory optimizations toggled by the trainer:
+        # gradient_checkpointing recomputes each cycle in backward;
+        # loss_chunk_rows > 0 computes the label CE over checkpointed
+        # vocabulary-sized row chunks instead of one monolithic tensor.
+        self.gradient_checkpointing = False
+        self.loss_chunk_rows = 0
         self.apply(self._init)
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
@@ -523,26 +794,28 @@ class MemoryTransformerForCausalLM(nn.Module):
         """Batch-mean halting cost ``l_t`` at one depth (lower is better).
 
         Weighted sum of the inference-available terms of the readout-training
-        objective: confidence deficit, probability-margin deficit, state-delta
-        deficit, speed ``t/num_depths``, and min-depth guard.  The shortlist
+        objective, matching the training cost definition: confidence deficit
+        ``1 - q1``, probability-margin deficit ``1 - (q1 - q2)``, relative
+        state change over the delta threshold, speed ``t/num_depths``, and the
+        clamped min-depth guard ``max(0, (d_min - d) / D)``.  The shortlist
         cross-entropy term has no ground truth at inference and its annealed
         prior mass is zero, so it is omitted.
         """
         weights = self.config.exit_selection_weights
-        cost = weights[1] * (self.config.early_exit_confidence_threshold - confidence).clamp_min(
-            0.0
-        ).mean()
-        cost = cost + weights[2] * (self.config.early_exit_margin_threshold - margin).clamp_min(
-            0.0
-        ).mean()
+        td = self.config.early_exit_state_delta_threshold
+        if td <= 0:
+            raise ValueError("exit state delta threshold must be positive")
+        cost = weights[1] * (1.0 - confidence).mean()
+        cost = cost + weights[2] * (1.0 - margin).mean()
         if delta is not None and weights[3] > 0:
-            cost = cost + weights[3] * (
-                delta.to(confidence.dtype) - self.config.early_exit_state_delta_threshold
-            ).clamp_min(0.0).mean()
+            cost = cost + weights[3] * (delta.float() / td).mean()
         num_depths = self.config.num_layers
-        cost = cost + weights[4] * ((depth_index + 1) / num_depths)
+        cost = cost + weights[4] * confidence.new_tensor((depth_index + 1) / num_depths)
         min_depth = min(self.config.early_exit_min_depth, num_depths)
-        cost = cost + weights[5] * (max(0, min_depth - (depth_index + 1)) / num_depths)
+        guard = confidence.new_tensor(
+            max(0.0, (min_depth - (depth_index + 1)) / num_depths)
+        )
+        cost = cost + weights[5] * guard
         return cost
 
     def apply_exit_selection(
@@ -579,12 +852,53 @@ class MemoryTransformerForCausalLM(nn.Module):
         load = assignment.mean(dim=(0, 2))
         return blocks * (importance * load).sum(dim=-1).mean()
 
+    def _per_sample_exit_depths(
+        self,
+        confidence: list[Tensor],
+        margin: list[Tensor],
+        deltas: list[Optional[Tensor]],
+    ) -> Tensor:
+        """Per-sample halting depths (1-based) via the batch rule applied per row."""
+        weights = self.config.exit_selection_weights
+        num_depths = len(confidence)
+        min_depth = min(self.config.early_exit_min_depth, num_depths)
+        device = confidence[0].device
+        rows = confidence[0].shape[0]
+        best = torch.full((rows,), float("inf"), device=device)
+        best_depth = torch.zeros(rows, dtype=torch.long, device=device)
+        exited = torch.full((rows,), float(num_depths), device=device)
+        done = torch.zeros(rows, dtype=torch.bool, device=device)
+        for depth_index in range(num_depths):
+            if depth_index + 1 < min_depth:
+                continue
+            cost = weights[1] * (
+                self.config.early_exit_confidence_threshold - confidence[depth_index]
+            ).clamp_min(0.0)
+            cost = cost + weights[2] * (
+                self.config.early_exit_margin_threshold - margin[depth_index]
+            ).clamp_min(0.0)
+            delta = deltas[depth_index]
+            if delta is not None and weights[3] > 0:
+                cost = cost + weights[3] * (
+                    delta.to(cost.dtype) - self.config.early_exit_state_delta_threshold
+                ).clamp_min(0.0)
+            cost = cost + weights[4] * ((depth_index + 1) / num_depths)
+            cost = cost + weights[5] * (max(0, min_depth - (depth_index + 1)) / num_depths)
+            improve = cost < best
+            best = torch.where(improve, cost, best)
+            best_depth = torch.where(improve, depth_index, best_depth)
+            halt = (~improve) & (~done)
+            exited = torch.where(halt, best_depth.to(exited.dtype) + 1.0, exited)
+            done = done | halt
+        return exited
+
     def forward(
         self,
         input_ids: Tensor,
         labels: Optional[Tensor] = None,
         attention_mask: Optional[Tensor] = None,
         return_router_stats: bool = False,
+        return_router_health: bool = False,
         early_exit: Optional[bool] = None,
     ) -> dict[str, object]:
         if input_ids.ndim != 2:
@@ -608,6 +922,28 @@ class MemoryTransformerForCausalLM(nn.Module):
             # Halting is an inference-time mechanism; training always runs the
             # full depth so gradients and router statistics stay unchanged.
             enabled = False
+        if enabled and input_ids.shape[0] > 1:
+            # Independent sample execution: stopped samples perform no further cycles.
+            outputs = [self.forward(
+                input_ids[i:i+1],
+                labels=None if labels is None else labels[i:i+1],
+                attention_mask=None if attention_mask is None else attention_mask[i:i+1],
+                return_router_stats=return_router_stats,
+                return_router_health=return_router_health, early_exit=True,
+            ) for i in range(input_ids.shape[0])]
+            result = {
+                "logits": torch.cat([o["logits"] for o in outputs]),
+                "router_loss": torch.stack([o["router_loss"] for o in outputs]).mean(),
+                "exit_depth": [o["exit_depth"] for o in outputs],
+                "exit_halted": [o["exit_halted"] for o in outputs],
+                "sample_outputs": outputs,
+            }
+            if labels is not None:
+                targets = labels[:, 1:]
+                if attention_mask is not None:
+                    targets = targets.masked_fill(~attention_mask[:, 1:], -100)
+                result["loss"] = F.cross_entropy(result["logits"][:, :-1].reshape(-1, self.config.vocab_size), targets.reshape(-1), ignore_index=-100)
+            return result
 
         x = self.embed_tokens(input_ids)
         if attention_mask is not None:
@@ -616,6 +952,8 @@ class MemoryTransformerForCausalLM(nn.Module):
         route_indices = []
         route_weights = []
         route_probabilities = []
+        health_load: Optional[Tensor] = None
+        health_importance: Optional[Tensor] = None
         exit_depth = self.config.num_layers
         exit_confidence: list[Tensor] = []
         exit_margin: list[Tensor] = []
@@ -627,9 +965,18 @@ class MemoryTransformerForCausalLM(nn.Module):
         prev_normed: Optional[Tensor] = None
         halted = False
         for depth_index, layer in enumerate(self.layers):
-            x, indices, weights, probabilities = layer(
-                x, self.memory, attention_mask=attention_mask
-            )
+            if (
+                self.gradient_checkpointing
+                and self.training
+                and torch.is_grad_enabled()
+            ):
+                x, indices, weights, probabilities = torch.utils.checkpoint.checkpoint(
+                    layer, x, self.memory, attention_mask, use_reentrant=False
+                )
+            else:
+                x, indices, weights, probabilities = layer(
+                    x, self.memory, attention_mask=attention_mask
+                )
             if attention_mask is not None:
                 x = x * attention_mask.unsqueeze(-1).to(x.dtype)
             route_losses.append(
@@ -639,6 +986,25 @@ class MemoryTransformerForCausalLM(nn.Module):
                 route_indices.append(indices)
                 route_weights.append(weights)
                 route_probabilities.append(probabilities)
+            if return_router_health:
+                blocks_n = probabilities.shape[-1]
+                probability_rows = probabilities.reshape(
+                    -1, probabilities.shape[-2], blocks_n
+                )
+                index_rows = indices.reshape(-1, indices.shape[-2], indices.shape[-1])
+                if attention_mask is not None:
+                    valid = attention_mask.reshape(-1).bool()
+                    probability_rows = probability_rows[valid]
+                    index_rows = index_rows[valid]
+                if probability_rows.shape[0] > 0:
+                    importance = probability_rows.float().mean(dim=0)
+                    assignment = F.one_hot(index_rows, num_classes=blocks_n).float()
+                    load = assignment.mean(dim=(0, 2))
+                    if health_load is None:
+                        health_load = torch.zeros(blocks_n, device=x.device)
+                        health_importance = torch.zeros_like(health_load)
+                    health_load = health_load + load.sum(dim=0).detach()
+                    health_importance = health_importance + importance.sum(dim=0).detach()
             if not enabled:
                 continue
             normed = self.norm(x)
@@ -676,7 +1042,19 @@ class MemoryTransformerForCausalLM(nn.Module):
             exit_normed = best_normed
             halted = True
             break
-        if enabled and self.exit_readout is not None:
+        # Chunked training CE: skip materializing the [batch, seq, vocab]
+        # logits entirely and let the labels branch below compute the loss
+        # row-chunk by row-chunk (training mode never early-exits, so the
+        # exit-aware logits selection above is irrelevant here).
+        chunked_ce = (
+            labels is not None
+            and self.loss_chunk_rows > 0
+            and self.training
+            and torch.is_grad_enabled()
+        )
+        if chunked_ce:
+            logits = None
+        elif enabled and self.exit_readout is not None:
             normed_final = exit_normed if halted else self.norm(x)
             logits = self.exit_readout.logits_at(
                 exit_depth - 1, normed_final, self.lm_head.weight
@@ -689,6 +1067,21 @@ class MemoryTransformerForCausalLM(nn.Module):
             "logits": logits,
             "router_loss": torch.stack(route_losses).mean(),
         }
+        if return_router_health:
+            depth_count = max(len(route_losses), 1)
+            result["router_health"] = {
+                "layer_losses": [float(value.detach()) for value in route_losses],
+                "block_load": (
+                    (health_load / depth_count).cpu()
+                    if health_load is not None
+                    else torch.zeros(self.config.num_memory_blocks)
+                ),
+                "block_importance": (
+                    (health_importance / depth_count).cpu()
+                    if health_importance is not None
+                    else torch.zeros(self.config.num_memory_blocks)
+                ),
+            }
         if enabled:
             result["exit_depth"] = exit_depth
             result["exit_halted"] = halted
@@ -698,22 +1091,110 @@ class MemoryTransformerForCausalLM(nn.Module):
                 None if tensor is None else tensor.tolist() for tensor in exit_delta
             ]
         if labels is not None:
-            shifted_logits = logits[:, :-1].contiguous()
-            shifted_labels = labels[:, 1:].contiguous()
-            if attention_mask is not None:
-                shifted_labels = shifted_labels.masked_fill(
-                    ~attention_mask[:, 1:], -100
+            if chunked_ce:
+                result["loss"] = self._chunked_cross_entropy(
+                    x, labels, attention_mask
                 )
-            result["loss"] = F.cross_entropy(
-                shifted_logits.reshape(-1, shifted_logits.size(-1)),
-                shifted_labels.reshape(-1),
-                ignore_index=-100,
-            )
+            else:
+                shifted_logits = logits[:, :-1].contiguous()
+                shifted_labels = labels[:, 1:].contiguous()
+                if attention_mask is not None:
+                    shifted_labels = shifted_labels.masked_fill(
+                        ~attention_mask[:, 1:], -100
+                    )
+                result["loss"] = F.cross_entropy(
+                    shifted_logits.reshape(-1, shifted_logits.size(-1)),
+                    shifted_labels.reshape(-1),
+                    ignore_index=-100,
+                )
         if return_router_stats:
             result["route_indices"] = route_indices
             result["route_weights"] = route_weights
             result["route_probabilities"] = route_probabilities
         return result
+
+    def _chunked_cross_entropy(
+        self, hidden_state: Tensor, labels: Tensor, attention_mask: Optional[Tensor]
+    ) -> Tensor:
+        """Checkpointed chunk-wise CE that never materializes full logits.
+
+        Computes the same masked-mean cross entropy as the monolithic path,
+        but the ``[rows, vocab]`` logits and their backward intermediates only
+        ever span ``loss_chunk_rows`` rows at a time, each wrapped in an
+        activation checkpoint so the saved state per chunk is just the hidden
+        rows.  The CE itself runs in fp32: a bf16 log-softmax over a ~150k
+        vocabulary loses precision.
+        """
+        normed = self.norm(hidden_state)
+        flat_hidden = normed[:, :-1].reshape(-1, normed.size(-1))
+        flat_labels = labels[:, 1:].reshape(-1)
+        if attention_mask is not None:
+            flat_labels = flat_labels.masked_fill(
+                ~attention_mask[:, 1:].reshape(-1), -100
+            )
+        masked_count = flat_labels.ne(-100).sum().clamp_min(1)
+        ce_sum = flat_hidden.new_zeros((), dtype=torch.float32)
+
+        def chunk_ce(rows: Tensor, targets: Tensor) -> Tensor:
+            chunk_logits = self.lm_head(rows)
+            return F.cross_entropy(
+                chunk_logits.float(), targets, ignore_index=-100, reduction="sum"
+            )
+
+        for start in range(0, flat_hidden.size(0), self.loss_chunk_rows):
+            ce_sum = ce_sum + torch.utils.checkpoint.checkpoint(
+                chunk_ce,
+                flat_hidden[start : start + self.loss_chunk_rows],
+                flat_labels[start : start + self.loss_chunk_rows],
+                use_reentrant=False,
+            )
+        return ce_sum / masked_count
+
+    @torch.no_grad()
+    def exit_depth_stats(
+        self, input_ids: Tensor, attention_mask: Optional[Tensor] = None
+    ) -> Tensor:
+        """Per-sample halting depths (1-based) from one full-depth no-grad probe.
+
+        Diagnostic helper for the trainer's log line: runs every reasoner
+        cycle without grad, records per-depth confidence/margin/delta, and
+        applies the selection-cost halting rule per row.  Never materializes
+        full-vocabulary logits, so the transient peak stays well below the
+        training step's.
+        """
+        x = self.embed_tokens(input_ids)
+        if attention_mask is not None:
+            x = x * attention_mask.unsqueeze(-1).to(x.dtype)
+        confidence: list[Tensor] = []
+        margin: list[Tensor] = []
+        deltas: list[Optional[Tensor]] = []
+        prev_normed: Optional[Tensor] = None
+        for depth_index, layer in enumerate(self.layers):
+            x, _indices, _weights, _probabilities = layer(
+                x, self.memory, attention_mask=attention_mask
+            )
+            if attention_mask is not None:
+                x = x * attention_mask.unsqueeze(-1).to(x.dtype)
+            normed = self.norm(x)
+            if prev_normed is None:
+                delta = None
+            else:
+                difference = normed.float() - prev_normed
+                denominator = normed.float().norm(dim=-1).clamp_min(1e-6)
+                per_position = difference.norm(dim=-1) / denominator
+                if attention_mask is not None:
+                    mask = attention_mask.to(per_position.dtype)
+                    delta = (per_position * mask).sum(-1) / mask.sum(-1).clamp_min(1.0)
+                else:
+                    delta = per_position.mean(-1)
+            last_logits = self._exit_readout_logits(depth_index, normed[:, -1, :])
+            last_probabilities = torch.softmax(last_logits.float(), dim=-1)
+            top2 = torch.topk(last_probabilities, 2, dim=-1).values
+            confidence.append(top2[:, 0])
+            margin.append(top2[:, 0] - top2[:, 1])
+            deltas.append(delta)
+            prev_normed = normed
+        return self._per_sample_exit_depths(confidence, margin, deltas)
 
     @torch.no_grad()
     def exit_rollout(
@@ -853,9 +1334,18 @@ class MemoryTransformerForCausalLM(nn.Module):
         router_losses: list[Tensor] = []
         normed_states: list[Tensor] = []
         for layer in self.layers[:num_cycles]:
-            x, indices, _weights, probabilities = layer(
-                x, self.memory, attention_mask=attention_mask
-            )
+            if (
+                self.gradient_checkpointing
+                and self.training
+                and torch.is_grad_enabled()
+            ):
+                x, indices, _weights, probabilities = torch.utils.checkpoint.checkpoint(
+                    layer, x, self.memory, attention_mask, use_reentrant=False
+                )
+            else:
+                x, indices, _weights, probabilities = layer(
+                    x, self.memory, attention_mask=attention_mask
+                )
             if attention_mask is not None:
                 x = x * attention_mask.unsqueeze(-1).to(x.dtype)
             router_losses.append(
@@ -887,7 +1377,8 @@ class MemoryTransformerForCausalLM(nn.Module):
         for _ in range(max_new_tokens):
             output = self(input_ids, early_exit=early_exit)
             if "exit_depth" in output:
-                exit_depths.append(int(output["exit_depth"]))
+                depths = output["exit_depth"]
+                exit_depths.extend(depths if isinstance(depths, list) else [int(depths)])
             logits = output["logits"][:, -1]
             next_token = logits.argmax(-1, keepdim=True)
             if eos_token_id is not None:

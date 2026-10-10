@@ -25,7 +25,7 @@ from memory_transformer import MemoryTransformerConfig, MemoryTransformerForCaus
 from pretrain_data import load_tokenizer
 
 MAX_CHARS = 100
-DEFAULT_CHECKPOINT = Path("datasets/checkpoints/memory-transformer-24h-router03.pt")
+DEFAULT_CHECKPOINT = Path("backups/checkpoints_20261008_054446/datasets/checkpoints/memory-transformer-24h-router03.pt")
 DEFAULT_TOKENIZER = "tokenizer/qwen"
 
 

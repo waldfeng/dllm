@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/text"),
+        default=Path("/home/datasets/dllm/data/text"),
         help="destination for wit-XXXXX.jsonl.gz records",
     )
     parser.add_argument(

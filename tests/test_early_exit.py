@@ -42,12 +42,11 @@ def permissive_args(**overrides) -> argparse.Namespace:
     values = dict(
         exit_shortlist=64,
         exit_min_depth=1,
-        exit_tau_confidence=0.0,
-        exit_tau_margin=0.0,
+        exit_tau_confidence=0.9,
+        exit_tau_margin=0.3,
         exit_tau_delta=1e9,
         exit_temp_start=2.0,
         exit_temp_end=0.25,
-        exit_sparsity_weight=1.0,
     )
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -72,8 +71,9 @@ def speed_only_model(**overrides) -> MemoryTransformerForCausalLM:
     values = dict(
         early_exit_enabled=True,
         early_exit_confidence_threshold=1e-6,
-        early_exit_margin_threshold=0.0,
+        early_exit_margin_threshold=0.3,
         early_exit_state_delta_threshold=1e9,
+        exit_selection_weights=(0.0, 0.0, 0.0, 0.0, 1.0, 0.0),
     )
     values.update(overrides)
     return tiny_model(**values)
@@ -178,7 +178,7 @@ def test_exit_terms_move_in_the_minimization_direction():
     _, guard_free = run(rollout, penalized, permissive_args(exit_min_depth=1))
     _, guarded = run(rollout, penalized, permissive_args(exit_min_depth=8))
     assert guard_free["guard"] == 0.0
-    assert guarded["guard"] > 0.0
+    assert guarded["guard"] > guard_free["guard"]
     assert strong_total.isfinite() and weak_total.isfinite()
 
 
@@ -199,32 +199,39 @@ def test_loss_terms_are_bounded_and_weights_sum_to_one():
     )
     assert abs(float(weights.sum()) - 1.0) < 1e-5
     assert 0.0 <= stats["weight_alignment"] <= 1.0
-    assert 0.0 <= stats["sparsity"] <= 1.0 + 1e-6
-    assert 0.0 <= stats["ce"] <= 1.0
+    assert "sparsity" not in stats
+    assert stats["total"] == pytest.approx(
+        sum(stats[key] for key in ("ce", "confidence", "margin", "delta", "speed", "guard", "weight_alignment"))
+    )
+    assert stats["ce"] >= 0.0
     assert 0.0 <= stats["confidence"] <= 1.0
     assert 0.0 <= stats["margin"] <= 1.0
-    assert 0.0 <= stats["delta"] <= 1.0
+    assert stats["delta"] >= 0.0
     assert 0.0 <= stats["speed"] <= 1.0
-    assert 0.0 <= stats["guard"] <= 1.0
+    assert stats["guard"] >= 0.0
     assert torch.isfinite(total)
 
 
-def test_saturation_reaches_exact_zero():
+def test_smooth_costs_have_range_and_finite_gradients():
     model = tiny_model().eval()
     ensure_exit_readout(model)
     weights = uniform_weights()
-    _, stats = exit_readout_losses(
+    total, stats = exit_readout_losses(
         model,
         synthetic_rollout(),
         torch.tensor([3, 7]),
         weights,
         uniform_weights(),
-        permissive_args(exit_tau_confidence=0.0, exit_tau_margin=0.0),
+        permissive_args(),
         0.0,
         4,
     )
-    assert stats["confidence"] == 0.0
-    assert stats["margin"] == 0.0
+    assert 0.0 < stats["confidence"] < weights[1]
+    assert 0.0 < stats["margin"] < weights[2]
+    total.backward()
+    assert model.exit_readout.bias.grad is not None
+    assert torch.isfinite(model.exit_readout.bias.grad).all()
+    assert model.exit_readout.bias.grad.abs().sum() > 0
 
 
 def test_fixed_weights_receive_no_gradient():
@@ -320,7 +327,7 @@ def test_shortlist_full_coverage_matches_full_ce():
             depth_index, states[depth_index], model.lm_head.weight.to(states.dtype)
         )
         full_ce = torch.nn.functional.cross_entropy(logits, target, reduction="none")
-        expected.append(full_ce / log_vocab)
+        expected.append(full_ce / (log_vocab + full_ce))
     expected_mean = torch.stack(expected).mean().detach()
     assert abs(stats["ce"] - float(expected_mean)) < 1e-6
 
@@ -388,13 +395,13 @@ def test_exit_selection_cost_matches_reference():
     cost = model._exit_selection_cost(confidence, margin, delta, 1)
     weights = model.config.exit_selection_weights
     expected = (
-        weights[1] * 0.2
-        + weights[2] * 0.1
-        + weights[3] * 0.225
-        + weights[4] * 0.5
-        + weights[5] * 0.0
+        weights[1] * (1.0 - confidence).mean()
+        + weights[2] * (1.0 - margin).mean()
+        + weights[3] * (delta / 0.05).mean()
+        + weights[4] * torch.tensor(0.5)
+        + weights[5] * torch.tensor(0.0)
     )
-    assert torch.allclose(cost, torch.tensor(expected), atol=1e-6)
+    assert torch.allclose(cost, expected, atol=1e-6)
 
 
 def test_oversized_min_depth_clamps_to_full_depth():
@@ -477,6 +484,24 @@ def test_assemble_terms_matches_readout_losses_and_base_path():
     assert torch.allclose(selection_base, selection_logits, atol=1e-5)
 
 
+def test_single_sample_exit_terms_preserve_depth_batch_axes():
+    model = tiny_model().eval()
+    ensure_exit_readout(model)
+    rollout = model.joint_rollout(torch.arange(8).view(1, 8) % 32)
+    rollout = {key: value.clone() for key, value in rollout.items()}
+    terms, _, _ = assemble_exit_terms(
+        model, rollout, torch.tensor([7]), permissive_args(), 4,
+        base_logits=rollout["base_logits"],
+    )
+    assert terms.shape == (6, 4, 1)
+    expected = torch.nn.functional.cross_entropy(
+        rollout["base_logits"].reshape(4, -1), torch.full((4,), 7), reduction="none"
+    )
+    log_vocab = torch.tensor(float(model.config.vocab_size)).log()
+    expected = expected / (log_vocab + expected)
+    assert torch.allclose(terms[0, :, 0], expected, atol=1e-5)
+
+
 def test_phase_isolation_halting_vs_backbone():
     model = tiny_model().eval()
     ensure_exit_readout(model)
@@ -497,7 +522,7 @@ def test_phase_isolation_halting_vs_backbone():
     )
     model.zero_grad(set_to_none=True)
     # the CE term is the part of the halting objective that touches the
-    # readout parameters; the hinges are zero under permissive thresholds and
+    # readout parameters; the deficit terms follow the readout logits and
     # speed/guard are constants
     terms[0].mean().backward()
     assert any(

@@ -82,10 +82,10 @@ def test_memory_initializes_each_matrix_at_linear_scale():
     config = tiny_model().config
     model = tiny_model()
     q_expected = (2.0 / (config.hidden_size + config.hidden_size)) ** 0.5
-    gate_expected = (
+    gate_expected = (2.0 / config.hidden_size) ** 0.5
+    down_expected = (
         2.0 / (config.hidden_size + config.intermediate_size)
     ) ** 0.5
-    down_expected = gate_expected
     assert 0.5 * q_expected < model.memory.q_proj.std() < 1.5 * q_expected
     assert 0.5 * gate_expected < model.memory.ffn_gate.std() < 1.5 * gate_expected
     assert 0.5 * down_expected < model.memory.ffn_down.std() < 1.5 * down_expected

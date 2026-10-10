@@ -661,6 +661,8 @@ def token_batches(
     world_size: int = 1,
     start_step: int = 0,
     seed: int = 0,
+    start_sample: int | None = None,
+    permutation_batch: int | None = None,
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
     """Yield equal-sized distributed batches with deterministic epoch shuffling."""
     if sequence_length <= 0 or batch_size <= 0 or steps < 0:
@@ -672,13 +674,18 @@ def token_batches(
     steps_per_epoch = samples // global_batch
     if steps_per_epoch <= 0:
         raise ValueError("token store is too small for one complete distributed batch")
-    usable_samples = steps_per_epoch * global_batch
+    original_batch = permutation_batch or global_batch
+    usable_samples = (samples // original_batch) * original_batch
     for local_step in range(steps):
         global_step = start_step + local_step
-        epoch, step_in_epoch = divmod(global_step, steps_per_epoch)
-        stride, offset = _permutation_parameters(usable_samples, seed + epoch)
-        first = step_in_epoch * global_batch + rank * batch_size
-        positions = (offset + stride * (first + np.arange(batch_size))) % usable_samples
+        first = ((start_sample + local_step * global_batch) if start_sample is not None
+                 else global_step * global_batch) + rank * batch_size
+        indices = first + np.arange(batch_size)
+        positions = np.empty(batch_size, dtype=np.int64)
+        for epoch in np.unique(indices // usable_samples):
+            mask = indices // usable_samples == epoch
+            stride, offset = _permutation_parameters(usable_samples, seed + int(epoch))
+            positions[mask] = (offset + stride * (indices[mask] % usable_samples)) % usable_samples
         inputs = np.empty((batch_size, sequence_length), dtype=np.int64)
         labels = np.empty((batch_size, sequence_length), dtype=np.int64)
         for row, sample in enumerate(positions.tolist()):
