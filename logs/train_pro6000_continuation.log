@@ -1,0 +1,81 @@
+W1008 03:11:37.815000 39327 torch/distributed/run.py:982] 
+W1008 03:11:37.815000 39327 torch/distributed/run.py:982] *****************************************
+W1008 03:11:37.815000 39327 torch/distributed/run.py:982] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1008 03:11:37.815000 39327 torch/distributed/run.py:982] *****************************************
+/home/src/dllm/.venv-pro6000/lib/python3.10/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+resume_data samples_consumed=535590 permutation_batch=11
+start step=16230 target_steps=25000 params=1,092,383,232 vocab=151665 global_tokens_per_step=335,872 lr=1.500e-04 warmup_steps=300 min_lr_ratio=0.100 precision=amp fsdp=False checkpoint=data/checkpoints/pro6000-continuation.pt schedule_steps=25000 max_runtime_h=48.0
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.84 total_gib=94.97gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.51 peak_gib=85.79 total_gib=94.97
+
+step=16231 loss=2.57955 lr=5.579e-05 rl_min=1.005 rl_max=2.675 rb_dead=0/24 rb_max=0.3096 rb_min=0.1357 rb_ent=2.229 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.84 tokens_per_s=8556.4
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.51 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.76 total_gib=94.97
+step=16232 loss=2.44840 lr=5.578e-05 rl_min=1.005 rl_max=2.679 rb_dead=0/24 rb_max=0.3044 rb_min=0.1351 rb_ent=2.230 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.76 tokens_per_s=8784.4
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.51 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.71 total_gib=94.97
+step=16233 loss=2.54404 lr=5.577e-05 rl_min=1.005 rl_max=2.691 rb_dead=0/24 rb_max=0.3079 rb_min=0.1358 rb_ent=2.229 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.71 tokens_per_s=8735.5
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.51 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.71 total_gib=94.97
+step=16234 loss=2.61441 lr=5.576e-05 rl_min=1.006 rl_max=2.708 rb_dead=0/24 rb_max=0.3087 rb_min=0.1353 rb_ent=2.229 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.71 tokens_per_s=8762.3
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.51 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.72 total_gib=94.97
+step=16235 loss=2.52273 lr=5.575e-05 rl_min=1.006 rl_max=2.671 rb_dead=0/24 rb_max=0.3050 rb_min=0.1367 rb_ent=2.230 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.72 tokens_per_s=8735.0
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.51 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.75 total_gib=94.97
+step=16236 loss=2.47099 lr=5.575e-05 rl_min=1.005 rl_max=2.686 rb_dead=0/24 rb_max=0.3050 rb_min=0.1351 rb_ent=2.230 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.75 tokens_per_s=8759.4
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.51 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.76 total_gib=94.97
+step=16237 loss=2.60453 lr=5.574e-05 rl_min=1.006 rl_max=2.680 rb_dead=0/24 rb_max=0.3077 rb_min=0.1354 rb_ent=2.229 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.76 tokens_per_s=8733.7
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.51 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.75 total_gib=94.97
+step=16238 loss=2.52893 lr=5.573e-05 rl_min=1.006 rl_max=2.656 rb_dead=0/24 rb_max=0.3056 rb_min=0.1350 rb_ent=2.230 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.75 tokens_per_s=8767.2
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.51 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.77 total_gib=94.97
+step=16239 loss=2.54620 lr=5.572e-05 rl_min=1.005 rl_max=2.679 rb_dead=0/24 rb_max=0.3051 rb_min=0.1358 rb_ent=2.230 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.77 tokens_per_s=8760.8
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.64 total_gib=94.97
+step=16240 loss=2.43356 lr=5.571e-05 rl_min=1.005 rl_max=2.683 rb_dead=0/24 rb_max=0.3066 rb_min=0.1366 rb_ent=2.230 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.64 tokens_per_s=8648.1
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.76 total_gib=94.97
+step=16241 loss=2.43679 lr=5.570e-05 rl_min=1.006 rl_max=2.687 rb_dead=0/24 rb_max=0.3057 rb_min=0.1363 rb_ent=2.230 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.76 tokens_per_s=8690.2
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.69 total_gib=94.97
+step=16242 loss=2.52752 lr=5.570e-05 rl_min=1.005 rl_max=2.674 rb_dead=0/24 rb_max=0.3076 rb_min=0.1357 rb_ent=2.230 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.69 tokens_per_s=8755.3
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.67 total_gib=94.97
+step=16243 loss=2.53583 lr=5.569e-05 rl_min=1.005 rl_max=2.671 rb_dead=0/24 rb_max=0.3067 rb_min=0.1358 rb_ent=2.230 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.67 tokens_per_s=8727.6
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.72 total_gib=94.97
+step=16244 loss=2.55890 lr=5.568e-05 rl_min=1.005 rl_max=2.711 rb_dead=0/24 rb_max=0.3045 rb_min=0.1367 rb_ent=2.230 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.72 tokens_per_s=8752.3
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.71 total_gib=94.97
+step=16245 loss=2.55643 lr=5.567e-05 rl_min=1.005 rl_max=2.694 rb_dead=0/24 rb_max=0.3059 rb_min=0.1347 rb_ent=2.230 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.71 tokens_per_s=8720.3
+gpu_memory rank=1 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.79 total_gib=94.97
+gpu_memory rank=0 allocated_gib=16.34 reserved_gib=86.66 peak_gib=85.72 total_gib=94.97
+step=16246 loss=2.54144 lr=5.566e-05 rl_min=1.005 rl_max=2.674 rb_dead=0/24 rb_max=0.3051 rb_min=0.1372 rb_ent=2.230 exit=off ro=absent md=8 alloc_gib=16.34 reserved_gib=86.66 peak_gib=85.72 tokens_per_s=8751.5
+W1008 03:22:37.070000 39327 torch/distributed/elastic/agent/server/api.py:753] Received Signals.SIGTERM death signal, shutting down workers
+W1008 03:22:37.070000 39327 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 39364 closing signal SIGTERM
+W1008 03:22:37.070000 39327 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 39365 closing signal SIGTERM
+Traceback (most recent call last):
+  File "/home/src/dllm/.venv-pro6000/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+  File "/home/src/dllm/.venv-pro6000/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 380, in wrapper
+    return f(*args, **kwargs)
+  File "/home/src/dllm/.venv-pro6000/lib/python3.10/site-packages/torch/distributed/run.py", line 1138, in main
+    run(args)
+  File "/home/src/dllm/.venv-pro6000/lib/python3.10/site-packages/torch/distributed/run.py", line 1129, in run
+    elastic_launch(
+  File "/home/src/dllm/.venv-pro6000/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 197, in __call__
+    return launch_agent(
+  File "/home/src/dllm/.venv-pro6000/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 377, in launch_agent
+    result = agent.run()
+  File "/home/src/dllm/.venv-pro6000/lib/python3.10/site-packages/torch/distributed/elastic/metrics/api.py", line 134, in wrapper
+    result = f(*args, **kwargs)
+  File "/home/src/dllm/.venv-pro6000/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 745, in run
+    result = self._invoke_run(role)
+  File "/home/src/dllm/.venv-pro6000/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 923, in _invoke_run
+    time.sleep(monitor_interval)
+  File "/home/src/dllm/.venv-pro6000/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/api.py", line 86, in _terminate_process_handler
+    raise SignalException(f"Process {os.getpid()} got signal: {sigval}", sigval=sigval)
+torch.distributed.elastic.multiprocessing.api.SignalException: Process 39327 got signal: 15

@@ -1,0 +1,32 @@
+W0807 01:40:36.312000 300686 torch/distributed/run.py:874] 
+W0807 01:40:36.312000 300686 torch/distributed/run.py:874] *****************************************
+W0807 01:40:36.312000 300686 torch/distributed/run.py:874] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0807 01:40:36.312000 300686 torch/distributed/run.py:874] *****************************************
+start step=0 target_steps=1400 params=1,092,383,232 vocab=151665 global_tokens_per_step=73,728 lr=2.500e-04 warmup_steps=100 min_lr_ratio=0.100 precision=bf16 fsdp=True checkpoint=datasets/checkpoints/memory-transformer-12h.pt
+step=1 loss=11.93932 router=1.00822 grad=0.79969 lr=5.000e-06 elapsed_h=0.008 tokens_per_s=2416.3 alloc_gib=10.81 reserved_gib=93.02 peak_gib=69.56
+step=10 loss=11.91774 router=1.01282 grad=0.75383 lr=2.750e-05 elapsed_h=0.083 tokens_per_s=2463.2 alloc_gib=10.81 reserved_gib=93.03 peak_gib=73.65
+W0807 01:47:05.237000 300686 torch/distributed/elastic/agent/server/api.py:753] Received Signals.SIGTERM death signal, shutting down workers
+W0807 01:47:05.238000 300686 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 300723 closing signal SIGTERM
+W0807 01:47:05.238000 300686 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 300724 closing signal SIGTERM
+Traceback (most recent call last):
+  File "/home/src/dllm/.venv/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+    return f(*args, **kwargs)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/run.py", line 1028, in main
+    run(args)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/run.py", line 1019, in run
+    elastic_launch(
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 194, in __call__
+    return launch_agent(
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 374, in launch_agent
+    result = agent.run()
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/metrics/api.py", line 134, in wrapper
+    result = f(*args, **kwargs)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 745, in run
+    result = self._invoke_run(role)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 923, in _invoke_run
+    time.sleep(monitor_interval)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/api.py", line 86, in _terminate_process_handler
+    raise SignalException(f"Process {os.getpid()} got signal: {sigval}", sigval=sigval)
+torch.distributed.elastic.multiprocessing.api.SignalException: Process 300686 got signal: 15

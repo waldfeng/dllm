@@ -1,0 +1,67 @@
+[2026-10-10 00:19:54] watchdog START log=logs/joint_scratch_1epoch.log floor=19577MiB stall=900s poll=10s hourly_exit=3600s
+[2026-10-10 00:24:05] STEP CHECK-IN step=540 (every 10 steps)
+joint step=540 lossB_ce=5.49627 lossA=3.00650 depth=16.02 E[t]=15.34 w=0.650,0.050,0.050,0.050,0.150,0.050 grad=0.371 skipped=0 oom=0 lrB=1.352e-04 lrA=9.017e-05 peak=82.5GiB mem=16.3/95GiB(17%) elapsed_h=11.477
+0, 96921 MiB, 100 %
+1, 92929 MiB, 100 %
+steps_logged=503 elapsed_h=11.48 step_s=82.1
+B_CE: init=11.895 -100steps=5.948 now=5.496
+lossA: init=3.6729 now=3.0065
+depth: init=20.11 -100steps=14.47 now=16.02 E[t]=15.34
+grad=0.371 lrB=1.35e-04 lrA=9.02e-05 peak=82.5GiB oom=0 skipped=0
+A1=0.4684 A2=2.5381 entropy=0.944311
+depth_hist(recent 32000 samples, both GPUs): 7:1 8:15 9:4 10:1989 11:105 12:2113 13:2108 14:7034 15:10035 16:632 17:53 18:6221 19:12 20:266 21:1 22:148 23:1147 24:116
+[2026-10-10 00:38:19] STEP CHECK-IN step=550 (every 10 steps)
+joint step=550 lossB_ce=5.50387 lossA=3.00305 depth=15.67 E[t]=15.42 w=0.650,0.050,0.050,0.050,0.150,0.050 grad=0.395 skipped=0 oom=0 lrB=1.377e-04 lrA=9.183e-05 peak=82.4GiB mem=16.3/95GiB(17%) elapsed_h=11.713
+0, 96921 MiB, 100 %
+1, 92929 MiB, 100 %
+steps_logged=513 elapsed_h=11.71 step_s=82.2
+B_CE: init=11.895 -100steps=5.816 now=5.504
+lossA: init=3.6729 now=3.0030
+depth: init=20.11 -100steps=14.22 now=15.67 E[t]=15.42
+grad=0.395 lrB=1.38e-04 lrA=9.18e-05 peak=82.4GiB oom=0 skipped=0
+A1=0.4661 A2=2.5369 entropy=0.943025
+depth_hist(recent 32000 samples, both GPUs): 7:1 8:14 9:4 10:1639 11:36 12:1971 13:1795 14:7895 15:9281 16:634 17:46 18:6994 19:7 20:223 21:1 22:171 23:1173 24:115
+[2026-10-10 00:52:13] STEP CHECK-IN step=560 (every 10 steps)
+joint step=560 lossB_ce=5.50944 lossA=2.98525 depth=16.04 E[t]=15.45 w=0.650,0.050,0.050,0.050,0.150,0.050 grad=0.373 skipped=0 oom=0 lrB=1.402e-04 lrA=9.350e-05 peak=85.8GiB mem=16.3/95GiB(17%) elapsed_h=11.946
+0, 96921 MiB, 100 %
+1, 92929 MiB, 100 %
+steps_logged=523 elapsed_h=11.95 step_s=82.2
+B_CE: init=11.895 -100steps=5.820 now=5.509
+lossA: init=3.6729 now=2.9853
+depth: init=20.11 -100steps=14.64 now=16.04 E[t]=15.45
+grad=0.373 lrB=1.40e-04 lrA=9.35e-05 peak=85.8GiB oom=0 skipped=0
+A1=0.4643 A2=2.5209 entropy=0.943741
+depth_hist(recent 32000 samples, both GPUs): 7:1 8:13 9:5 10:1332 11:27 12:1825 13:1496 14:8473 15:8603 16:622 17:36 18:7831 19:5 20:215 22:200 23:1199 24:117
+[2026-10-10 01:05:57] STEP CHECK-IN step=570 (every 10 steps)
+joint step=570 lossB_ce=5.41102 lossA=2.98411 depth=15.94 E[t]=15.43 w=0.650,0.050,0.050,0.050,0.150,0.050 grad=0.554 skipped=0 oom=0 lrB=1.427e-04 lrA=9.517e-05 peak=84.1GiB mem=16.3/95GiB(17%) elapsed_h=12.175
+0, 96921 MiB, 100 %
+1, 92929 MiB, 100 %
+steps_logged=533 elapsed_h=12.18 step_s=82.2
+B_CE: init=11.895 -100steps=5.653 now=5.411
+lossA: init=3.6729 now=2.9841
+depth: init=20.11 -100steps=14.30 now=15.94 E[t]=15.43
+grad=0.554 lrB=1.43e-04 lrA=9.52e-05 peak=84.1GiB oom=0 skipped=0
+A1=0.4603 A2=2.5238 entropy=0.943540
+depth_hist(recent 32000 samples, both GPUs): 7:1 8:15 9:7 10:1114 11:23 12:1813 13:1124 14:8981 15:7579 16:605 17:36 18:8952 19:6 20:198 22:238 23:1199 24:109
+[2026-10-10 01:19:41] STEP CHECK-IN step=580 (every 10 steps)
+joint step=580 lossB_ce=5.37827 lossA=2.96847 depth=16.11 E[t]=15.48 w=0.650,0.050,0.050,0.050,0.150,0.050 grad=0.380 skipped=0 oom=0 lrB=1.453e-04 lrA=9.683e-05 peak=82.4GiB mem=16.3/95GiB(17%) elapsed_h=12.403
+0, 96921 MiB, 100 %
+1, 92929 MiB, 100 %
+steps_logged=543 elapsed_h=12.40 step_s=82.2
+B_CE: init=11.895 -100steps=5.673 now=5.378
+lossA: init=3.6729 now=2.9685
+depth: init=20.11 -100steps=14.24 now=16.11 E[t]=15.48
+grad=0.380 lrB=1.45e-04 lrA=9.68e-05 peak=82.4GiB oom=0 skipped=0
+A1=0.4639 A2=2.5046 entropy=0.943027
+depth_hist(recent 32000 samples, both GPUs): 8:14 9:8 10:899 11:25 12:1816 13:794 14:9384 15:6500 16:581 17:35 18:10128 19:8 20:185 22:310 23:1213 24:100
+[2026-10-10 01:20:02] HOURLY CHECK-IN (routine)
+joint step=580 lossB_ce=5.37827 lossA=2.96847 depth=16.11 E[t]=15.48 w=0.650,0.050,0.050,0.050,0.150,0.050 grad=0.380 skipped=0 oom=0 lrB=1.453e-04 lrA=9.683e-05 peak=82.4GiB mem=16.3/95GiB(17%) elapsed_h=12.403
+  GPU 0, 96921 MiB, 100 %
+  GPU 1, 92929 MiB, 100 %
+steps_logged=543 elapsed_h=12.40 step_s=82.2
+B_CE: init=11.895 -100steps=5.673 now=5.378
+lossA: init=3.6729 now=2.9685
+depth: init=20.11 -100steps=14.24 now=16.11 E[t]=15.48
+grad=0.380 lrB=1.45e-04 lrA=9.68e-05 peak=82.4GiB oom=0 skipped=0
+A1=0.4430 A2=2.4949 entropy=0.940470
+depth_hist(recent 32000 samples, both GPUs): 8:14 9:8 10:899 11:25 12:1816 13:794 14:9384 15:6500 16:581 17:35 18:10128 19:8 20:185 22:310 23:1213 24:100

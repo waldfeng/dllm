@@ -1,0 +1,48 @@
+W0819 06:11:47.758000 7330 torch/distributed/run.py:874] 
+W0819 06:11:47.758000 7330 torch/distributed/run.py:874] *****************************************
+W0819 06:11:47.758000 7330 torch/distributed/run.py:874] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0819 06:11:47.758000 7330 torch/distributed/run.py:874] *****************************************
+/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/fsdp/fully_sharded_data_parallel.py:821: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  prev_state_dict_settings = FullyShardedDataParallel.set_state_dict_type(
+/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/fsdp/fully_sharded_data_parallel.py:821: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  prev_state_dict_settings = FullyShardedDataParallel.set_state_dict_type(
+/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/fsdp/fully_sharded_data_parallel.py:828: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  FullyShardedDataParallel.set_state_dict_type(
+/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/fsdp/fully_sharded_data_parallel.py:828: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  FullyShardedDataParallel.set_state_dict_type(
+start step=30115 target_steps=33080 params=1,092,383,232 vocab=151665 global_tokens_per_step=65,536 lr=5.000e-05 warmup_steps=80 min_lr_ratio=0.500 precision=bf16 fsdp=True checkpoint=datasets/checkpoints/memory-transformer-24h-router03.pt schedule_steps=33080 max_runtime_h=24.0 resume_lr=2.400e-05
+step=30120 loss=3.09759 router=1.59791 grad=0.36397 lr=2.563e-05 elapsed_h=0.041 tokens_per_s=2223.5 alloc_gib=10.52 reserved_gib=90.31 peak_gib=66.44
+step=30130 loss=3.22723 router=1.62409 grad=0.37360 lr=2.888e-05 elapsed_h=0.122 tokens_per_s=2247.5 alloc_gib=10.52 reserved_gib=90.31 peak_gib=66.43
+step=30140 loss=3.30787 router=1.64333 grad=0.38095 lr=3.213e-05 elapsed_h=0.202 tokens_per_s=2261.2 alloc_gib=10.52 reserved_gib=90.31 peak_gib=66.44
+step=30150 loss=2.95691 router=1.59280 grad=0.37364 lr=3.538e-05 elapsed_h=0.283 tokens_per_s=2258.1 alloc_gib=10.52 reserved_gib=90.31 peak_gib=66.43
+step=30160 loss=3.18328 router=1.60145 grad=0.38456 lr=3.863e-05 elapsed_h=0.364 tokens_per_s=2251.2 alloc_gib=10.52 reserved_gib=90.31 peak_gib=66.46
+step=30170 loss=3.18415 router=1.62067 grad=0.38027 lr=4.188e-05 elapsed_h=0.445 tokens_per_s=2258.5 alloc_gib=10.52 reserved_gib=90.31 peak_gib=66.45
+step=30180 loss=2.92501 router=1.59853 grad=0.36145 lr=4.513e-05 elapsed_h=0.525 tokens_per_s=2256.9 alloc_gib=10.52 reserved_gib=90.31 peak_gib=66.44
+step=30190 loss=3.01488 router=1.62444 grad=0.42522 lr=4.838e-05 elapsed_h=0.606 tokens_per_s=2253.5 alloc_gib=10.52 reserved_gib=90.32 peak_gib=66.44
+W0819 06:49:21.550000 7330 torch/distributed/elastic/agent/server/api.py:753] Received Signals.SIGTERM death signal, shutting down workers
+W0819 06:49:21.550000 7330 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 7368 closing signal SIGTERM
+W0819 06:49:21.550000 7330 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 7369 closing signal SIGTERM
+Traceback (most recent call last):
+  File "/home/src/dllm/.venv/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+    return f(*args, **kwargs)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/run.py", line 1028, in main
+    run(args)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/run.py", line 1019, in run
+    elastic_launch(
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 194, in __call__
+    return launch_agent(
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 374, in launch_agent
+    result = agent.run()
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/metrics/api.py", line 134, in wrapper
+    result = f(*args, **kwargs)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 745, in run
+    result = self._invoke_run(role)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 923, in _invoke_run
+    time.sleep(monitor_interval)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/api.py", line 86, in _terminate_process_handler
+    raise SignalException(f"Process {os.getpid()} got signal: {sigval}", sigval=sigval)
+torch.distributed.elastic.multiprocessing.api.SignalException: Process 7330 got signal: 15

@@ -1,0 +1,8 @@
+init_weights loaded from /home/datasets/dllm/datasets/checkpoints/memory-transformer-24h-router03.pt (model weights only; optimizer and schedule restart at step 0)
+start step=0 target_steps=25000 params=1,092,383,232 vocab=151665 global_tokens_per_step=67,584 lr=1.500e-04 warmup_steps=300 min_lr_ratio=0.100 precision=amp fsdp=False checkpoint=/home/datasets/dllm/datasets/checkpoints/memory-transformer-5090-continuation.pt schedule_steps=25000 max_runtime_h=0.0
+step=1 loss=7.05284 router=2.28431 grad=5.76242 lr=1.000e-06 elapsed_h=0.009 tokens_per_s=2035.6 alloc_gib=12.22 reserved_gib=20.97 peak_gib=20.38
+step=10 loss=6.99621 router=2.28749 grad=2.69019 lr=5.500e-06 elapsed_h=0.092 tokens_per_s=2043.2 alloc_gib=12.22 reserved_gib=28.93 peak_gib=28.58
+step=20 loss=6.47773 router=2.26850 grad=2.91199 lr=1.050e-05 elapsed_h=0.184 tokens_per_s=2035.3 alloc_gib=12.22 reserved_gib=28.70 peak_gib=28.55
+step=30 loss=6.15947 router=2.23543 grad=2.19888 lr=1.550e-05 elapsed_h=0.275 tokens_per_s=2063.6 alloc_gib=12.22 reserved_gib=28.77 peak_gib=28.55
+step=40 loss=6.02235 router=2.22878 grad=1.57756 lr=2.050e-05 elapsed_h=0.366 tokens_per_s=2055.5 alloc_gib=12.22 reserved_gib=28.68 peak_gib=28.59
+step=50 loss=5.53317 router=2.19945 grad=1.28581 lr=2.550e-05 elapsed_h=0.458 tokens_per_s=2041.6 alloc_gib=12.22 reserved_gib=28.77 peak_gib=28.58

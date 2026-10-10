@@ -1,0 +1,10 @@
+[2026-09-28 03:29:17] status: alive=0 fresh=0 last_step=363 recent_errs_total=12
+[2026-09-28 03:29:17] last: joint step=363 lossB_ce=6.61367 lossA=2.21955 depth=7.00 E[t]=13.20 w=0.000,0.149,0.151,0.101,0.447,0.151 grad=0.750 skipped=0 lrB=9.999e-05 lrA=1.250e-05 peak=73.2GiB elapsed_h=0.125
+[2026-09-28 03:29:17] watchdog: problem detected (process dead), attempting repair 1/2
+[2026-09-28 03:29:27] watchdog: OOM seen, relaunching with batch-size 8
+[2026-09-28 03:36:27] watchdog: repair attempt 1 did not produce progress
+[2026-09-28 03:36:27] watchdog: problem detected (log stale >15min (hang)), attempting repair 2/2
+temp/watchdog_check.sh: line 113:  3528 Killed                  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid nohup .venv/bin/torchrun --standalone --nproc_per_node=2 train.py --train-exit-joint --resume "$CKPT" --checkpoint "$CKPT" --dataset-dir data/tokens_v2 --sequence-length 2048 --batch-size "$1" --gradient-accumulation 2 --steps 41000 --schedule-steps 41000 --warmup-steps 100 --lr 1e-4 --exit-min-depth 6 --loss-weight-prior "0.0,0.15,0.15,0.10,0.45,0.15" --exit-joint-readout-lr 1.25e-5 --log-steps 1 --save-steps 250 --save-interval-hours 0.5 --max-runtime-hours 48 >> "$LOG" 2>&1 < /dev/null
+[2026-09-28 03:36:37] watchdog: OOM seen, relaunching with batch-size 8
+[2026-09-28 03:43:37] watchdog: repair attempt 2 did not produce progress
+[2026-09-28 03:43:37] watchdog: STILL BROKEN after 2 repair attempts, giving up

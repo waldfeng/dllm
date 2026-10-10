@@ -1,0 +1,43 @@
+{
+  "mode": "reuse",
+  "depth": 16,
+  "device": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "measurements": [
+    {
+      "step": 0,
+      "loss_a": 1.242287516593933,
+      "loss_b": 8.258739471435547,
+      "grad_norm": 4.967561721801758,
+      "seconds": 3.350646871000208,
+      "peak_allocated_gib": 38.56598138809204,
+      "peak_reserved_gib": 39.771484375
+    },
+    {
+      "step": 1,
+      "loss_a": 1.291353702545166,
+      "loss_b": 8.278249740600586,
+      "grad_norm": 3.2598001956939697,
+      "seconds": 2.036893517997669,
+      "peak_allocated_gib": 41.861690521240234,
+      "peak_reserved_gib": 43.814453125
+    },
+    {
+      "step": 2,
+      "loss_a": 1.2106671333312988,
+      "loss_b": 8.072632789611816,
+      "grad_norm": 2.82086443901062,
+      "seconds": 2.2341432260000147,
+      "peak_allocated_gib": 44.32279062271118,
+      "peak_reserved_gib": 45.494140625
+    },
+    {
+      "step": 3,
+      "loss_a": 1.221130132675171,
+      "loss_b": 8.168575286865234,
+      "grad_norm": 4.509714126586914,
+      "seconds": 3.1806574519978312,
+      "peak_allocated_gib": 50.470948219299316,
+      "peak_reserved_gib": 51.494140625
+    }
+  ]
+}

@@ -1,0 +1,1065 @@
+{
+  "format": "uint32_token_shards_v1",
+  "tokenizer": "tokenizer/qwen",
+  "vocab_size": 151665,
+  "eos_token_id": 151643,
+  "input_dir": "data/text_v2",
+  "total_tokens": 19942189733,
+  "documents": 25090998,
+  "min_tokens": 10000000000,
+  "max_tokens": null,
+  "shards": [
+    {
+      "path": "train-00000.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00001.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00002.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00003.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00004.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00005.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00006.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00007.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00008.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00009.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00010.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00011.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00012.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00013.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00014.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00015.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00016.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00017.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00018.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00019.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00020.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00021.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00022.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00023.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00024.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00025.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00026.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00027.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00028.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00029.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00030.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00031.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00032.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00033.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00034.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00035.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00036.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00037.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00038.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00039.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00040.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00041.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00042.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00043.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00044.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00045.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00046.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00047.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00048.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00049.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00050.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00051.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00052.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00053.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00054.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00055.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00056.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00057.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00058.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00059.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00060.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00061.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00062.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00063.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00064.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00065.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00066.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00067.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00068.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00069.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00070.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00071.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00072.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00073.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00074.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00075.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00076.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00077.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00078.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00079.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00080.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00081.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00082.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00083.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00084.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00085.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00086.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00087.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00088.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00089.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00090.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00091.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00092.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00093.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00094.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00095.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00096.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00097.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00098.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00099.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00100.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00101.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00102.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00103.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00104.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00105.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00106.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00107.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00108.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00109.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00110.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00111.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00112.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00113.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00114.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00115.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00116.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00117.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00118.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00119.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00120.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00121.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00122.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00123.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00124.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00125.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00126.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00127.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00128.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00129.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00130.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00131.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00132.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00133.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00134.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00135.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00136.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00137.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00138.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00139.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00140.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00141.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00142.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00143.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00144.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00145.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00146.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00147.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00148.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00149.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00150.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00151.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00152.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00153.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00154.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00155.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00156.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00157.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00158.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00159.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00160.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00161.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00162.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00163.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00164.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00165.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00166.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00167.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00168.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00169.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00170.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00171.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00172.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00173.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00174.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00175.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00176.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00177.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00178.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00179.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00180.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00181.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00182.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00183.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00184.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00185.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00186.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00187.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00188.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00189.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00190.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00191.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00192.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00193.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00194.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00195.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00196.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00197.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00198.bin",
+      "tokens": 100000000
+    },
+    {
+      "path": "train-00199.bin",
+      "tokens": 42189733
+    }
+  ],
+  "source_documents": {
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000000_processed.jsonl.zst": 61000,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000001_processed.jsonl.zst": 90301,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000002_processed.jsonl.zst": 92902,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000003_processed.jsonl.zst": 98889,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000004_processed.jsonl.zst": 88509,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000005_processed.jsonl.zst": 85468,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000006_processed.jsonl.zst": 95952,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000007_processed.jsonl.zst": 85384,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000008_processed.jsonl.zst": 105479,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000009_processed.jsonl.zst": 77316,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000010_processed.jsonl.zst": 84302,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000011_processed.jsonl.zst": 100020,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000012_processed.jsonl.zst": 89134,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000013_processed.jsonl.zst": 92212,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000014_processed.jsonl.zst": 92065,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000015_processed.jsonl.zst": 86683,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000016_processed.jsonl.zst": 57698,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000017_processed.jsonl.zst": 87034,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000018_processed.jsonl.zst": 95163,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000019_processed.jsonl.zst": 84709,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000020_processed.jsonl.zst": 115591,
+    "AI-ModelScope__fineweb-edu__data__CC-MAIN-2013-20__train-00000-of-00014.parquet": 785906,
+    "AI-ModelScope__fineweb-edu__data__CC-MAIN-2013-20__train-00001-of-00014.parquet": 785906,
+    "AI-ModelScope__fineweb-edu__data__CC-MAIN-2013-20__train-00002-of-00014.parquet": 785905,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00000-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00001-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00002-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00003-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00004-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00005-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00006-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00007-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00008-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00009-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00010-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00011-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00012-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00013-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00014-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00015-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00016-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00017-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00018-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00019-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00020-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00021-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00022-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00023-of-00045.parquet": 240029,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00024-of-00045.parquet": 240029,
+    "GAIR__MathPile__train__arXiv__math_arXiv_v0.2_chunk_1.jsonl.gz": 100000,
+    "GAIR__MathPile__train__commoncrawl__C4_math_docs_chunk_0.jsonl.gz": 4155,
+    "GAIR__MathPile__train__proofwiki__ProofWiki_definitions.jsonl.gz": 10225,
+    "GAIR__MathPile__train__proofwiki__ProofWiki_theorem_proofs.jsonl.gz": 13376,
+    "GAIR__MathPile__train__stackexchange__cs.stackexchange.com.jsonl.gz": 4768,
+    "GAIR__MathPile__train__stackexchange__cstheory.stackexchange.com.jsonl.gz": 4440,
+    "GAIR__MathPile__train__stackexchange__datascience.stackexchange.com.jsonl.gz": 2399,
+    "GAIR__MathPile__train__stackexchange__hsm.stackexchange.com.jsonl.gz": 1252,
+    "GAIR__MathPile__train__stackexchange__math.stackexchange.com.jsonl.gz": 110929,
+    "GAIR__MathPile__train__stackexchange__matheducators.stackexchange.com.jsonl.gz": 1937,
+    "GAIR__MathPile__train__stackexchange__mathematica.stackexchange.com.jsonl.gz": 19856,
+    "GAIR__MathPile__train__stackexchange__mathoverflow.net.jsonl.gz": 40933,
+    "GAIR__MathPile__train__stackexchange__physics.stackexchange.com.jsonl.gz": 24054,
+    "GAIR__MathPile__train__stackexchange__proofassistants.stackexchange.com.jsonl.gz": 320,
+    "GAIR__MathPile__train__stackexchange__tex.stackexchange.com.jsonl.gz": 53762,
+    "GAIR__MathPile__train__textbooks__synthetic_textbooks_markdown.jsonl.gz": 3088,
+    "GAIR__MathPile__train__textbooks__textbooks_markdown.jsonl.gz": 852,
+    "allenai__peS2o__data__v3__train-0000-of-0136.zst": 1046455,
+    "allenai__peS2o__data__v3__train-0001-of-0136.zst": 1081142,
+    "allenai__peS2o__data__v3__train-0002-of-0136.zst": 1164710,
+    "allenai__peS2o__data__v3__train-0003-of-0136.zst": 1188351,
+    "allenai__peS2o__data__v3__train-0004-of-0136.zst": 1177004,
+    "allenai__peS2o__data__v3__train-0005-of-0136.zst": 1103604,
+    "allenai__peS2o__data__v3__train-0030-of-0136.zst": 5029,
+    "allenai__peS2o__data__v3__train-0053-of-0136.zst": 29673,
+    "m-a-p__MAP-CC__zh_baike.jsonl.gz.part01": 3040159,
+    "tiiuae__falcon-refinedweb__data__train-00000-of-05534-b8fc5348cbe605a5.parquet": 174917,
+    "tiiuae__falcon-refinedweb__data__train-00001-of-05534-9bca3ce859516338.parquet": 174915,
+    "tiiuae__falcon-refinedweb__data__train-00002-of-05534-01680948bd81de83.parquet": 174917,
+    "tiiuae__falcon-refinedweb__data__train-00003-of-05534-b7806bb8ca893c23.parquet": 174917,
+    "tiiuae__falcon-refinedweb__data__train-00004-of-05534-cbe1137f523084a7.parquet": 174918,
+    "tiiuae__falcon-refinedweb__data__train-00005-of-05534-e4a5eae6c1419c9b.parquet": 174916,
+    "tiiuae__falcon-refinedweb__data__train-00006-of-05534-5bc49be138fd315b.parquet": 174917,
+    "tiiuae__falcon-refinedweb__data__train-00007-of-05534-c185da59aece723d.parquet": 174917,
+    "tiiuae__falcon-refinedweb__data__train-00008-of-05534-8ed029166c6795cf.parquet": 174916,
+    "tiiuae__falcon-refinedweb__data__train-00009-of-05534-f0954d1648b16e88.parquet": 174918,
+    "tiiuae__falcon-refinedweb__data__train-00010-of-05534-5373970b3705bfc5.parquet": 174915,
+    "tiiuae__falcon-refinedweb__data__train-00011-of-05534-7d7970b7bb98922c.parquet": 174919,
+    "tiiuae__falcon-refinedweb__data__train-00012-of-05534-acf3fb5fee2b7e50.parquet": 174917,
+    "tiiuae__falcon-refinedweb__data__train-00013-of-05534-a2a70ea6a8536f67.parquet": 174916,
+    "tiiuae__falcon-refinedweb__data__train-00411-of-05534-681afaed81e4d907.parquet": 174915,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0000.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0001.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0002.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0003.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0004.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0005.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0006.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0007.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0008.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0009.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0010.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0011.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0012.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0013.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0014.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0015.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0016.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0017.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0018.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0019.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0020.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0021.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0022.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0023.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0024.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0025.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0026.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0027.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0028.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0029.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0030.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0031.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0032.json.zst": 59133,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0033.json.zst": 59133
+  },
+  "source_tokens": {
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000000_processed.jsonl.zst": 74750913,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000001_processed.jsonl.zst": 114988106,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000002_processed.jsonl.zst": 123345136,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000003_processed.jsonl.zst": 124515453,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000004_processed.jsonl.zst": 109685223,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000005_processed.jsonl.zst": 99308364,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000006_processed.jsonl.zst": 111090720,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000007_processed.jsonl.zst": 102110611,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000008_processed.jsonl.zst": 134277116,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000009_processed.jsonl.zst": 96200884,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000010_processed.jsonl.zst": 101844499,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000011_processed.jsonl.zst": 134906280,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000012_processed.jsonl.zst": 110402059,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000013_processed.jsonl.zst": 108538619,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000014_processed.jsonl.zst": 114607350,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000015_processed.jsonl.zst": 107921004,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000016_processed.jsonl.zst": 68614023,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000017_processed.jsonl.zst": 105016479,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000018_processed.jsonl.zst": 111039951,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000019_processed.jsonl.zst": 102843769,
+    "AI-ModelScope__dclm-baseline-1.0__global-shard_01_of_10__local-shard_0_of_10__shard_00000020_processed.jsonl.zst": 149698163,
+    "AI-ModelScope__fineweb-edu__data__CC-MAIN-2013-20__train-00000-of-00014.parquet": 833477441,
+    "AI-ModelScope__fineweb-edu__data__CC-MAIN-2013-20__train-00001-of-00014.parquet": 836509575,
+    "AI-ModelScope__fineweb-edu__data__CC-MAIN-2013-20__train-00002-of-00014.parquet": 833094829,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00000-of-00045.parquet": 216264585,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00001-of-00045.parquet": 212056812,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00002-of-00045.parquet": 214051003,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00003-of-00045.parquet": 212216502,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00004-of-00045.parquet": 214179440,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00005-of-00045.parquet": 212345434,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00006-of-00045.parquet": 210189735,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00007-of-00045.parquet": 217489817,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00008-of-00045.parquet": 212227648,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00009-of-00045.parquet": 211637702,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00010-of-00045.parquet": 212723190,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00011-of-00045.parquet": 212342138,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00012-of-00045.parquet": 212402698,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00013-of-00045.parquet": 211959626,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00014-of-00045.parquet": 208084482,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00015-of-00045.parquet": 214760525,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00016-of-00045.parquet": 214340863,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00017-of-00045.parquet": 210832120,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00018-of-00045.parquet": 208143207,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00019-of-00045.parquet": 212436940,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00020-of-00045.parquet": 215594528,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00021-of-00045.parquet": 210994707,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00022-of-00045.parquet": 210908995,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00023-of-00045.parquet": 213684403,
+    "AI-ModelScope__starcoderdata__c-sharp__train-00024-of-00045.parquet": 213268180,
+    "GAIR__MathPile__train__arXiv__math_arXiv_v0.2_chunk_1.jsonl.gz": 2382033646,
+    "GAIR__MathPile__train__commoncrawl__C4_math_docs_chunk_0.jsonl.gz": 3127712,
+    "GAIR__MathPile__train__proofwiki__ProofWiki_definitions.jsonl.gz": 1282983,
+    "GAIR__MathPile__train__proofwiki__ProofWiki_theorem_proofs.jsonl.gz": 6131319,
+    "GAIR__MathPile__train__stackexchange__cs.stackexchange.com.jsonl.gz": 3827272,
+    "GAIR__MathPile__train__stackexchange__cstheory.stackexchange.com.jsonl.gz": 3458335,
+    "GAIR__MathPile__train__stackexchange__datascience.stackexchange.com.jsonl.gz": 1599336,
+    "GAIR__MathPile__train__stackexchange__hsm.stackexchange.com.jsonl.gz": 1098951,
+    "GAIR__MathPile__train__stackexchange__math.stackexchange.com.jsonl.gz": 99640194,
+    "GAIR__MathPile__train__stackexchange__matheducators.stackexchange.com.jsonl.gz": 2218628,
+    "GAIR__MathPile__train__stackexchange__mathematica.stackexchange.com.jsonl.gz": 22266599,
+    "GAIR__MathPile__train__stackexchange__mathoverflow.net.jsonl.gz": 41799355,
+    "GAIR__MathPile__train__stackexchange__physics.stackexchange.com.jsonl.gz": 23428947,
+    "GAIR__MathPile__train__stackexchange__proofassistants.stackexchange.com.jsonl.gz": 290036,
+    "GAIR__MathPile__train__stackexchange__tex.stackexchange.com.jsonl.gz": 56298133,
+    "GAIR__MathPile__train__textbooks__synthetic_textbooks_markdown.jsonl.gz": 42187433,
+    "GAIR__MathPile__train__textbooks__textbooks_markdown.jsonl.gz": 147929266,
+    "allenai__peS2o__data__v3__train-0000-of-0136.zst": 291152402,
+    "allenai__peS2o__data__v3__train-0001-of-0136.zst": 300813956,
+    "allenai__peS2o__data__v3__train-0002-of-0136.zst": 324183243,
+    "allenai__peS2o__data__v3__train-0003-of-0136.zst": 330564248,
+    "allenai__peS2o__data__v3__train-0004-of-0136.zst": 327231867,
+    "allenai__peS2o__data__v3__train-0005-of-0136.zst": 307197033,
+    "allenai__peS2o__data__v3__train-0030-of-0136.zst": 31699104,
+    "allenai__peS2o__data__v3__train-0053-of-0136.zst": 188328069,
+    "m-a-p__MAP-CC__zh_baike.jsonl.gz.part01": 1584156966,
+    "tiiuae__falcon-refinedweb__data__train-00000-of-05534-b8fc5348cbe605a5.parquet": 108239372,
+    "tiiuae__falcon-refinedweb__data__train-00001-of-05534-9bca3ce859516338.parquet": 103762226,
+    "tiiuae__falcon-refinedweb__data__train-00002-of-05534-01680948bd81de83.parquet": 101691060,
+    "tiiuae__falcon-refinedweb__data__train-00003-of-05534-b7806bb8ca893c23.parquet": 102848016,
+    "tiiuae__falcon-refinedweb__data__train-00004-of-05534-cbe1137f523084a7.parquet": 105575719,
+    "tiiuae__falcon-refinedweb__data__train-00005-of-05534-e4a5eae6c1419c9b.parquet": 105538644,
+    "tiiuae__falcon-refinedweb__data__train-00006-of-05534-5bc49be138fd315b.parquet": 102086379,
+    "tiiuae__falcon-refinedweb__data__train-00007-of-05534-c185da59aece723d.parquet": 100386009,
+    "tiiuae__falcon-refinedweb__data__train-00008-of-05534-8ed029166c6795cf.parquet": 99562557,
+    "tiiuae__falcon-refinedweb__data__train-00009-of-05534-f0954d1648b16e88.parquet": 102851552,
+    "tiiuae__falcon-refinedweb__data__train-00010-of-05534-5373970b3705bfc5.parquet": 100272652,
+    "tiiuae__falcon-refinedweb__data__train-00011-of-05534-7d7970b7bb98922c.parquet": 103107652,
+    "tiiuae__falcon-refinedweb__data__train-00012-of-05534-acf3fb5fee2b7e50.parquet": 110792393,
+    "tiiuae__falcon-refinedweb__data__train-00013-of-05534-a2a70ea6a8536f67.parquet": 100829904,
+    "tiiuae__falcon-refinedweb__data__train-00411-of-05534-681afaed81e4d907.parquet": 97112347,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0000.json.zst": 51191703,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0001.json.zst": 51643414,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0002.json.zst": 51311008,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0003.json.zst": 52155850,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0004.json.zst": 51104068,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0005.json.zst": 51394509,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0006.json.zst": 51822521,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0007.json.zst": 51406338,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0008.json.zst": 51073401,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0009.json.zst": 52015939,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0010.json.zst": 51054939,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0011.json.zst": 51860720,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0012.json.zst": 50873588,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0013.json.zst": 51325847,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0014.json.zst": 50958857,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0015.json.zst": 51457535,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0016.json.zst": 51451331,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0017.json.zst": 51513786,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0018.json.zst": 51086514,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0019.json.zst": 51880354,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0020.json.zst": 51075111,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0021.json.zst": 51658707,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0022.json.zst": 51504038,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0023.json.zst": 51932431,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0024.json.zst": 51261108,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0025.json.zst": 51462773,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0026.json.zst": 51733504,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0027.json.zst": 51972798,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0028.json.zst": 51205816,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0029.json.zst": 51259877,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0030.json.zst": 51381159,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0031.json.zst": 51496904,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0032.json.zst": 51455443,
+    "whynlp__WuDaoCorpus-200G-shuffled__data__part-0033.json.zst": 51684480
+  }
+}

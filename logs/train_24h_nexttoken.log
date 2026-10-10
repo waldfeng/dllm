@@ -1,0 +1,355 @@
+W0815 16:13:48.146000 3158 torch/distributed/run.py:874] 
+W0815 16:13:48.146000 3158 torch/distributed/run.py:874] *****************************************
+W0815 16:13:48.146000 3158 torch/distributed/run.py:874] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0815 16:13:48.146000 3158 torch/distributed/run.py:874] *****************************************
+/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/fsdp/fully_sharded_data_parallel.py:821: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  prev_state_dict_settings = FullyShardedDataParallel.set_state_dict_type(
+/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/fsdp/fully_sharded_data_parallel.py:821: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  prev_state_dict_settings = FullyShardedDataParallel.set_state_dict_type(
+/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/fsdp/fully_sharded_data_parallel.py:828: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  FullyShardedDataParallel.set_state_dict_type(
+/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/fsdp/fully_sharded_data_parallel.py:828: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  FullyShardedDataParallel.set_state_dict_type(
+start step=21331 target_steps=24300 params=1,092,383,232 vocab=151665 global_tokens_per_step=65,536 lr=1.200e-04 warmup_steps=200 min_lr_ratio=0.200 precision=bf16 fsdp=True checkpoint=datasets/checkpoints/memory-transformer-24h-router03.pt schedule_steps=24300 max_runtime_h=24.0 resume_lr=1.600e-05
+step=21340 loss=5.17305 router=1.51260 grad=1.84193 lr=2.068e-05 elapsed_h=0.073 tokens_per_s=2235.5 alloc_gib=10.52 reserved_gib=90.55 peak_gib=66.44
+step=21350 loss=4.69141 router=1.63799 grad=0.79734 lr=2.588e-05 elapsed_h=0.154 tokens_per_s=2253.9 alloc_gib=10.52 reserved_gib=90.71 peak_gib=66.42
+step=21360 loss=4.08039 router=1.63811 grad=0.55854 lr=3.108e-05 elapsed_h=0.235 tokens_per_s=2261.1 alloc_gib=10.52 reserved_gib=90.71 peak_gib=66.42
+step=21370 loss=4.20091 router=1.61664 grad=0.45404 lr=3.628e-05 elapsed_h=0.315 tokens_per_s=2251.2 alloc_gib=10.52 reserved_gib=90.71 peak_gib=66.43
+step=21380 loss=3.91916 router=1.58788 grad=0.40441 lr=4.148e-05 elapsed_h=0.396 tokens_per_s=2258.3 alloc_gib=10.52 reserved_gib=90.72 peak_gib=66.43
+step=21390 loss=4.23581 router=1.59087 grad=0.40103 lr=4.668e-05 elapsed_h=0.477 tokens_per_s=2261.2 alloc_gib=10.52 reserved_gib=90.72 peak_gib=66.43
+step=21400 loss=3.91925 router=1.56359 grad=0.40435 lr=5.188e-05 elapsed_h=0.557 tokens_per_s=2255.6 alloc_gib=10.52 reserved_gib=90.74 peak_gib=66.43
+step=21410 loss=3.85252 router=1.56912 grad=0.38632 lr=5.708e-05 elapsed_h=0.638 tokens_per_s=2251.0 alloc_gib=10.52 reserved_gib=90.74 peak_gib=66.43
+step=21420 loss=3.92414 router=1.56749 grad=0.39954 lr=6.228e-05 elapsed_h=0.719 tokens_per_s=2261.8 alloc_gib=10.52 reserved_gib=90.74 peak_gib=66.43
+step=21430 loss=3.93419 router=1.56088 grad=0.52724 lr=6.748e-05 elapsed_h=0.799 tokens_per_s=2259.3 alloc_gib=10.52 reserved_gib=90.74 peak_gib=66.44
+step=21440 loss=3.75748 router=1.55565 grad=0.40210 lr=7.268e-05 elapsed_h=0.880 tokens_per_s=2250.1 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.42
+step=21450 loss=3.91536 router=1.56167 grad=0.38834 lr=7.788e-05 elapsed_h=0.961 tokens_per_s=2258.2 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.43
+checkpoint_saved step=21455 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=1.005
+step=21460 loss=3.86041 router=1.55468 grad=0.40154 lr=8.308e-05 elapsed_h=1.045 tokens_per_s=2161.8 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.45
+step=21470 loss=3.89270 router=1.56302 grad=0.40234 lr=8.828e-05 elapsed_h=1.126 tokens_per_s=2254.3 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.45
+step=21480 loss=3.85809 router=1.56563 grad=0.39621 lr=9.348e-05 elapsed_h=1.207 tokens_per_s=2249.4 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.43
+step=21490 loss=3.82937 router=1.55650 grad=0.39402 lr=9.868e-05 elapsed_h=1.287 tokens_per_s=2262.6 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.45
+step=21500 loss=3.90161 router=1.55425 grad=0.38971 lr=1.039e-04 elapsed_h=1.368 tokens_per_s=2259.4 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.43
+step=21510 loss=3.62502 router=1.55624 grad=0.42908 lr=1.091e-04 elapsed_h=1.448 tokens_per_s=2252.4 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.44
+step=21520 loss=3.69133 router=1.56146 grad=0.41526 lr=1.143e-04 elapsed_h=1.529 tokens_per_s=2259.1 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.42
+step=21530 loss=3.76531 router=1.56398 grad=0.39953 lr=1.195e-04 elapsed_h=1.610 tokens_per_s=2259.7 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.44
+step=21540 loss=3.79659 router=1.56863 grad=0.42253 lr=1.200e-04 elapsed_h=1.690 tokens_per_s=2253.5 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.44
+step=21550 loss=3.68390 router=1.54257 grad=0.40467 lr=1.200e-04 elapsed_h=1.771 tokens_per_s=2252.3 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.44
+step=21560 loss=3.59931 router=1.60459 grad=0.47039 lr=1.200e-04 elapsed_h=1.852 tokens_per_s=2261.4 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.43
+step=21570 loss=3.68743 router=1.55611 grad=0.39287 lr=1.200e-04 elapsed_h=1.932 tokens_per_s=2259.2 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.46
+checkpoint_saved step=21579 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=2.009
+step=21580 loss=3.61217 router=1.55798 grad=0.40963 lr=1.199e-04 elapsed_h=2.017 tokens_per_s=2152.8 alloc_gib=10.52 reserved_gib=90.80 peak_gib=66.44
+step=21590 loss=3.68566 router=1.59505 grad=0.41863 lr=1.199e-04 elapsed_h=2.097 tokens_per_s=2258.2 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.44
+step=21600 loss=3.69784 router=1.59387 grad=0.41732 lr=1.199e-04 elapsed_h=2.178 tokens_per_s=2259.1 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.43
+step=21610 loss=3.50938 router=1.56313 grad=0.43384 lr=1.198e-04 elapsed_h=2.259 tokens_per_s=2253.4 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.45
+step=21620 loss=3.77708 router=1.56585 grad=0.40942 lr=1.198e-04 elapsed_h=2.340 tokens_per_s=2253.4 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.43
+step=21630 loss=3.71984 router=1.59057 grad=0.38831 lr=1.197e-04 elapsed_h=2.420 tokens_per_s=2259.0 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.43
+step=21640 loss=3.75635 router=1.59171 grad=0.39622 lr=1.196e-04 elapsed_h=2.501 tokens_per_s=2257.7 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.44
+step=21650 loss=3.71058 router=1.61235 grad=0.40601 lr=1.196e-04 elapsed_h=2.582 tokens_per_s=2250.6 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.45
+step=21660 loss=3.54332 router=1.57696 grad=0.42334 lr=1.195e-04 elapsed_h=2.662 tokens_per_s=2260.7 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.43
+step=21670 loss=3.77427 router=1.58926 grad=0.39750 lr=1.194e-04 elapsed_h=2.743 tokens_per_s=2261.3 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.46
+step=21680 loss=3.63517 router=1.57896 grad=0.40383 lr=1.193e-04 elapsed_h=2.824 tokens_per_s=2253.2 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.45
+step=21690 loss=3.77154 router=1.57853 grad=0.39803 lr=1.192e-04 elapsed_h=2.904 tokens_per_s=2251.9 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.45
+step=21700 loss=3.39885 router=1.56841 grad=0.38876 lr=1.191e-04 elapsed_h=2.985 tokens_per_s=2258.1 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.42
+checkpoint_saved step=21703 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=3.013
+step=21710 loss=3.60643 router=1.57488 grad=0.39554 lr=1.190e-04 elapsed_h=3.069 tokens_per_s=2161.3 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.45
+step=21720 loss=3.70682 router=1.57424 grad=0.43550 lr=1.189e-04 elapsed_h=3.150 tokens_per_s=2251.3 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.45
+step=21730 loss=3.52347 router=1.56922 grad=0.37734 lr=1.188e-04 elapsed_h=3.231 tokens_per_s=2257.9 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.45
+step=21740 loss=3.66070 router=1.60120 grad=0.38919 lr=1.187e-04 elapsed_h=3.311 tokens_per_s=2260.4 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.44
+step=21750 loss=3.56328 router=1.56869 grad=0.37954 lr=1.185e-04 elapsed_h=3.392 tokens_per_s=2252.0 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.43
+step=21760 loss=3.59044 router=1.59674 grad=0.39564 lr=1.184e-04 elapsed_h=3.473 tokens_per_s=2253.6 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.44
+step=21770 loss=3.80715 router=1.57415 grad=0.38659 lr=1.182e-04 elapsed_h=3.553 tokens_per_s=2259.7 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.44
+step=21780 loss=3.45238 router=1.57882 grad=0.38355 lr=1.181e-04 elapsed_h=3.634 tokens_per_s=2259.7 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.44
+step=21790 loss=3.64955 router=1.59380 grad=0.40846 lr=1.179e-04 elapsed_h=3.715 tokens_per_s=2249.3 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.44
+step=21800 loss=3.48482 router=1.58399 grad=0.38909 lr=1.178e-04 elapsed_h=3.796 tokens_per_s=2256.4 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.43
+step=21810 loss=3.69302 router=1.58896 grad=0.41274 lr=1.176e-04 elapsed_h=3.876 tokens_per_s=2259.8 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.46
+step=21820 loss=3.76360 router=1.60732 grad=0.41005 lr=1.174e-04 elapsed_h=3.957 tokens_per_s=2254.1 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.45
+checkpoint_saved step=21827 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=4.017
+step=21830 loss=3.62728 router=1.60333 grad=0.39383 lr=1.173e-04 elapsed_h=4.041 tokens_per_s=2156.3 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.47
+step=21840 loss=3.71708 router=1.60045 grad=0.39229 lr=1.171e-04 elapsed_h=4.122 tokens_per_s=2262.9 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.43
+step=21850 loss=3.65019 router=1.59733 grad=0.38853 lr=1.169e-04 elapsed_h=4.202 tokens_per_s=2259.8 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.43
+step=21860 loss=3.46732 router=1.61118 grad=0.39784 lr=1.167e-04 elapsed_h=4.283 tokens_per_s=2250.2 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.44
+step=21870 loss=3.64655 router=1.59782 grad=0.38919 lr=1.165e-04 elapsed_h=4.364 tokens_per_s=2259.8 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.46
+step=21880 loss=3.54466 router=1.59344 grad=0.39106 lr=1.163e-04 elapsed_h=4.444 tokens_per_s=2261.3 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.43
+step=21890 loss=3.45421 router=1.58741 grad=0.40755 lr=1.161e-04 elapsed_h=4.525 tokens_per_s=2255.2 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.44
+step=21900 loss=3.48473 router=1.57903 grad=0.38165 lr=1.159e-04 elapsed_h=4.606 tokens_per_s=2254.9 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.45
+step=21910 loss=3.38301 router=1.60429 grad=0.38554 lr=1.156e-04 elapsed_h=4.686 tokens_per_s=2261.1 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.43
+step=21920 loss=3.50695 router=1.58867 grad=0.38482 lr=1.154e-04 elapsed_h=4.767 tokens_per_s=2257.1 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.44
+step=21930 loss=3.48275 router=1.59428 grad=0.37488 lr=1.152e-04 elapsed_h=4.848 tokens_per_s=2248.7 alloc_gib=10.52 reserved_gib=90.85 peak_gib=66.43
+step=21940 loss=3.68540 router=1.59705 grad=0.37951 lr=1.149e-04 elapsed_h=4.928 tokens_per_s=2259.8 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.47
+step=21950 loss=3.56331 router=1.59564 grad=0.38461 lr=1.147e-04 elapsed_h=5.009 tokens_per_s=2260.3 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+checkpoint_saved step=21952 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=5.029
+step=21960 loss=3.63582 router=1.61268 grad=0.40573 lr=1.144e-04 elapsed_h=5.094 tokens_per_s=2153.5 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=21970 loss=3.19527 router=1.58159 grad=0.36241 lr=1.142e-04 elapsed_h=5.174 tokens_per_s=2257.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.46
+step=21980 loss=3.08034 router=1.57441 grad=0.40149 lr=1.139e-04 elapsed_h=5.255 tokens_per_s=2260.8 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=21990 loss=3.41020 router=1.61024 grad=0.38460 lr=1.136e-04 elapsed_h=5.335 tokens_per_s=2257.6 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22000 loss=3.44577 router=1.59000 grad=0.45043 lr=1.134e-04 elapsed_h=5.416 tokens_per_s=2252.1 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22010 loss=3.24818 router=1.58462 grad=0.38460 lr=1.131e-04 elapsed_h=5.497 tokens_per_s=2260.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22020 loss=3.43821 router=1.59696 grad=0.38775 lr=1.128e-04 elapsed_h=5.577 tokens_per_s=2260.9 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22030 loss=3.60169 router=1.61794 grad=0.48703 lr=1.125e-04 elapsed_h=5.658 tokens_per_s=2251.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22040 loss=3.31902 router=1.59442 grad=0.37964 lr=1.122e-04 elapsed_h=5.739 tokens_per_s=2256.0 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.46
+step=22050 loss=3.54875 router=1.59460 grad=0.36992 lr=1.119e-04 elapsed_h=5.819 tokens_per_s=2261.1 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22060 loss=3.67812 router=1.59288 grad=0.36667 lr=1.116e-04 elapsed_h=5.900 tokens_per_s=2258.9 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22070 loss=3.33733 router=1.60001 grad=0.38097 lr=1.113e-04 elapsed_h=5.981 tokens_per_s=2253.5 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+checkpoint_saved step=22076 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=6.033
+step=22080 loss=3.58894 router=1.60287 grad=0.37976 lr=1.110e-04 elapsed_h=6.065 tokens_per_s=2161.8 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22090 loss=3.54096 router=1.60328 grad=0.39403 lr=1.107e-04 elapsed_h=6.145 tokens_per_s=2260.8 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22100 loss=3.64544 router=1.63032 grad=0.38300 lr=1.103e-04 elapsed_h=6.226 tokens_per_s=2250.4 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22110 loss=3.52048 router=1.58741 grad=0.37495 lr=1.100e-04 elapsed_h=6.307 tokens_per_s=2257.1 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.42
+step=22120 loss=3.36305 router=1.58709 grad=0.38594 lr=1.097e-04 elapsed_h=6.388 tokens_per_s=2260.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22130 loss=3.64331 router=1.60187 grad=0.37661 lr=1.093e-04 elapsed_h=6.468 tokens_per_s=2258.6 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22140 loss=3.44924 router=1.59042 grad=0.40103 lr=1.090e-04 elapsed_h=6.549 tokens_per_s=2252.6 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22150 loss=3.45432 router=1.61608 grad=0.39666 lr=1.086e-04 elapsed_h=6.629 tokens_per_s=2261.4 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22160 loss=3.43815 router=1.60314 grad=0.36884 lr=1.083e-04 elapsed_h=6.710 tokens_per_s=2262.7 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.47
+step=22170 loss=3.60052 router=1.58898 grad=0.36863 lr=1.079e-04 elapsed_h=6.791 tokens_per_s=2251.0 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22180 loss=3.60905 router=1.60459 grad=0.36625 lr=1.076e-04 elapsed_h=6.871 tokens_per_s=2257.4 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22190 loss=3.33502 router=1.58066 grad=0.38192 lr=1.072e-04 elapsed_h=6.952 tokens_per_s=2259.7 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22200 loss=3.20334 router=1.60696 grad=0.37967 lr=1.068e-04 elapsed_h=7.033 tokens_per_s=2257.5 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+checkpoint_saved step=22201 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=7.044
+step=22210 loss=3.50038 router=1.61271 grad=0.39170 lr=1.064e-04 elapsed_h=7.117 tokens_per_s=2155.1 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.42
+step=22220 loss=3.55479 router=1.60649 grad=0.37971 lr=1.061e-04 elapsed_h=7.198 tokens_per_s=2263.0 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22230 loss=3.39126 router=1.59730 grad=0.36999 lr=1.057e-04 elapsed_h=7.278 tokens_per_s=2260.8 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22240 loss=3.54388 router=1.62074 grad=0.38287 lr=1.053e-04 elapsed_h=7.359 tokens_per_s=2249.8 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.42
+step=22250 loss=3.58810 router=1.60905 grad=0.38829 lr=1.049e-04 elapsed_h=7.440 tokens_per_s=2256.5 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.42
+step=22260 loss=3.48576 router=1.60308 grad=0.37470 lr=1.045e-04 elapsed_h=7.520 tokens_per_s=2261.7 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.46
+step=22270 loss=3.31074 router=1.59912 grad=0.42068 lr=1.041e-04 elapsed_h=7.601 tokens_per_s=2258.5 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22280 loss=3.52910 router=1.63230 grad=0.36643 lr=1.037e-04 elapsed_h=7.682 tokens_per_s=2252.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22290 loss=3.42370 router=1.60031 grad=0.38272 lr=1.033e-04 elapsed_h=7.762 tokens_per_s=2259.0 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22300 loss=3.30226 router=1.58778 grad=0.37460 lr=1.029e-04 elapsed_h=7.843 tokens_per_s=2260.8 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22310 loss=3.49464 router=1.60661 grad=0.38888 lr=1.024e-04 elapsed_h=7.924 tokens_per_s=2249.1 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.42
+step=22320 loss=3.50435 router=1.60892 grad=0.40979 lr=1.020e-04 elapsed_h=8.004 tokens_per_s=2256.4 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+checkpoint_saved step=22325 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=8.048
+step=22330 loss=3.66382 router=1.61769 grad=0.37322 lr=1.016e-04 elapsed_h=8.088 tokens_per_s=2164.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22340 loss=3.52216 router=1.60699 grad=0.38783 lr=1.012e-04 elapsed_h=8.169 tokens_per_s=2257.5 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22350 loss=3.57637 router=1.60007 grad=0.36705 lr=1.007e-04 elapsed_h=8.250 tokens_per_s=2252.5 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22360 loss=3.12790 router=1.57924 grad=0.39409 lr=1.003e-04 elapsed_h=8.330 tokens_per_s=2261.3 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22370 loss=3.65170 router=1.62255 grad=0.36949 lr=9.985e-05 elapsed_h=8.411 tokens_per_s=2258.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22380 loss=3.29630 router=1.60773 grad=0.37679 lr=9.940e-05 elapsed_h=8.492 tokens_per_s=2248.7 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.42
+step=22390 loss=3.31142 router=1.60396 grad=0.37763 lr=9.895e-05 elapsed_h=8.573 tokens_per_s=2256.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.42
+step=22400 loss=3.53862 router=1.60665 grad=0.37857 lr=9.850e-05 elapsed_h=8.653 tokens_per_s=2259.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22410 loss=3.30978 router=1.60382 grad=0.37609 lr=9.804e-05 elapsed_h=8.734 tokens_per_s=2255.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.46
+step=22420 loss=3.29337 router=1.60495 grad=0.37672 lr=9.759e-05 elapsed_h=8.815 tokens_per_s=2249.5 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22430 loss=3.36933 router=1.60415 grad=0.41326 lr=9.712e-05 elapsed_h=8.895 tokens_per_s=2258.8 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22440 loss=3.43654 router=1.61089 grad=0.37484 lr=9.666e-05 elapsed_h=8.976 tokens_per_s=2261.1 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+checkpoint_saved step=22449 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=9.053
+step=22450 loss=3.29856 router=1.59146 grad=0.35758 lr=9.619e-05 elapsed_h=9.061 tokens_per_s=2150.4 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22460 loss=3.21784 router=1.57849 grad=0.39279 lr=9.572e-05 elapsed_h=9.141 tokens_per_s=2256.8 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22470 loss=3.67571 router=1.63343 grad=0.39280 lr=9.524e-05 elapsed_h=9.222 tokens_per_s=2261.4 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22480 loss=3.61336 router=1.60768 grad=0.37154 lr=9.476e-05 elapsed_h=9.302 tokens_per_s=2256.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22490 loss=3.14815 router=1.59367 grad=0.36370 lr=9.428e-05 elapsed_h=9.383 tokens_per_s=2251.5 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22500 loss=3.29952 router=1.61277 grad=0.36197 lr=9.380e-05 elapsed_h=9.464 tokens_per_s=2262.0 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22510 loss=3.48697 router=1.60591 grad=0.38443 lr=9.331e-05 elapsed_h=9.544 tokens_per_s=2258.3 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.46
+step=22520 loss=3.69221 router=1.63369 grad=0.38650 lr=9.282e-05 elapsed_h=9.625 tokens_per_s=2250.0 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22530 loss=3.54027 router=1.61505 grad=0.36513 lr=9.233e-05 elapsed_h=9.706 tokens_per_s=2254.8 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22540 loss=3.56658 router=1.62746 grad=0.36922 lr=9.184e-05 elapsed_h=9.787 tokens_per_s=2260.5 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22550 loss=3.33938 router=1.61237 grad=0.36619 lr=9.134e-05 elapsed_h=9.867 tokens_per_s=2256.3 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22560 loss=3.56644 router=1.62170 grad=0.37906 lr=9.084e-05 elapsed_h=9.948 tokens_per_s=2253.5 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22570 loss=3.27139 router=1.60092 grad=0.38300 lr=9.034e-05 elapsed_h=10.029 tokens_per_s=2260.0 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+checkpoint_saved step=22573 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=10.056
+step=22580 loss=3.30529 router=1.60615 grad=0.37975 lr=8.983e-05 elapsed_h=10.113 tokens_per_s=2162.4 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22590 loss=3.28753 router=1.60838 grad=0.37570 lr=8.933e-05 elapsed_h=10.194 tokens_per_s=2251.0 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22600 loss=3.17590 router=1.59202 grad=0.37193 lr=8.882e-05 elapsed_h=10.274 tokens_per_s=2258.9 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22610 loss=3.55771 router=1.61878 grad=0.39608 lr=8.831e-05 elapsed_h=10.355 tokens_per_s=2260.9 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22620 loss=3.19074 router=1.59471 grad=0.36962 lr=8.779e-05 elapsed_h=10.436 tokens_per_s=2253.8 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22630 loss=3.39822 router=1.61727 grad=0.37114 lr=8.728e-05 elapsed_h=10.516 tokens_per_s=2252.0 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22640 loss=3.45450 router=1.60701 grad=0.37139 lr=8.676e-05 elapsed_h=10.597 tokens_per_s=2259.3 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22650 loss=3.50273 router=1.61874 grad=0.37924 lr=8.624e-05 elapsed_h=10.678 tokens_per_s=2254.3 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22660 loss=3.34000 router=1.60506 grad=0.36567 lr=8.572e-05 elapsed_h=10.759 tokens_per_s=2252.0 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22670 loss=3.51809 router=1.62446 grad=0.39020 lr=8.520e-05 elapsed_h=10.839 tokens_per_s=2261.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22680 loss=3.43340 router=1.61398 grad=0.37534 lr=8.467e-05 elapsed_h=10.920 tokens_per_s=2261.6 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.41
+step=22690 loss=3.51971 router=1.64336 grad=0.42321 lr=8.415e-05 elapsed_h=11.000 tokens_per_s=2252.4 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+checkpoint_saved step=22697 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=11.061
+step=22700 loss=3.08981 router=1.59238 grad=0.66889 lr=8.362e-05 elapsed_h=11.085 tokens_per_s=2159.4 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22710 loss=3.49588 router=1.63279 grad=0.39557 lr=8.309e-05 elapsed_h=11.165 tokens_per_s=2254.5 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22720 loss=3.39184 router=1.59736 grad=0.36437 lr=8.256e-05 elapsed_h=11.246 tokens_per_s=2254.9 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22730 loss=3.26200 router=1.59882 grad=0.35916 lr=8.203e-05 elapsed_h=11.327 tokens_per_s=2256.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22740 loss=3.43351 router=1.62729 grad=0.37755 lr=8.149e-05 elapsed_h=11.407 tokens_per_s=2263.1 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22750 loss=3.43532 router=1.60734 grad=0.36900 lr=8.096e-05 elapsed_h=11.488 tokens_per_s=2258.1 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.45
+step=22760 loss=3.47331 router=1.62333 grad=0.36745 lr=8.042e-05 elapsed_h=11.569 tokens_per_s=2251.3 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22770 loss=3.48623 router=1.60717 grad=0.37579 lr=7.989e-05 elapsed_h=11.649 tokens_per_s=2259.6 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22780 loss=3.26936 router=1.62836 grad=0.41267 lr=7.935e-05 elapsed_h=11.730 tokens_per_s=2261.9 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22790 loss=3.49361 router=1.61264 grad=0.37763 lr=7.881e-05 elapsed_h=11.811 tokens_per_s=2250.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22800 loss=3.32212 router=1.58894 grad=0.36053 lr=7.827e-05 elapsed_h=11.891 tokens_per_s=2260.2 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.43
+step=22810 loss=3.41168 router=1.63330 grad=0.39254 lr=7.773e-05 elapsed_h=11.972 tokens_per_s=2262.7 alloc_gib=10.52 reserved_gib=90.86 peak_gib=66.44
+step=22820 loss=3.37152 router=1.60092 grad=0.37623 lr=7.719e-05 elapsed_h=12.052 tokens_per_s=2256.5 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.42
+checkpoint_saved step=22822 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=12.072
+step=22830 loss=3.23110 router=1.58058 grad=0.39786 lr=7.665e-05 elapsed_h=12.137 tokens_per_s=2155.0 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=22840 loss=3.52736 router=1.61598 grad=0.37827 lr=7.611e-05 elapsed_h=12.217 tokens_per_s=2260.9 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=22850 loss=3.29046 router=1.60101 grad=0.39593 lr=7.556e-05 elapsed_h=12.298 tokens_per_s=2256.7 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=22860 loss=3.37167 router=1.63116 grad=0.38229 lr=7.502e-05 elapsed_h=12.379 tokens_per_s=2252.8 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=22870 loss=3.48242 router=1.61316 grad=0.37237 lr=7.448e-05 elapsed_h=12.459 tokens_per_s=2260.7 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.46
+step=22880 loss=3.11811 router=1.59219 grad=0.35600 lr=7.393e-05 elapsed_h=12.540 tokens_per_s=2258.0 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.42
+step=22890 loss=3.33567 router=1.62316 grad=0.39006 lr=7.339e-05 elapsed_h=12.621 tokens_per_s=2249.2 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.45
+step=22900 loss=3.53457 router=1.63446 grad=0.38670 lr=7.284e-05 elapsed_h=12.702 tokens_per_s=2257.5 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=22910 loss=3.32253 router=1.60409 grad=0.39509 lr=7.230e-05 elapsed_h=12.782 tokens_per_s=2260.7 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=22920 loss=3.19022 router=1.59550 grad=0.38168 lr=7.175e-05 elapsed_h=12.863 tokens_per_s=2252.8 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=22930 loss=3.06209 router=1.61866 grad=0.39136 lr=7.121e-05 elapsed_h=12.944 tokens_per_s=2255.4 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.45
+step=22940 loss=3.35369 router=1.59373 grad=0.35574 lr=7.067e-05 elapsed_h=13.024 tokens_per_s=2260.9 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+checkpoint_saved step=22946 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=13.076
+step=22950 loss=3.32169 router=1.63131 grad=0.38814 lr=7.012e-05 elapsed_h=13.108 tokens_per_s=2158.8 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.45
+step=22960 loss=3.31181 router=1.61562 grad=0.35515 lr=6.958e-05 elapsed_h=13.189 tokens_per_s=2251.9 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=22970 loss=3.15550 router=1.60645 grad=0.35106 lr=6.903e-05 elapsed_h=13.270 tokens_per_s=2256.5 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=22980 loss=3.22486 router=1.60359 grad=0.37924 lr=6.849e-05 elapsed_h=13.351 tokens_per_s=2256.4 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.45
+step=22990 loss=3.29529 router=1.61851 grad=0.36647 lr=6.795e-05 elapsed_h=13.432 tokens_per_s=2250.6 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=23000 loss=3.18141 router=1.61949 grad=0.36635 lr=6.741e-05 elapsed_h=13.512 tokens_per_s=2259.0 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=23010 loss=3.23996 router=1.59782 grad=0.37622 lr=6.686e-05 elapsed_h=13.593 tokens_per_s=2259.0 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.42
+step=23020 loss=3.42788 router=1.63306 grad=0.38756 lr=6.632e-05 elapsed_h=13.674 tokens_per_s=2250.9 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=23030 loss=3.29883 router=1.60843 grad=0.37119 lr=6.578e-05 elapsed_h=13.754 tokens_per_s=2257.0 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.45
+step=23040 loss=3.26962 router=1.58336 grad=0.35593 lr=6.524e-05 elapsed_h=13.835 tokens_per_s=2261.9 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.45
+step=23050 loss=3.32498 router=1.61702 grad=0.38744 lr=6.470e-05 elapsed_h=13.916 tokens_per_s=2252.2 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.45
+step=23060 loss=3.61965 router=1.61448 grad=0.36766 lr=6.417e-05 elapsed_h=13.996 tokens_per_s=2253.3 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=23070 loss=3.45640 router=1.61635 grad=0.40168 lr=6.363e-05 elapsed_h=14.077 tokens_per_s=2259.8 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.45
+checkpoint_saved step=23070 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=14.081
+step=23080 loss=3.27692 router=1.63572 grad=0.37475 lr=6.309e-05 elapsed_h=14.161 tokens_per_s=2154.6 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=23090 loss=3.36731 router=1.60967 grad=0.40408 lr=6.256e-05 elapsed_h=14.242 tokens_per_s=2250.3 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.42
+step=23100 loss=3.55949 router=1.62499 grad=0.39051 lr=6.203e-05 elapsed_h=14.323 tokens_per_s=2256.3 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.42
+step=23110 loss=3.26634 router=1.59428 grad=0.36259 lr=6.149e-05 elapsed_h=14.404 tokens_per_s=2256.4 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=23120 loss=3.31652 router=1.62279 grad=0.37825 lr=6.096e-05 elapsed_h=14.485 tokens_per_s=2250.4 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=23130 loss=3.29928 router=1.59333 grad=0.40976 lr=6.043e-05 elapsed_h=14.565 tokens_per_s=2261.8 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=23140 loss=3.24733 router=1.59366 grad=0.36227 lr=5.991e-05 elapsed_h=14.646 tokens_per_s=2259.6 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=23150 loss=3.39568 router=1.61126 grad=0.36353 lr=5.938e-05 elapsed_h=14.727 tokens_per_s=2247.9 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.45
+step=23160 loss=3.45763 router=1.62551 grad=0.36307 lr=5.885e-05 elapsed_h=14.807 tokens_per_s=2259.1 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=23170 loss=3.47415 router=1.62605 grad=0.40369 lr=5.833e-05 elapsed_h=14.888 tokens_per_s=2262.2 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=23180 loss=3.36757 router=1.61013 grad=0.35571 lr=5.781e-05 elapsed_h=14.969 tokens_per_s=2250.9 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=23190 loss=3.45588 router=1.61708 grad=0.37472 lr=5.729e-05 elapsed_h=15.049 tokens_per_s=2254.5 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+checkpoint_saved step=23194 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=15.085
+step=23200 loss=3.42113 router=1.60553 grad=0.36875 lr=5.677e-05 elapsed_h=15.133 tokens_per_s=2164.3 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=23210 loss=3.36684 router=1.62550 grad=0.50624 lr=5.626e-05 elapsed_h=15.214 tokens_per_s=2252.2 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.42
+step=23220 loss=3.08291 router=1.58431 grad=0.34630 lr=5.575e-05 elapsed_h=15.295 tokens_per_s=2251.4 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=23230 loss=3.45169 router=1.61381 grad=0.35568 lr=5.523e-05 elapsed_h=15.376 tokens_per_s=2260.8 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.42
+step=23240 loss=3.27190 router=1.60816 grad=0.38410 lr=5.472e-05 elapsed_h=15.456 tokens_per_s=2256.0 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=23250 loss=3.47022 router=1.61982 grad=0.40017 lr=5.422e-05 elapsed_h=15.537 tokens_per_s=2251.7 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=23260 loss=3.41354 router=1.60617 grad=0.36895 lr=5.371e-05 elapsed_h=15.618 tokens_per_s=2259.6 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=23270 loss=3.55209 router=1.63803 grad=0.37839 lr=5.321e-05 elapsed_h=15.698 tokens_per_s=2257.8 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=23280 loss=3.49647 router=1.61501 grad=0.36954 lr=5.271e-05 elapsed_h=15.779 tokens_per_s=2249.2 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=23290 loss=3.39430 router=1.59886 grad=0.36483 lr=5.221e-05 elapsed_h=15.860 tokens_per_s=2256.3 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=23300 loss=3.17535 router=1.58959 grad=0.36189 lr=5.172e-05 elapsed_h=15.941 tokens_per_s=2258.9 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.42
+step=23310 loss=3.14786 router=1.62382 grad=0.40074 lr=5.123e-05 elapsed_h=16.021 tokens_per_s=2251.0 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+checkpoint_saved step=23318 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=16.090
+step=23320 loss=3.36854 router=1.61396 grad=0.36147 lr=5.074e-05 elapsed_h=16.106 tokens_per_s=2161.6 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=23330 loss=3.38708 router=1.62641 grad=0.37959 lr=5.025e-05 elapsed_h=16.186 tokens_per_s=2261.8 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=23340 loss=3.21736 router=1.60826 grad=0.36466 lr=4.977e-05 elapsed_h=16.267 tokens_per_s=2249.9 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.45
+step=23350 loss=3.29935 router=1.59127 grad=0.35665 lr=4.928e-05 elapsed_h=16.348 tokens_per_s=2254.8 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=23360 loss=3.04883 router=1.57866 grad=0.34482 lr=4.881e-05 elapsed_h=16.428 tokens_per_s=2260.0 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=23370 loss=3.32110 router=1.63395 grad=0.39556 lr=4.833e-05 elapsed_h=16.509 tokens_per_s=2252.7 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.44
+step=23380 loss=3.40766 router=1.60804 grad=0.36495 lr=4.786e-05 elapsed_h=16.590 tokens_per_s=2252.8 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.42
+step=23390 loss=3.45997 router=1.63190 grad=0.41366 lr=4.739e-05 elapsed_h=16.671 tokens_per_s=2259.2 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.43
+step=23400 loss=3.18369 router=1.61223 grad=0.36183 lr=4.692e-05 elapsed_h=16.751 tokens_per_s=2257.3 alloc_gib=10.52 reserved_gib=90.91 peak_gib=66.45
+step=23410 loss=3.14077 router=1.61108 grad=0.38664 lr=4.646e-05 elapsed_h=16.832 tokens_per_s=2250.7 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.42
+step=23420 loss=3.36347 router=1.60795 grad=0.35748 lr=4.600e-05 elapsed_h=16.913 tokens_per_s=2258.9 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+step=23430 loss=3.31304 router=1.62619 grad=0.37305 lr=4.555e-05 elapsed_h=16.993 tokens_per_s=2256.7 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23440 loss=3.48184 router=1.61814 grad=0.36805 lr=4.509e-05 elapsed_h=17.074 tokens_per_s=2249.5 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+checkpoint_saved step=23442 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=17.094
+step=23450 loss=3.03465 router=1.58526 grad=0.61169 lr=4.464e-05 elapsed_h=17.158 tokens_per_s=2160.8 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23460 loss=3.31555 router=1.60812 grad=0.35350 lr=4.420e-05 elapsed_h=17.239 tokens_per_s=2258.9 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23470 loss=2.99659 router=1.59751 grad=0.35860 lr=4.376e-05 elapsed_h=17.320 tokens_per_s=2249.1 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23480 loss=3.07684 router=1.58027 grad=0.36256 lr=4.332e-05 elapsed_h=17.401 tokens_per_s=2256.3 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23490 loss=3.35270 router=1.61592 grad=0.37474 lr=4.288e-05 elapsed_h=17.481 tokens_per_s=2262.3 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.42
+step=23500 loss=3.22370 router=1.60297 grad=0.36846 lr=4.245e-05 elapsed_h=17.562 tokens_per_s=2251.7 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23510 loss=3.09329 router=1.59217 grad=0.36585 lr=4.202e-05 elapsed_h=17.643 tokens_per_s=2252.3 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23520 loss=3.19082 router=1.60347 grad=0.35234 lr=4.160e-05 elapsed_h=17.723 tokens_per_s=2260.2 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+step=23530 loss=3.29395 router=1.61734 grad=0.37009 lr=4.118e-05 elapsed_h=17.804 tokens_per_s=2255.3 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23540 loss=3.35059 router=1.60409 grad=0.37052 lr=4.077e-05 elapsed_h=17.885 tokens_per_s=2251.7 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23550 loss=3.38756 router=1.59169 grad=0.38080 lr=4.035e-05 elapsed_h=17.966 tokens_per_s=2257.2 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23560 loss=3.42410 router=1.62854 grad=0.37885 lr=3.995e-05 elapsed_h=18.046 tokens_per_s=2258.6 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+checkpoint_saved step=23566 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=18.098
+step=23570 loss=3.17030 router=1.59747 grad=0.35364 lr=3.954e-05 elapsed_h=18.131 tokens_per_s=2151.3 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23580 loss=3.20015 router=1.58431 grad=0.35062 lr=3.914e-05 elapsed_h=18.211 tokens_per_s=2257.5 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23590 loss=3.24912 router=1.59981 grad=0.36139 lr=3.875e-05 elapsed_h=18.292 tokens_per_s=2260.7 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23600 loss=3.08670 router=1.59349 grad=0.35923 lr=3.836e-05 elapsed_h=18.373 tokens_per_s=2250.9 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23610 loss=3.28327 router=1.59695 grad=0.36201 lr=3.797e-05 elapsed_h=18.454 tokens_per_s=2254.1 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23620 loss=3.37352 router=1.59908 grad=0.35954 lr=3.759e-05 elapsed_h=18.534 tokens_per_s=2259.2 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23630 loss=3.20589 router=1.61946 grad=0.35441 lr=3.721e-05 elapsed_h=18.615 tokens_per_s=2250.0 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23640 loss=3.31259 router=1.62225 grad=0.38511 lr=3.684e-05 elapsed_h=18.696 tokens_per_s=2249.4 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.42
+step=23650 loss=3.32104 router=1.62357 grad=0.37150 lr=3.647e-05 elapsed_h=18.777 tokens_per_s=2255.9 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23660 loss=2.94011 router=1.58841 grad=0.35478 lr=3.611e-05 elapsed_h=18.857 tokens_per_s=2258.9 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+step=23670 loss=3.34501 router=1.60558 grad=0.37965 lr=3.575e-05 elapsed_h=18.938 tokens_per_s=2247.5 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23680 loss=3.09946 router=1.58456 grad=0.40303 lr=3.539e-05 elapsed_h=19.019 tokens_per_s=2248.8 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23690 loss=3.30052 router=1.58638 grad=0.37094 lr=3.504e-05 elapsed_h=19.100 tokens_per_s=2254.2 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.42
+checkpoint_saved step=23690 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=19.104
+step=23700 loss=3.39735 router=1.61276 grad=0.36429 lr=3.470e-05 elapsed_h=19.184 tokens_per_s=2156.1 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23710 loss=3.24879 router=1.58214 grad=0.35308 lr=3.436e-05 elapsed_h=19.265 tokens_per_s=2247.8 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23720 loss=3.23241 router=1.59101 grad=0.35255 lr=3.402e-05 elapsed_h=19.346 tokens_per_s=2257.7 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23730 loss=3.41460 router=1.60473 grad=0.36577 lr=3.369e-05 elapsed_h=19.427 tokens_per_s=2246.9 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23740 loss=3.40707 router=1.61013 grad=0.36697 lr=3.337e-05 elapsed_h=19.508 tokens_per_s=2237.8 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23750 loss=3.45701 router=1.61110 grad=0.36075 lr=3.305e-05 elapsed_h=19.589 tokens_per_s=2255.1 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23760 loss=3.33300 router=1.60168 grad=0.35876 lr=3.273e-05 elapsed_h=19.670 tokens_per_s=2260.6 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23770 loss=3.12313 router=1.58526 grad=0.35096 lr=3.242e-05 elapsed_h=19.751 tokens_per_s=2251.9 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23780 loss=3.30561 router=1.59623 grad=0.36997 lr=3.211e-05 elapsed_h=19.831 tokens_per_s=2256.4 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23790 loss=3.42571 router=1.61478 grad=0.36483 lr=3.181e-05 elapsed_h=19.912 tokens_per_s=2261.7 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.42
+step=23800 loss=3.42141 router=1.60338 grad=0.37326 lr=3.152e-05 elapsed_h=19.992 tokens_per_s=2254.6 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=23810 loss=3.32125 router=1.60076 grad=0.35724 lr=3.123e-05 elapsed_h=20.073 tokens_per_s=2248.9 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.46
+checkpoint_saved step=23814 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=20.109
+step=23820 loss=3.15957 router=1.64814 grad=0.80683 lr=3.094e-05 elapsed_h=20.158 tokens_per_s=2161.8 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.42
+step=23830 loss=3.21623 router=1.59969 grad=0.34886 lr=3.066e-05 elapsed_h=20.238 tokens_per_s=2257.7 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+step=23840 loss=3.23062 router=1.59666 grad=0.36241 lr=3.039e-05 elapsed_h=20.319 tokens_per_s=2248.3 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.42
+step=23850 loss=2.89095 router=1.58033 grad=0.34112 lr=3.012e-05 elapsed_h=20.400 tokens_per_s=2257.9 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+step=23860 loss=3.24419 router=1.60219 grad=0.36482 lr=2.986e-05 elapsed_h=20.480 tokens_per_s=2263.8 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+step=23870 loss=3.18575 router=1.59888 grad=0.36709 lr=2.960e-05 elapsed_h=20.561 tokens_per_s=2256.0 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.42
+step=23880 loss=3.16846 router=1.59637 grad=0.38031 lr=2.935e-05 elapsed_h=20.642 tokens_per_s=2253.3 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23890 loss=3.49041 router=1.61740 grad=0.36106 lr=2.910e-05 elapsed_h=20.722 tokens_per_s=2261.0 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+step=23900 loss=3.13673 router=1.60809 grad=0.41196 lr=2.886e-05 elapsed_h=20.803 tokens_per_s=2261.0 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23910 loss=2.95281 router=1.60134 grad=0.34260 lr=2.862e-05 elapsed_h=20.884 tokens_per_s=2251.3 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23920 loss=3.01609 router=1.59763 grad=0.37075 lr=2.839e-05 elapsed_h=20.964 tokens_per_s=2258.1 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23930 loss=3.23640 router=1.61072 grad=0.36928 lr=2.817e-05 elapsed_h=21.045 tokens_per_s=2263.2 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+checkpoint_saved step=23939 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=21.121
+step=23940 loss=3.18808 router=1.59047 grad=0.35974 lr=2.795e-05 elapsed_h=21.129 tokens_per_s=2158.7 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+step=23950 loss=3.31545 router=1.60397 grad=0.36638 lr=2.773e-05 elapsed_h=21.210 tokens_per_s=2249.4 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.46
+step=23960 loss=3.34363 router=1.62835 grad=0.41349 lr=2.753e-05 elapsed_h=21.291 tokens_per_s=2260.1 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+step=23970 loss=3.34518 router=1.61731 grad=0.36584 lr=2.733e-05 elapsed_h=21.371 tokens_per_s=2260.2 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=23980 loss=3.41845 router=1.60328 grad=0.36141 lr=2.713e-05 elapsed_h=21.452 tokens_per_s=2248.9 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+step=23990 loss=3.13070 router=1.58367 grad=0.35152 lr=2.694e-05 elapsed_h=21.533 tokens_per_s=2256.9 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.46
+step=24000 loss=3.47047 router=1.62540 grad=0.37970 lr=2.675e-05 elapsed_h=21.613 tokens_per_s=2262.4 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+step=24010 loss=3.24612 router=1.57679 grad=0.35725 lr=2.657e-05 elapsed_h=21.694 tokens_per_s=2255.6 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=24020 loss=3.20270 router=1.59092 grad=0.37444 lr=2.640e-05 elapsed_h=21.775 tokens_per_s=2252.2 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=24030 loss=3.06987 router=1.58201 grad=0.35465 lr=2.623e-05 elapsed_h=21.855 tokens_per_s=2263.2 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=24040 loss=3.37302 router=1.60467 grad=0.36284 lr=2.607e-05 elapsed_h=21.936 tokens_per_s=2262.6 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=24050 loss=3.38991 router=1.59411 grad=0.35654 lr=2.592e-05 elapsed_h=22.016 tokens_per_s=2253.3 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=24060 loss=3.11701 router=1.57500 grad=0.37302 lr=2.577e-05 elapsed_h=22.097 tokens_per_s=2256.2 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+checkpoint_saved step=24063 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=22.125
+step=24070 loss=3.24633 router=1.62552 grad=0.39470 lr=2.563e-05 elapsed_h=22.181 tokens_per_s=2157.9 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=24080 loss=3.25071 router=1.59537 grad=0.34792 lr=2.549e-05 elapsed_h=22.262 tokens_per_s=2257.5 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=24090 loss=3.16270 router=1.59607 grad=0.35264 lr=2.536e-05 elapsed_h=22.343 tokens_per_s=2249.5 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.42
+step=24100 loss=3.25198 router=1.60984 grad=0.43057 lr=2.523e-05 elapsed_h=22.424 tokens_per_s=2260.4 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+step=24110 loss=3.35064 router=1.61075 grad=0.36201 lr=2.511e-05 elapsed_h=22.504 tokens_per_s=2262.8 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=24120 loss=3.33033 router=1.59683 grad=0.37508 lr=2.500e-05 elapsed_h=22.585 tokens_per_s=2250.8 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=24130 loss=3.22007 router=1.59259 grad=0.37023 lr=2.489e-05 elapsed_h=22.666 tokens_per_s=2256.1 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=24140 loss=3.43661 router=1.62195 grad=0.36784 lr=2.479e-05 elapsed_h=22.746 tokens_per_s=2259.4 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=24150 loss=3.32419 router=1.62298 grad=0.38704 lr=2.469e-05 elapsed_h=22.827 tokens_per_s=2256.6 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=24160 loss=3.12341 router=1.57950 grad=0.35502 lr=2.460e-05 elapsed_h=22.908 tokens_per_s=2249.7 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+step=24170 loss=2.82904 router=1.58827 grad=0.36702 lr=2.452e-05 elapsed_h=22.988 tokens_per_s=2259.1 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=24180 loss=3.42410 router=1.63806 grad=0.37813 lr=2.444e-05 elapsed_h=23.069 tokens_per_s=2258.6 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+checkpoint_saved step=24187 path=datasets/checkpoints/memory-transformer-24h-router03.pt elapsed_h=23.129
+step=24190 loss=3.22069 router=1.59737 grad=0.35843 lr=2.437e-05 elapsed_h=23.153 tokens_per_s=2152.3 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=24200 loss=3.11394 router=1.58806 grad=0.37998 lr=2.431e-05 elapsed_h=23.234 tokens_per_s=2256.4 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+step=24210 loss=3.37898 router=1.59578 grad=0.36136 lr=2.425e-05 elapsed_h=23.315 tokens_per_s=2262.6 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=24220 loss=3.04807 router=1.58633 grad=0.35761 lr=2.420e-05 elapsed_h=23.395 tokens_per_s=2253.0 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.44
+step=24230 loss=3.17228 router=1.60193 grad=0.35989 lr=2.415e-05 elapsed_h=23.476 tokens_per_s=2253.2 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.46
+step=24240 loss=3.43110 router=1.59866 grad=0.37031 lr=2.411e-05 elapsed_h=23.557 tokens_per_s=2257.4 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.45
+step=24250 loss=3.21839 router=1.59874 grad=0.41193 lr=2.408e-05 elapsed_h=23.638 tokens_per_s=2253.9 alloc_gib=10.52 reserved_gib=91.02 peak_gib=66.43
+W0816 15:52:22.960000 3158 torch/distributed/elastic/agent/server/api.py:753] Received Signals.SIGTERM death signal, shutting down workers
+W0816 15:52:22.961000 3158 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 3195 closing signal SIGTERM
+W0816 15:52:22.961000 3158 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 3196 closing signal SIGTERM
+Traceback (most recent call last):
+  File "/home/src/dllm/.venv/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+    return f(*args, **kwargs)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/run.py", line 1028, in main
+    run(args)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/run.py", line 1019, in run
+    elastic_launch(
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 194, in __call__
+    return launch_agent(
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 374, in launch_agent
+    result = agent.run()
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/metrics/api.py", line 134, in wrapper
+    result = f(*args, **kwargs)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 745, in run
+    result = self._invoke_run(role)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 923, in _invoke_run
+    time.sleep(monitor_interval)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/api.py", line 86, in _terminate_process_handler
+    raise SignalException(f"Process {os.getpid()} got signal: {sigval}", sigval=sigval)
+torch.distributed.elastic.multiprocessing.api.SignalException: Process 3158 got signal: 15

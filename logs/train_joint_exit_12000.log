@@ -1,0 +1,53 @@
+W0924 09:08:01.602000 1962 torch/distributed/run.py:874] 
+W0924 09:08:01.602000 1962 torch/distributed/run.py:874] *****************************************
+W0924 09:08:01.602000 1962 torch/distributed/run.py:874] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0924 09:08:01.602000 1962 torch/distributed/run.py:874] *****************************************
+joint step=10 lossB_ce=11.91748 lossA=2.23759 depth=6.00 E[t]=13.43 w=0.000,0.150,0.150,0.100,0.450,0.150 grad=0.688 skipped=0 lrB=1.100e-05 lrA=1.266e-06 peak=24.5GiB elapsed_h=0.024
+joint step=20 lossB_ce=11.24793 lossA=2.23620 depth=7.00 E[t]=13.51 w=0.000,0.150,0.150,0.100,0.450,0.150 grad=0.461 skipped=0 lrB=2.100e-05 lrA=2.516e-06 peak=28.9GiB elapsed_h=0.048
+joint step=30 lossB_ce=10.31661 lossA=2.24275 depth=6.00 E[t]=13.32 w=0.000,0.150,0.150,0.100,0.450,0.150 grad=0.465 skipped=0 lrB=3.100e-05 lrA=3.766e-06 peak=23.6GiB elapsed_h=0.071
+joint step=40 lossB_ce=9.80062 lossA=2.24214 depth=6.12 E[t]=13.17 w=0.000,0.150,0.150,0.100,0.450,0.150 grad=0.336 skipped=0 lrB=4.100e-05 lrA=5.016e-06 peak=25.4GiB elapsed_h=0.095
+joint step=50 lossB_ce=9.23452 lossA=2.23185 depth=7.25 E[t]=13.27 w=0.000,0.150,0.150,0.100,0.450,0.150 grad=1.828 skipped=0 lrB=5.100e-05 lrA=6.266e-06 peak=26.2GiB elapsed_h=0.120
+joint step=60 lossB_ce=8.83253 lossA=2.24678 depth=6.00 E[t]=13.33 w=0.000,0.150,0.150,0.100,0.449,0.150 grad=0.281 skipped=0 lrB=6.100e-05 lrA=7.516e-06 peak=23.6GiB elapsed_h=0.143
+joint step=70 lossB_ce=8.53500 lossA=2.25624 depth=6.00 E[t]=12.96 w=0.000,0.150,0.150,0.100,0.449,0.150 grad=0.566 skipped=0 lrB=7.100e-05 lrA=8.766e-06 peak=22.8GiB elapsed_h=0.166
+joint step=80 lossB_ce=7.79648 lossA=2.24645 depth=6.25 E[t]=13.16 w=0.000,0.150,0.150,0.100,0.449,0.151 grad=0.309 skipped=0 lrB=8.100e-05 lrA=1.002e-05 peak=23.6GiB elapsed_h=0.189
+joint step=90 lossB_ce=7.98418 lossA=2.23716 depth=6.88 E[t]=13.16 w=0.000,0.149,0.151,0.100,0.449,0.151 grad=0.482 skipped=0 lrB=9.100e-05 lrA=1.127e-05 peak=25.3GiB elapsed_h=0.213
+joint step=100 lossB_ce=7.84593 lossA=2.22445 depth=6.88 E[t]=13.71 w=0.000,0.149,0.151,0.101,0.448,0.151 grad=0.455 skipped=0 lrB=1.000e-04 lrA=1.250e-05 peak=25.4GiB elapsed_h=0.237
+joint step=110 lossB_ce=7.76898 lossA=2.24105 depth=6.88 E[t]=12.95 w=0.000,0.149,0.151,0.101,0.448,0.151 grad=0.488 skipped=0 lrB=1.000e-04 lrA=1.250e-05 peak=28.0GiB elapsed_h=0.261
+joint step=120 lossB_ce=8.02512 lossA=2.22501 depth=6.38 E[t]=13.31 w=0.000,0.149,0.151,0.101,0.448,0.151 grad=0.879 skipped=0 lrB=1.000e-04 lrA=1.250e-05 peak=24.5GiB elapsed_h=0.285
+joint step=130 lossB_ce=7.55043 lossA=2.23053 depth=6.75 E[t]=13.10 w=0.000,0.149,0.151,0.101,0.447,0.151 grad=0.188 skipped=0 lrB=1.000e-04 lrA=1.250e-05 peak=28.9GiB elapsed_h=0.310
+joint step=140 lossB_ce=7.65920 lossA=2.22323 depth=6.88 E[t]=13.18 w=0.000,0.149,0.152,0.101,0.447,0.152 grad=0.953 skipped=0 lrB=1.000e-04 lrA=1.250e-05 peak=24.5GiB elapsed_h=0.335
+joint step=150 lossB_ce=7.51035 lossA=2.22371 depth=6.75 E[t]=13.06 w=0.000,0.149,0.152,0.101,0.446,0.152 grad=0.396 skipped=0 lrB=1.000e-04 lrA=1.250e-05 peak=24.5GiB elapsed_h=0.360
+joint step=160 lossB_ce=7.46405 lossA=2.21544 depth=6.38 E[t]=13.09 w=0.000,0.149,0.152,0.101,0.446,0.152 grad=0.750 skipped=0 lrB=9.999e-05 lrA=1.250e-05 peak=24.5GiB elapsed_h=0.384
+joint step=170 lossB_ce=7.67559 lossA=2.22028 depth=7.00 E[t]=13.06 w=0.000,0.149,0.152,0.101,0.446,0.152 grad=0.633 skipped=0 lrB=9.999e-05 lrA=1.250e-05 peak=25.4GiB elapsed_h=0.410
+joint step=180 lossB_ce=7.85527 lossA=2.21396 depth=6.88 E[t]=13.21 w=0.000,0.149,0.152,0.102,0.445,0.152 grad=0.463 skipped=0 lrB=9.999e-05 lrA=1.250e-05 peak=24.5GiB elapsed_h=0.436
+joint step=190 lossB_ce=7.56262 lossA=2.20595 depth=6.75 E[t]=13.53 w=0.000,0.148,0.153,0.102,0.445,0.152 grad=0.625 skipped=0 lrB=9.999e-05 lrA=1.250e-05 peak=23.6GiB elapsed_h=0.461
+joint step=200 lossB_ce=8.66838 lossA=2.18857 depth=7.50 E[t]=13.77 w=0.000,0.148,0.153,0.102,0.444,0.153 grad=0.504 skipped=0 lrB=9.998e-05 lrA=1.250e-05 peak=29.8GiB elapsed_h=0.486
+joint step=210 lossB_ce=7.63052 lossA=2.21106 depth=6.75 E[t]=13.22 w=0.000,0.148,0.153,0.102,0.444,0.153 grad=0.443 skipped=0 lrB=9.998e-05 lrA=1.250e-05 peak=29.8GiB elapsed_h=0.512
+joint step=220 lossB_ce=7.63547 lossA=2.21029 depth=6.75 E[t]=13.23 w=0.000,0.148,0.153,0.102,0.444,0.153 grad=0.406 skipped=0 lrB=9.998e-05 lrA=1.250e-05 peak=24.5GiB elapsed_h=0.537
+joint step=230 lossB_ce=7.64191 lossA=2.20325 depth=7.25 E[t]=13.48 w=0.000,0.148,0.153,0.102,0.443,0.153 grad=0.527 skipped=0 lrB=9.997e-05 lrA=1.250e-05 peak=27.1GiB elapsed_h=0.562
+joint step=240 lossB_ce=7.94214 lossA=2.20414 depth=8.25 E[t]=13.32 w=0.000,0.148,0.154,0.102,0.443,0.153 grad=0.424 skipped=0 lrB=9.997e-05 lrA=1.250e-05 peak=27.1GiB elapsed_h=0.589
+W0924 09:43:32.502000 1962 torch/distributed/elastic/agent/server/api.py:753] Received Signals.SIGTERM death signal, shutting down workers
+W0924 09:43:32.503000 1962 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 1999 closing signal SIGTERM
+W0924 09:43:32.503000 1962 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 2000 closing signal SIGTERM
+Traceback (most recent call last):
+  File "/home/src/dllm/.venv/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+    return f(*args, **kwargs)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/run.py", line 1028, in main
+    run(args)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/run.py", line 1019, in run
+    elastic_launch(
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 194, in __call__
+    return launch_agent(
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 374, in launch_agent
+    result = agent.run()
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/metrics/api.py", line 134, in wrapper
+    result = f(*args, **kwargs)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 745, in run
+    result = self._invoke_run(role)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 923, in _invoke_run
+    time.sleep(monitor_interval)
+  File "/home/src/dllm/.venv/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/api.py", line 86, in _terminate_process_handler
+    raise SignalException(f"Process {os.getpid()} got signal: {sigval}", sigval=sigval)
+torch.distributed.elastic.multiprocessing.api.SignalException: Process 1962 got signal: 15

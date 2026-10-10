@@ -1,0 +1,1 @@
+calibrated thresholds=(np.float64(0.222222), 0.0, 0.2) heldout={'relative_degradation': -0.410880021145731, 'mean_exit_depth': 19.0, 'speedup': 1.263157894736842, 'within_budget': True, 'share_full_depth': 0.1015625} oracle_depth=15.91 rows=600 output=data/calibration.pt elapsed_s=24.6

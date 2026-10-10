@@ -1,0 +1,10 @@
+[2026-09-28 03:29:17] watchdog: problem detected (process dead), attempting repair 1/2
+[2026-09-28 03:29:27] watchdog: OOM seen, relaunching with batch-size 8
+[2026-09-28 03:29:27] watchdog: relaunched training (batch=8, resume from /home/src/dllm/data/checkpoints/joint-exit-v1.pt)
+[2026-09-28 03:36:27] watchdog: repair attempt 1 did not produce progress
+[2026-09-28 03:36:27] watchdog: problem detected (log stale >15min (hang)), attempting repair 2/2
+[2026-09-28 03:36:37] watchdog: OOM seen, relaunching with batch-size 8
+[2026-09-28 03:36:37] watchdog: relaunched training (batch=8, resume from /home/src/dllm/data/checkpoints/joint-exit-v1.pt)
+[2026-09-28 03:43:37] watchdog: repair attempt 2 did not produce progress
+[2026-09-28 03:43:37] watchdog: STILL BROKEN after 2 repair attempts, giving up
+[2026-09-28 03:43:37] watchdog loop: fatal, stopping

@@ -1,0 +1,33 @@
+windows 4/64
+windows 8/64
+windows 12/64
+windows 16/64
+windows 20/64
+windows 24/64
+windows 28/64
+windows 32/64
+windows 36/64
+windows 40/64
+windows 44/64
+windows 48/64
+windows 52/64
+windows 56/64
+windows 60/64
+windows 64/64
+
+per-depth full-sequence CE (nats/token): 47.0314 43.0201 49.4863 64.9960 66.9649 50.6743 51.1060 51.0111 47.4142 44.2533 45.0040 47.3876 49.6323 49.9747 14.5080 13.3300 11.1831 10.7458 10.9009 10.9369 10.3153 9.9262 9.4042 19.8935
+per-depth next-token CE (nats):         45.8380 41.7030 49.2428 65.1514 67.1497 48.0728 49.1153 48.3818 45.5221 42.4226 42.7443 45.3700 48.0753 48.5702 12.7363 11.4304 9.2970 8.9262 8.9929 8.8890 8.2406 7.9921 7.6497 18.0202
+
+== sequence CE ==
+            policy exit_depth   ce_nats      ppl  delta_nats   rel_%
+      teacher@full         24    7.0330 1133.400    -12.8605 -64.65
+   full_readout@24         24   19.8935 436146400.687      0.0000   0.00
+  deployed_default       8.00   51.0111 14250967275916218073088.000     31.1176 156.42   speedup=3.00x
+        trained_pi       8.00   51.0111 14250967275916218073088.000     31.1176 156.42   speedup=3.00x
+
+== next-token CE ==
+            policy exit_depth   ce_nats      ppl  delta_nats   rel_%
+      teacher@full         24    5.7322  308.661    -12.2880 -68.19
+   full_readout@24         24   18.0202 67002537.643      0.0000   0.00
+  deployed_default       8.00   48.3818 1027857343169751416832.000     30.3615 168.49   speedup=3.00x
+        trained_pi       8.00   48.3818 1027857343169751416832.000     30.3615 168.49   speedup=3.00x
