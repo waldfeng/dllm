@@ -11,7 +11,6 @@ from memory_transformer import (
     MemoryTransformerConfig,
     MemoryTransformerForCausalLM,
     ensure_exit_readout,
-    selection_exit_depth,
 )
 from test import load_model
 from train import assemble_exit_terms, exit_readout_losses
@@ -55,7 +54,7 @@ def permissive_args(**overrides) -> argparse.Namespace:
 def synthetic_rollout(
     depth: int = 4, batch: int = 2, hidden: int = 32, vocab: int = 32, seed: int = 0
 ) -> dict[str, torch.Tensor]:
-    generator = torch.Generator().manual_seed(seed)
+    generator = torch.Generator(device="cuda").manual_seed(seed)
     states = torch.randn(depth, batch, hidden, generator=generator)
     deltas = torch.rand(depth, batch, generator=generator)
     teacher = torch.randn(batch, vocab, generator=generator) * 5.0
@@ -67,20 +66,19 @@ def uniform_weights() -> torch.Tensor:
     return prior / prior.sum()
 
 
-def speed_only_model(**overrides) -> MemoryTransformerForCausalLM:
+def always_exit_model(**overrides) -> MemoryTransformerForCausalLM:
     values = dict(
         early_exit_enabled=True,
         early_exit_confidence_threshold=1e-6,
-        early_exit_margin_threshold=0.3,
+        early_exit_margin_threshold=0.0,
         early_exit_state_delta_threshold=1e9,
-        exit_selection_weights=(0.0, 0.0, 0.0, 0.0, 1.0, 0.0),
     )
     values.update(overrides)
     return tiny_model(**values)
 
 
 def test_full_min_depth_runs_full_depth_and_matches_baseline():
-    model = speed_only_model(early_exit_min_depth=4).eval()
+    model = always_exit_model(early_exit_min_depth=4).eval()
     ids = torch.arange(8).view(1, 8) % 32
     with torch.no_grad():
         exited = model(ids, early_exit=True)
@@ -90,8 +88,8 @@ def test_full_min_depth_runs_full_depth_and_matches_baseline():
     assert torch.equal(exited["logits"], baseline["logits"])
 
 
-def test_monotone_cost_halts_at_min_depth_and_matches_manual_loop():
-    model = speed_only_model(early_exit_min_depth=2).eval()
+def test_threshold_rule_halts_at_first_candidate_and_matches_manual_loop():
+    model = always_exit_model(early_exit_min_depth=2).eval()
     ensure_exit_readout(model)
     ids = torch.arange(8).view(1, 8) % 32
     with torch.no_grad():
@@ -278,35 +276,38 @@ def test_exit_rollout_shapes_and_zero_first_delta():
     assert torch.all(rollout["deltas"][1:] > 0.0)
 
 
-def test_checkpoint_roundtrip_with_selection_payload(tmp_path: Path):
+def test_checkpoint_roundtrip_enables_halting(tmp_path: Path):
     model = tiny_model().eval()
     ensure_exit_readout(model)
     ids = torch.arange(8).view(1, 8) % 32
     with torch.no_grad():
         before = model(ids, early_exit=True)["logits"]
-    weights = torch.tensor(list(model.config.exit_selection_weights))
     path = tmp_path / "exit-readout.pt"
     torch.save(
         {
             "model": model.state_dict(),
             "config": asdict(model.config),
             "exit_readout_rank": 16,
-            "exit_loss_weights": weights,
-            "exit_temperature": 0.25,
         },
         path,
     )
-    restored = load_model(path, torch.device("cpu"))
+    restored = load_model(path, torch.device("cuda"))
     assert restored.config.early_exit_enabled is True
-    assert torch.allclose(
-        torch.tensor(restored.config.exit_selection_weights),
-        torch.tensor(model.config.exit_selection_weights),
-        atol=1e-6,
-    )
-    assert restored.config.exit_selection_temperature == pytest.approx(0.25)
     with torch.no_grad():
         after = restored(ids, early_exit=True)["logits"]
     assert torch.equal(before, after)
+
+
+def test_load_model_tolerates_retired_config_fields(tmp_path: Path):
+    model = tiny_model().eval()
+    ensure_exit_readout(model)
+    saved = asdict(model.config)
+    saved["exit_selection_weights"] = (0.0, 0.2, 0.2, 0.2, 0.2, 0.2)
+    saved["exit_selection_temperature"] = 0.25
+    path = tmp_path / "legacy-config.pt"
+    torch.save({"model": model.state_dict(), "config": saved, "exit_readout_rank": 16}, path)
+    restored = load_model(path, torch.device("cuda"))
+    assert restored.config.early_exit_enabled is True
 
 
 def test_shortlist_full_coverage_matches_full_ce():
@@ -329,11 +330,13 @@ def test_shortlist_full_coverage_matches_full_ce():
         full_ce = torch.nn.functional.cross_entropy(logits, target, reduction="none")
         expected.append(full_ce / (log_vocab + full_ce))
     expected_mean = torch.stack(expected).mean().detach()
-    assert abs(stats["ce"] - float(expected_mean)) < 1e-6
+    # CUDA readout terms are assembled in bf16 (train.py compute_dtype), so
+    # the fp32 reference here only matches to bf16 rounding.
+    assert abs(stats["ce"] - float(expected_mean)) < 2e-3
 
 
 def test_generate_returns_stats():
-    model = speed_only_model(early_exit_min_depth=1).eval()
+    model = always_exit_model(early_exit_min_depth=1).eval()
     ids = torch.arange(4).view(1, 4) % 32
     with torch.no_grad():
         generated, stats = model.generate(ids, 3, early_exit=True, return_stats=True)
@@ -342,70 +345,83 @@ def test_generate_returns_stats():
     assert stats["avg_exit_depth"] == 1.0
 
 
-def test_selection_exit_depth_pure_rule():
-    assert selection_exit_depth([3.0, 2.0, 1.0, 0.5], 1, 4) == (4, False)
-    assert selection_exit_depth([1.0, 2.0, 3.0, 4.0], 1, 4) == (1, True)
-    assert selection_exit_depth([9.0, 8.0, 1.0, 5.0], 2, 4) == (3, True)
-    assert selection_exit_depth([9.0, 8.0, 7.0, 3.0], 3, 4) == (4, False)
-    assert selection_exit_depth([1.0, 0.5], 5, 4) == (4, False)
-
-
-def test_apply_exit_selection_sets_and_validates():
-    model = tiny_model()
-    model.apply_exit_selection([0.0, 0.2, 0.2, 0.2, 0.2, 0.2], 0.3)
-    assert model.config.early_exit_enabled is True
-    assert model.config.exit_selection_temperature == 0.3
-    assert model.config.exit_selection_weights[0] == 0.0
-    with pytest.raises(ValueError, match="must sum to one"):
-        model.apply_exit_selection([0.5, 0.1, 0.1, 0.1, 0.1, 0.05], 0.25)
-    with pytest.raises(ValueError, match="must hold six values"):
-        model.apply_exit_selection([0.5, 0.5], 0.25)
-    with pytest.raises(ValueError, match="must be non-negative"):
-        model.apply_exit_selection([-0.1, 0.22, 0.22, 0.22, 0.22, 0.22], 0.25)
-
-
 def test_config_validates_exit_fields():
     with pytest.raises(ValueError, match="early_exit_min_depth"):
         tiny_config(early_exit_min_depth=0)
     with pytest.raises(ValueError, match="early_exit_confidence_threshold"):
         tiny_config(early_exit_confidence_threshold=0.0)
+    with pytest.raises(ValueError, match="early_exit_margin_threshold"):
+        tiny_config(early_exit_margin_threshold=-1.0)
     with pytest.raises(ValueError, match="early_exit_state_delta_threshold"):
         tiny_config(early_exit_state_delta_threshold=0.0)
-    with pytest.raises(ValueError, match="exit_selection_weights must hold six"):
-        tiny_config(exit_selection_weights=(0.5, 0.5))
-    with pytest.raises(ValueError, match="must sum to one"):
-        tiny_config(exit_selection_weights=(0.5, 0.1, 0.1, 0.1, 0.1, 0.05))
-    with pytest.raises(ValueError, match="must be non-negative"):
-        tiny_config(exit_selection_weights=(-0.1, 0.22, 0.22, 0.22, 0.22, 0.22))
-    with pytest.raises(ValueError, match="exit_selection_temperature"):
-        tiny_config(exit_selection_temperature=0.0)
     with pytest.raises(ValueError, match="exit_readout_rank"):
         tiny_config(exit_readout_rank=0)
 
 
-def test_exit_selection_cost_matches_reference():
+def test_thresholds_met_unit():
     model = tiny_model(
-        early_exit_confidence_threshold=0.9,
+        early_exit_confidence_threshold=0.6,
         early_exit_margin_threshold=0.3,
-        early_exit_state_delta_threshold=0.05,
+        early_exit_state_delta_threshold=0.2,
     )
-    confidence = torch.tensor([0.5, 0.95])
-    margin = torch.tensor([0.1, 0.4])
-    delta = torch.tensor([0.5, 0.01])
-    cost = model._exit_selection_cost(confidence, margin, delta, 1)
-    weights = model.config.exit_selection_weights
-    expected = (
-        weights[1] * (1.0 - confidence).mean()
-        + weights[2] * (1.0 - margin).mean()
-        + weights[3] * (delta / 0.05).mean()
-        + weights[4] * torch.tensor(0.5)
-        + weights[5] * torch.tensor(0.0)
-    )
-    assert torch.allclose(cost, expected, atol=1e-6)
+    confidence = torch.tensor([0.7])
+    margin = torch.tensor([0.4])
+    assert model._thresholds_met(confidence, margin, None) is True
+    assert model._thresholds_met(torch.tensor([0.5]), margin, None) is False
+    assert model._thresholds_met(confidence, torch.tensor([0.2]), None) is False
+    assert model._thresholds_met(confidence, margin, torch.tensor([0.3])) is False
+    assert model._thresholds_met(confidence, margin, torch.tensor([0.1])) is True
+
+
+def test_threshold_conjunction_requires_all_three():
+    model = tiny_model(
+        early_exit_enabled=True,
+        early_exit_min_depth=1,
+        early_exit_confidence_threshold=0.5,
+        early_exit_margin_threshold=0.3,
+        early_exit_state_delta_threshold=1e9,
+    ).eval()
+    ensure_exit_readout(model)
+    ids = torch.arange(8).view(1, 8) % 32
+    with torch.no_grad():
+        others = torch.ones(32, dtype=torch.bool)
+        others[3] = False
+        model.exit_readout.bias[:, others] = -20.0
+        model.exit_readout.bias[:, 3] = 20.0
+    with torch.no_grad():
+        halted = model(ids, early_exit=True)
+    assert halted["exit_depth"] == 1
+    assert halted["exit_halted"] is True
+    with torch.no_grad():
+        model.exit_readout.bias.zero_()
+        model.config.early_exit_confidence_threshold = 1.0
+        blocked = model(ids, early_exit=True)
+    assert blocked["exit_depth"] == 4
+    assert blocked["exit_halted"] is False
+
+
+def test_state_delta_threshold_gates_halting():
+    model = tiny_model(
+        early_exit_enabled=True,
+        early_exit_min_depth=2,
+        early_exit_confidence_threshold=1e-6,
+        early_exit_margin_threshold=0.0,
+        early_exit_state_delta_threshold=1e-6,
+    ).eval()
+    ids = torch.arange(8).view(1, 8) % 32
+    with torch.no_grad():
+        strict = model(ids, early_exit=True)
+    assert strict["exit_depth"] == 4
+    assert strict["exit_halted"] is False
+    with torch.no_grad():
+        model.config.early_exit_state_delta_threshold = 1e9
+        permissive = model(ids, early_exit=True)
+    assert permissive["exit_depth"] == 2
+    assert permissive["exit_halted"] is True
 
 
 def test_oversized_min_depth_clamps_to_full_depth():
-    model = speed_only_model(early_exit_min_depth=99).eval()
+    model = always_exit_model(early_exit_min_depth=99).eval()
     ids = torch.arange(8).view(1, 8) % 32
     with torch.no_grad():
         output = model(ids, early_exit=True)
@@ -480,8 +496,11 @@ def test_assemble_terms_matches_readout_losses_and_base_path():
     terms_base, selection_base, _ = assemble_exit_terms(
         model, rollout, target, args, 4, base_logits=base
     )
-    assert torch.allclose(terms_base, terms, atol=1e-5)
-    assert torch.allclose(selection_base, selection_logits, atol=1e-5)
+    # bf16 readout assembly on CUDA vs the fp32 base-logits reference; the
+    # bf16 GEMM itself is run-to-run nondeterministic (cublas split-k
+    # scheduling), so keep a generous absolute band over the [0, 1] terms.
+    assert torch.allclose(terms_base, terms, atol=6e-3)
+    assert torch.allclose(selection_base, selection_logits, atol=6e-3)
 
 
 def test_single_sample_exit_terms_preserve_depth_batch_axes():
@@ -499,7 +518,8 @@ def test_single_sample_exit_terms_preserve_depth_batch_axes():
     )
     log_vocab = torch.tensor(float(model.config.vocab_size)).log()
     expected = expected / (log_vocab + expected)
-    assert torch.allclose(terms[0, :, 0], expected, atol=1e-5)
+    # bf16 readout assembly on CUDA vs the fp32 base-logits reference
+    assert torch.allclose(terms[0, :, 0], expected, atol=2e-3)
 
 
 def test_phase_isolation_halting_vs_backbone():
@@ -561,3 +581,51 @@ def test_forward_until_truncates_cycles():
     assert four["router_losses"].shape == (4,)
     with pytest.raises(ValueError):
         model.forward_until(ids, 5)
+
+
+def test_forward_until_delta_matches_rollout_and_carries_gradient():
+    model = tiny_model()
+    ensure_exit_readout(model)
+    ids = torch.arange(16).view(2, 8) % 32
+    depth = 3
+    forward = model.forward_until(ids, depth, collect_delta=True)
+    assert forward["final_delta"].shape == (2,)
+    # the selected depth's delta matches the rollout's delta at that depth
+    rollout = model.joint_rollout(ids)
+    assert torch.allclose(forward["final_delta"].detach(), rollout["deltas"][depth - 1])
+    # depth 1 has no previous cycle: the delta is a zero constant
+    one = model.forward_until(ids, 1, collect_delta=True)
+    assert one["final_delta"].shape == (2,)
+    assert torch.all(one["final_delta"] == 0)
+    # collect_delta=False leaves the result unchanged
+    assert "final_delta" not in model.forward_until(ids, depth)
+    # the delta term's gradient reaches the backbone (both cycles), not the readout
+    model.zero_grad(set_to_none=True)
+    for parameter in model.exit_readout.parameters():
+        parameter.requires_grad_(False)
+    fresh = model.forward_until(ids, depth, collect_delta=True)
+    fresh["final_delta"].sum().backward()
+    backbone_grads = [
+        parameter.grad
+        for name, parameter in model.named_parameters()
+        if not name.startswith("exit_readout.")
+    ]
+    assert any(grad is not None for grad in backbone_grads)
+    assert all(parameter.grad is None for parameter in model.exit_readout.parameters())
+
+
+def test_assemble_exit_terms_omits_delta_when_disabled():
+    model = tiny_model().eval()
+    ensure_exit_readout(model)
+    rollout = synthetic_rollout()
+    target = torch.tensor([3, 7])
+    args = permissive_args(exit_min_depth=2)
+    terms_with, selection_with, _ = assemble_exit_terms(model, rollout, target, args, 4)
+    terms, selection, _ = assemble_exit_terms(
+        model, rollout, target, args, 4, include_delta=False
+    )
+    assert terms.shape == (5, 4, 2)
+    assert torch.allclose(torch.cat([terms_with[:3], terms_with[4:]]), terms)
+    # the selection drops the delta row's contribution
+    delta_row = terms_with[3].mean(dim=-1)
+    assert torch.allclose(selection, selection_with + delta_row.sum(0))

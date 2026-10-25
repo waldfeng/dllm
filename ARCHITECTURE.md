@@ -72,25 +72,21 @@ and the final norm. It remains inside the requested 1B-1.5B range.
 
 ## Early Exit And Calibrated Readout
 
-After each reasoner cycle the model evaluates a weighted halting cost on the
-last token position; the exit depth is the argmax of the depth-selection
-distribution over the whole loop (batch-level):
+At inference each sample runs independently. From cycle `d_min` on, the loop
+halts at the first cycle whose last-position readout satisfies all three
+thresholds; otherwise it runs to the full depth `L` and stops there
+(``exit_halted`` stays false at full depth):
 
 ```text
-l_t = pi_conf   * max(0, tau_c - p_t)   # top-1 probability deficit
-    + pi_margin * max(0, tau_m - m_t)   # m_t = p1 - p2 probability margin
-    + pi_delta  * max(0, d_t - tau_d)   # normalized state change (mask-averaged)
-    + pi_speed  * t / num_depths        # speed pressure
-    + pi_guard  * max(0, min_depth - t) / num_depths
-rho = softmax(-l_t / temperature)
-exit depth = argmax_t rho_t             # equivalently the smallest l_t
+halt at cycle t  iff  t >= d_min
+                  and p_t >= tau_p          # top-1 probability
+                  and m_t >= tau_m          # m_t = p1 - p2 probability margin
+                  and delta_t <= tau_delta  # normalized state change
 ```
 
-Online the loop tracks the running minimum of `l_t` and halts at the first
-depth whose cost rises above it; depths below `min_depth` are never exit
-candidates, and the shortlist cross-entropy term is dropped because it has no
-ground truth at inference (its annealed prior mass is zero, so the training
-and inference depth-selection distributions coincide).
+Depths below `d_min` are never exit candidates. Defaults: `d_min=2`,
+`tau_p=0.6`, `tau_m=0.3`, `tau_delta=0.2`; the training-side delta scale
+(`--exit-tau-delta 0.05`) is a separate parameter.
 
 `CalibratedExitReadout` is an optional per-depth correction on the frozen
 `lm_head`: `logits_t = s_t * (W h + B_t (A_t h) + c_t)` with rank-16 LoRA
@@ -115,16 +111,19 @@ shortlist CE uses the top-64 teacher tokens plus the true token, so per-depth
 supervision costs almost nothing.
 
 The trained six-way weights and the final temperature are saved inside the
-exit checkpoint (`exit_loss_weights`, `exit_temperature`); `test.py` restores
-them and enables the depth-selection halting automatically for two-stage
-checkpoints.
+exit checkpoint (`exit_loss_weights`, `exit_temperature`) for diagnostics
+only; the inference halting rule consumes just the thresholds above.  The
+joint two-phase mode (`train.py --train-exit-joint`) selects per-sample
+depths with the fixed six-term weights and updates the readout and the
+backbone with two disjoint losses in one micro-batch.  `test.py` enables the
+threshold-conjunction halting automatically for two-stage checkpoints.
 
 ```bash
 torchrun --standalone --nproc_per_node=2 train.py ...   # pretraining (unchanged)
 python train.py --train-exit-readout --resume <base.pt> \
-  --checkpoint datasets/checkpoints/exit-readout.pt --steps 2000 \
+  --checkpoint checkpoints/exit-readout.pt --steps 2000 \
   --exit-readout-rank 16 --device auto
-python test.py --checkpoint datasets/checkpoints/exit-readout.pt \
+python test.py --checkpoint checkpoints/exit-readout.pt \
   --benchmark-tokens 128
 ```
 
@@ -147,7 +146,7 @@ uv pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --python .venv -e ".[
 
 ```bash
 .venv/bin/python scripts/download_pretrain_datasets.py \
-  --output datasets \
+  --output data/text_v2 \
   --workers 16
 ```
 
@@ -155,8 +154,8 @@ uv pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --python .venv -e ".[
 
 ```bash
 .venv/bin/python scripts/prepare_pretrain_data.py \
-  --input-dir datasets \
-  --output-dir datasets/tokens \
+  --input-dir data/text_v2 \
+  --output-dir data/tokens_v2 \
   --tokenizer tokenizer/qwen \
   --local-files-only \
   --min-tokens 20000000000
@@ -164,7 +163,7 @@ uv pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --python .venv -e ".[
 
 The preprocessing step appends the Qwen EOS token to each document, writes
 uint32 mmap shards, and records the exact token count in
-`datasets/tokens/manifest.json`. The training loader reads windows directly
+`data/tokens_v2/manifest.json`. The training loader reads windows directly
 from these shards and assigns disjoint batches to ranks.
 
 The two-GPU training entry point uses bf16, FSDP, gradient accumulation,
@@ -175,7 +174,7 @@ effective token batch by one eighth to leave GPU headroom:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 train.py \
-  --dataset-dir datasets/tokens \
+  --dataset-dir data/tokens_v2 \
   --tokenizer tokenizer/qwen \
   --steps 900 \
   --sequence-length 4608 \
@@ -187,15 +186,16 @@ torchrun --standalone --nproc_per_node=2 train.py \
   --precision bf16 \
   --save-steps 0 \
   --save-interval-hours 1 \
-  --checkpoint datasets/checkpoints/memory-transformer-12h.pt \
+  --checkpoint checkpoints/memory-transformer-12h.pt \
   --log-steps 10
 ```
 
 This configuration has an effective global batch of 64,512 tokens per
 optimizer step. The measured throughput is about 1,348 tokens/second across
 both GPUs, giving about 12 hours for 900 steps. The checkpoint path is
-atomically overwritten once per wall-clock hour; training output should be
-redirected to a persistent log file such as `logs/train_12h.log`.
+atomically overwritten once per wall-clock hour (all three training paths:
+pretraining, joint, and legacy exit-readout); training output should be
+redirected to a persistent log file such as `checkpoints/logs/train_12h.log`.
 
 The reference implementation is correctness-oriented. The block dispatch is
 memory-safe but not a fused production kernel; benchmark throughput before

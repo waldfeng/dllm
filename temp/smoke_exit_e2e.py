@@ -95,7 +95,7 @@ def main() -> None:
         "--num-attention-heads", "4", "--num-key-value-heads", "2",
         "--num-memory-blocks", "4", "--top-k", "2", "--max-position-embeddings", "32",
         "--steps", "6", "--batch-size", "2", "--sequence-length", "8",
-        "--log-steps", "1", "--device", "cpu", "--precision", "fp32",
+        "--log-steps", "1", "--device", "cuda", "--precision", "fp32",
         "--exit-readout-lr", "3e-2", "--exit-tau-confidence", "0.3",
         "--exit-tau-margin", "0.05", "--exit-tau-delta", "0.05", "--exit-min-depth", "2",
     ])
@@ -140,7 +140,7 @@ def run_joint_smoke(store: Path, base: Path) -> None:
         "--num-attention-heads", "4", "--num-key-value-heads", "2",
         "--num-memory-blocks", "4", "--top-k", "2", "--max-position-embeddings", "32",
         "--sequence-length", "8", "--batch-size", "2", "--gradient-accumulation", "2",
-        "--log-steps", "1", "--device", "cpu", "--precision", "fp32",
+        "--log-steps", "1", "--device", "cuda", "--precision", "fp32",
         "--exit-min-depth", "2", "--exit-joint-readout-lr", "5e-3",
         "--loss-weight-prior", "0.0,0.15,0.15,0.10,0.45,0.15",
         "--lr", "1e-2", "--warmup-steps", "1",

@@ -108,7 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("data/checkpoints/last.pt"),
+        default=Path("checkpoints/last.pt"),
     )
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--resume-repartition", action="store_true",
@@ -124,7 +124,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-interval-hours",
         type=float,
-        default=0.0,
+        default=1.0,
         help="overwrite the checkpoint after this wall-clock interval; 0 disables it",
     )
     parser.add_argument("--log-steps", type=int, default=10)
@@ -139,7 +139,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="skip the final checkpoint save when training ends",
     )
-    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument("--device", choices=("cuda",), default="cuda")
     parser.add_argument(
         "--train-exit-readout",
         action="store_true",
@@ -163,10 +163,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exit-tau-margin", type=float, default=0.3)
     parser.add_argument("--exit-tau-delta", type=float, default=0.05)
     parser.add_argument(
+        "--exit-delta-weight",
+        type=float,
+        default=1.1,
+        help="lossB coefficient for the selected depth's state-change term "
+        "(delta / --exit-tau-delta). Calibrate for a target share s of lossB as "
+        "s/(1-s) * (lossB_ce + router_weight * router_loss) / mean(delta/tau) "
+        "from past joint logs; 1.1 ~= 20%% share at lossB_ce 8.5, d=0.99",
+    )
+    parser.add_argument(
         "--loss-weight-prior",
-        default="0.65,0.05,0.05,0.05,0.15,0.05",
-        help="fixed target distribution over the six loss terms "
-        "[CE, confidence, margin, delta, speed, guard]",
+        default="0.65,0.06,0.06,0.17,0.06",
+        help="fixed target distribution over the five cost terms "
+        "[CE, confidence, margin, speed, guard] (C_1..C_5); six-value inputs "
+        "[CE, confidence, margin, delta, speed, guard] are still accepted for "
+        "backward compatibility: the joint trainer drops the delta slot (its "
+        "state-change term trains lossB via --exit-delta-weight) and "
+        "renormalizes the remaining five",
     )
     parser.add_argument(
         "--pi1-anneal-start",
@@ -217,18 +230,12 @@ def setup_distributed(device_choice: str) -> tuple[int, int, int, torch.device, 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    use_cuda = device_choice != "cpu" and torch.cuda.is_available()
-    if device_choice == "cuda" and not use_cuda:
-        raise RuntimeError("--device cuda was requested but CUDA is unavailable")
+    if not torch.cuda.is_available():
+        raise RuntimeError("GPU-only policy: training requires CUDA")
     if world_size > 1:
-        backend = "nccl" if use_cuda else "gloo"
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-    if use_cuda:
-        if world_size > 1:
-            torch.cuda.set_device(local_rank)
-        device = torch.device("cuda", local_rank if world_size > 1 else 0)
-    else:
-        device = torch.device("cpu")
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+        torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank if world_size > 1 else 0)
     return rank, world_size, local_rank, device, world_size > 1
 
 
@@ -632,8 +639,9 @@ def assemble_exit_terms(
     args: argparse.Namespace,
     num_depths: int,
     base_logits: Optional[Tensor] = None,
+    include_delta: bool = True,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Build the six per-depth halting terms ``[6, D, B]`` and selection logits.
+    """Build the per-depth halting terms ``[6 or 5, D, B]`` and selection logits.
 
     Linear costs with no extra nonlinearity: bounded CE mapping
     ``CE/(ln V + CE)`` in [0, 1), confidence and margin deficits in [0, 1],
@@ -643,14 +651,16 @@ def assemble_exit_terms(
     the per-depth last-position normed states; when ``base_logits`` is given
     (the cached last-position ``W h`` products from :meth:`joint_rollout`) the
     readout logits are reconstructed from it plus the batched LoRA correction,
-    skipping a redundant vocabulary matmul.
+    skipping a redundant vocabulary matmul.  ``include_delta=False`` drops the
+    state-change row (five terms) -- lossB trains it through
+    :meth:`forward_until` instead, so the phase-A cost matrix omits it.
     """
     device = rollout["states"].device
     depths_range = torch.arange(num_depths, device=device, dtype=torch.float32)
     depth_fraction = (depths_range + 1.0) / num_depths
     guard = ((args.exit_min_depth - (depths_range + 1.0)) / num_depths).clamp_min(0.0)
     speed = depth_fraction
-    deltas = rollout["deltas"].float()
+    deltas = rollout["deltas"].float() if include_delta else None
     states = rollout["states"].float()
     target = target_tokens
     log_vocab = float(np.log(model.lm_head.weight.shape[0]))
@@ -680,17 +690,16 @@ def assemble_exit_terms(
     margin = confidence - (top2[..., 1] - log_normalizer).exp()
     target_logit = logits.gather(-1, target[None, :, None].expand(num_depths, -1, 1)).squeeze(-1)
     cross_entropy = (log_normalizer - target_logit) / log_vocab
-    per_depth_terms = torch.stack(
-        [
-            cross_entropy / (1.0 + cross_entropy),
-            1.0 - confidence,
-            1.0 - margin,
-            deltas / args.exit_tau_delta,
-            speed[:, None].expand(num_depths, cross_entropy.shape[-1]),
-            guard[:, None].expand(num_depths, cross_entropy.shape[-1]),
-        ],
-        dim=0,
-    )  # [6, D, B]
+    term_rows = [
+        cross_entropy / (1.0 + cross_entropy),
+        1.0 - confidence,
+        1.0 - margin,
+    ]
+    if include_delta:
+        term_rows.append(deltas / args.exit_tau_delta)
+    term_rows.append(speed[:, None].expand(num_depths, cross_entropy.shape[-1]))
+    term_rows.append(guard[:, None].expand(num_depths, cross_entropy.shape[-1]))
+    per_depth_terms = torch.stack(term_rows, dim=0)  # [5 or 6, D, B]
     selection_logits = -(per_depth_terms.mean(dim=-1).sum(dim=0))  # [D]
     return per_depth_terms, selection_logits, depths_range
 
@@ -866,8 +875,13 @@ def train_exit_readout(args: argparse.Namespace) -> None:
     prior = torch.tensor(
         [float(value) for value in args.loss_weight_prior.split(",")], dtype=torch.float32
     )
+    if prior.numel() == 5:
+        # Five-value prior maps to [CE, confidence, margin, speed, guard];
+        # this loss keeps a delta slot with zero weight (the state-change
+        # term belongs to lossB in joint training).
+        prior = torch.cat([prior[:3], prior.new_zeros(1), prior[3:]])
     if prior.numel() != 6 or abs(float(prior.sum()) - 1.0) > 1e-4:
-        raise ValueError("--loss-weight-prior must hold six values summing to one")
+        raise ValueError("--loss-weight-prior must hold five or six values summing to one")
     seed_everything(args.seed, rank)
     store = TokenStore(args.dataset_dir)
     vocab_size = int(store.manifest["vocab_size"])
@@ -940,15 +954,7 @@ def train_exit_readout(args: argparse.Namespace) -> None:
         torch.cuda.reset_peak_memory_stats(device)
     sync_parameters = trainable
     run_started = time.monotonic()
-
-    def selection_payload(step_progress: float) -> dict[str, object]:
-        learned = weights.detach()
-        return {
-            "exit_loss_weights": learned.cpu(),
-            "exit_temperature": float(
-                _anneal(args.exit_temp_start, args.exit_temp_end, step_progress)
-            ),
-        }
+    last_wall_save = run_started
 
     iterator = token_batches(
         store,
@@ -1026,13 +1032,36 @@ def train_exit_readout(args: argparse.Namespace) -> None:
                     "optimizer": optimizer.state_dict(),
                     "config": asdict(config),
                     "exit_readout_rank": model.exit_readout.rank,
-                    **selection_payload(progress),
                 },
                 args.checkpoint,
             )
             print(
                 f"exit_readout_saved step={global_step + 1} path={args.checkpoint} "
                 f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f}",
+                flush=True,
+            )
+        # Wall-clock checkpointing: hourly overwrite so a crash between step
+        # saves loses at most one hour of progress.
+        if (
+            rank == 0
+            and args.save_interval_hours > 0
+            and time.monotonic() - last_wall_save >= args.save_interval_hours * 3600.0
+        ):
+            last_wall_save = time.monotonic()
+            atomic_torch_save(
+                {
+                    "step": global_step + 1,
+                    "model": {key: value.cpu() for key, value in model.state_dict().items()},
+                    "optimizer": optimizer.state_dict(),
+                    "config": asdict(config),
+                    "exit_readout_rank": model.exit_readout.rank,
+                },
+                args.checkpoint,
+            )
+            print(
+                f"exit_readout_saved step={global_step + 1} path={args.checkpoint} "
+                f"elapsed_h={(time.monotonic() - run_started) / 3600.0:.3f} "
+                f"trigger=wall",
                 flush=True,
             )
     if rank == 0:
@@ -1043,7 +1072,6 @@ def train_exit_readout(args: argparse.Namespace) -> None:
                 "optimizer": optimizer.state_dict(),
                 "config": asdict(config),
                 "exit_readout_rank": model.exit_readout.rank,
-                **selection_payload(1.0),
             },
             args.checkpoint,
         )
@@ -1142,8 +1170,14 @@ def train_joint_exit(args: argparse.Namespace) -> None:
     prior = torch.tensor(
         [float(value) for value in args.loss_weight_prior.split(",")], dtype=torch.float32
     )
-    if prior.numel() != 6 or abs(float(prior.sum()) - 1.0) > 1e-4:
-        raise ValueError("--loss-weight-prior must hold six values summing to one")
+    if prior.numel() not in (5, 6) or abs(float(prior.sum()) - 1.0) > 1e-4:
+        raise ValueError("--loss-weight-prior must hold five or six values summing to one")
+    if prior.numel() == 6:
+        # The joint cost matrix has five terms: the state-change row now
+        # trains the backbone through lossB (--exit-delta-weight), so drop
+        # the delta slot and renormalize to keep the selection scale.
+        cost_prior = torch.cat([prior[:3], prior[4:]])
+        prior = cost_prior / cost_prior.sum()
     seed_everything(args.seed, rank)
     store = TokenStore(args.dataset_dir)
     vocab_size = int(store.manifest["vocab_size"])
@@ -1296,7 +1330,7 @@ def train_joint_exit(args: argparse.Namespace) -> None:
         t_rollout = time.perf_counter()
         try:
             with autocast:
-                rollout = model.joint_rollout(input_tensor)
+                rollout = model.joint_rollout(input_tensor, compute_deltas=False)
         except torch.OutOfMemoryError:
             torch.cuda.empty_cache()
             oom_skips += 1
@@ -1306,14 +1340,13 @@ def train_joint_exit(args: argparse.Namespace) -> None:
         if phase_a_ok:
             t_aterms = time.perf_counter()
             states = rollout["states"].clone()
-            deltas = rollout["deltas"].clone()
             base_logits = rollout["base_logits"].clone()
             router_all = rollout["router_losses"].clone()
             del rollout
-            phase_a_rollout = {"states": states, "deltas": deltas}
+            phase_a_rollout = {"states": states}
             term_rows, _, depths_range = assemble_exit_terms(
                 model, phase_a_rollout, target_last, args, config.num_layers,
-                base_logits=base_logits,
+                base_logits=base_logits, include_delta=False,
             )
         if phase_a_ok:
             weights = fixed_weights
@@ -1444,6 +1477,7 @@ def train_joint_exit(args: argparse.Namespace) -> None:
             ce_chunk_size = args.ce_chunk_rows if args.ce_chunk_rows > 0 else 8192
             ce_total = 0.0
             router_total = 0.0
+            delta_total = 0.0
             # An OOM inside a sub-chunk may have already deposited partial
             # gradients, so the whole micro-batch restarts from scratch with
             # smaller chunks; gradients from the aborted attempt are dropped.
@@ -1458,6 +1492,7 @@ def train_joint_exit(args: argparse.Namespace) -> None:
                 try:
                     ce_total = 0.0
                     router_total = 0.0
+                    delta_total = 0.0
                     optimizer_b.zero_grad(set_to_none=True)
                     for group_depth in selected_depths.unique().tolist():
                         indices = (selected_depths == group_depth).nonzero().flatten()
@@ -1467,7 +1502,8 @@ def train_joint_exit(args: argparse.Namespace) -> None:
                             sub = indices[pos:pos + chunk]
                             with autocast:
                                 forward = model.forward_until(
-                                    input_tensor[sub], num_cycles=group_depth, collect_states=False)
+                                    input_tensor[sub], num_cycles=group_depth, collect_states=False,
+                                    collect_delta=True)
                             # iter_training_batches already supplies window[1:]
                             # labels.  Shifting again would train a
                             # two-position-ahead target.
@@ -1483,12 +1519,14 @@ def train_joint_exit(args: argparse.Namespace) -> None:
                                 ce_sum = ce_sum + torch.utils.checkpoint.checkpoint(
                                     chunk_ce, flat_hidden[start:start+ce_chunk_size], flat_labels[start:start+ce_chunk_size], use_reentrant=False)
                             router_term = forward["router_losses"][:group_depth].mean() * sub.numel() / input_tensor.shape[0]
-                            loss_chunk = (ce_sum / masked_count + args.router_weight * router_term) / args.gradient_accumulation
+                            delta_term = forward["final_delta"].float().sum() / input_tensor.shape[0]
+                            loss_chunk = (ce_sum / masked_count + args.router_weight * router_term + args.exit_delta_weight * delta_term / args.exit_tau_delta) / args.gradient_accumulation
                             if not torch.isfinite(loss_chunk):
                                 raise FloatingPointError(f"non-finite phase-B loss at step {global_step}")
                             loss_chunk.backward()
                             ce_total += float(ce_sum.detach())
                             router_total += float(router_term.detach())
+                            delta_total += float(delta_term.detach())
                             del forward, flat_hidden, flat_labels, ce_sum, loss_chunk
                             pos += chunk
                     break
@@ -1501,17 +1539,19 @@ def train_joint_exit(args: argparse.Namespace) -> None:
             if not phase_b_failed:
                 ce_mean = ce_total / float(masked_count)
                 router_sum = router_total
-                loss_b = ce_mean + args.router_weight * router_sum
+                delta_mean = delta_total
+                loss_b = ce_mean + args.router_weight * router_sum + args.exit_delta_weight * delta_mean / args.exit_tau_delta
                 if not np.isfinite(loss_b):
                     raise FloatingPointError(f"non-finite phase-B loss at step {global_step}")
                 if local_step % args.log_steps == 0:
                     router_grad = [None if layer.router.weight.grad is None else
                                    float(layer.router.weight.grad.float().norm()) for layer in model.layers]
                     print(f"joint_grad rank={rank} micro={local_step+1} routers={router_grad} "
-                          f"ce={ce_mean:.5f} "
+                          f"ce={ce_mean:.5f} delta={delta_mean:.5f} "
                           f"peak_gib={torch.cuda.max_memory_allocated(device)/2**30:.2f}", flush=True)
                     import json
                     diagnostic.update(router_grad=router_grad, sequence_ce=ce_mean,
+                                      sequence_delta=delta_mean,
                                       peak_gib=torch.cuda.max_memory_allocated(device)/2**30)
                     diagnostic_path = args.checkpoint.with_suffix(f".rank{rank}.diagnostics.jsonl")
                     diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1535,6 +1575,9 @@ def train_joint_exit(args: argparse.Namespace) -> None:
             with torch.no_grad():
                 accumulated_stats["ce_at_depth"] = (
                     accumulated_stats.get("ce_at_depth", 0.0) + ce_mean
+                )
+                accumulated_stats["delta_term"] = (
+                    accumulated_stats.get("delta_term", 0.0) + delta_mean
                 )
                 accumulated_stats["loss_a"] = (
                     accumulated_stats.get("loss_a", 0.0) + float(loss_a.detach())
@@ -1619,6 +1662,7 @@ def train_joint_exit(args: argparse.Namespace) -> None:
                 )
             print(
                 f"joint step={completed_step} lossB_ce={means.get('ce_at_depth', 0.0):.5f} "
+                f"lossB_delta={means.get('delta_term', 0.0):.5f} "
                 f"lossA={means.get('loss_a', 0.0):.5f} depth={mean_depth:.2f} "
                 f"E[t]={means.get('expected_depth', 0.0):.2f} "
                 f"w={','.join(f'{value:.3f}' for value in weights_display.tolist())} "
@@ -1654,16 +1698,12 @@ def train_joint_exit(args: argparse.Namespace) -> None:
                         },
                         "optimizer": optimizer_b.state_dict(),
                         "optimizer_readout": optimizer_a.state_dict(),
-                        "exit_loss_weights": weights_display
-                        if completed_step % args.log_steps == 0
-                        else fixed_weights.cpu(),
-                        "exit_temperature": temperature,
                         "exit_readout_rank": model.exit_readout.rank,
                         "scheduler": scheduler_b.state_dict(),
                         "scheduler_readout": scheduler_a.state_dict(),
                         "config": asdict(config),
                         "exit_cost_mapping": "linear_v1",
-                        "joint_objective": "sample_a1_a2_v2",
+                        "joint_objective": "sample_a1_a2_v3",
                         "joint_selection_entropy_beta": args.joint_selection_entropy_beta,
                         "exit_hard_min_depth": args.exit_hard_min_depth,
                         "exit_guard_min_depth": args.exit_min_depth,
@@ -1696,14 +1736,12 @@ def train_joint_exit(args: argparse.Namespace) -> None:
                     },
                     "optimizer": optimizer_b.state_dict(),
                     "optimizer_readout": optimizer_a.state_dict(),
-                    "exit_loss_weights": fixed_weights.cpu(),
-                    "exit_temperature": temperature,
                     "exit_readout_rank": model.exit_readout.rank,
                     "scheduler": scheduler_b.state_dict(),
                     "scheduler_readout": scheduler_a.state_dict(),
                     "config": asdict(config),
                     "exit_cost_mapping": "linear_v1",
-                    "joint_objective": "sample_a1_a2_v2",
+                    "joint_objective": "sample_a1_a2_v3",
                     "joint_selection_entropy_beta": args.joint_selection_entropy_beta,
                     "exit_hard_min_depth": args.exit_hard_min_depth,
                     "exit_guard_min_depth": args.exit_min_depth,
@@ -1735,14 +1773,12 @@ def train_joint_exit(args: argparse.Namespace) -> None:
                 "model": {key: value.cpu() for key, value in model.state_dict().items()},
                 "optimizer": optimizer_b.state_dict(),
                 "optimizer_readout": optimizer_a.state_dict(),
-                "exit_loss_weights": fixed_weights.cpu(),
-                "exit_temperature": temperature,
                 "exit_readout_rank": model.exit_readout.rank,
                 "scheduler": scheduler_b.state_dict(),
                 "scheduler_readout": scheduler_a.state_dict(),
                 "config": asdict(config),
                 "exit_cost_mapping": "linear_v1",
-                "joint_objective": "sample_a1_a2_v2",
+                "joint_objective": "sample_a1_a2_v3",
                 "joint_selection_entropy_beta": args.joint_selection_entropy_beta,
                 "exit_hard_min_depth": args.exit_hard_min_depth,
                 "exit_guard_min_depth": args.exit_min_depth,
@@ -1823,6 +1859,7 @@ def main() -> None:
     start_step = 0
     continuation_lr: float | None = None
     schedule_metadata: dict[str, object] | None = None
+    args.samples_consumed = 0
     data_metadata = build_data_metadata(store, args, world_size)
     if args.resume is not None:
         start_step, _saved_schedule, saved_data, _saved_scheduler_state = load_checkpoint(
@@ -1846,11 +1883,16 @@ def main() -> None:
             data_metadata = build_data_metadata(store, args, world_size)
             if rank == 0:
                 print(f"resume_data samples_consumed={args.samples_consumed} permutation_batch={args.permutation_batch}", flush=True)
-        elif saved_data is not None and not data_streams_match(saved_data, data_metadata):
-            raise ValueError(
-                "checkpoint data metadata does not match the requested data stream: "
-                f"saved={saved_data} requested={data_metadata}"
-            )
+        elif saved_data is not None:
+            if not data_streams_match(saved_data, data_metadata):
+                raise ValueError(
+                    "checkpoint data metadata does not match the requested data stream: "
+                    f"saved={saved_data} requested={data_metadata}"
+                )
+            args.samples_consumed = int(saved_data.get("samples_consumed", start_step * saved_data["batch_size"] * saved_data["gradient_accumulation"] * saved_data["world_size"]))
+            args.permutation_batch = int(saved_data.get("permutation_batch", saved_data["batch_size"] * saved_data["world_size"]))
+            if rank == 0:
+                print(f"resume_data samples_consumed={args.samples_consumed} permutation_batch={args.permutation_batch}", flush=True)
         if saved_data is None and rank == 0:
             print(
                 "resume_warning checkpoint has no data metadata; "
@@ -1975,8 +2017,7 @@ def main() -> None:
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         completed_step = step + 1
-        if args.resume_repartition:
-            data_metadata["samples_consumed"] = args.samples_consumed + (completed_step - start_step) * args.batch_size * world_size * args.gradient_accumulation
+        data_metadata["samples_consumed"] = args.samples_consumed + (completed_step - start_step) * args.batch_size * world_size * args.gradient_accumulation
         if log_due:
             if device.type == "cuda":
                 total_gib = torch.cuda.get_device_properties(device).total_memory / 2**30
@@ -2033,17 +2074,10 @@ def main() -> None:
                     f" exit={'on' if exit_enabled else 'off'}"
                     f" ro={readout} md={exit_min_depth}"
                 )
-                exit_probe = ""
-                if hasattr(model, "exit_depth_stats"):
-                    depths = model.exit_depth_stats(input_tensor).float()
-                    exit_probe = (
-                        f" eavg={depths.mean().item():.2f}"
-                        f" emax={depths.max().item():.0f}"
-                    )
                 print(
                     f"step={completed_step} loss={metrics[0].item():.5f} "
                     f"lr={scheduler.get_last_lr()[0]:.3e}"
-                    f"{health_field}{exit_probe}{exit_field}{memory} tokens_per_s={tokens_per_second:.1f}",
+                    f"{health_field}{exit_field}{memory} tokens_per_s={tokens_per_second:.1f}",
                     flush=True,
                 )
                 last_log_time = now

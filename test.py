@@ -5,18 +5,18 @@ of generated text. EOS is ignored so generation does not stop early. After
 each completion, reads the next prompt until EOF / empty line.
 
 Early exit: two-stage checkpoints (ones carrying the trained
-``CalibratedExitReadout``) enable the reasoner loop's depth-selection halting
--- the exit depth is the argmax of ``softmax(-l_t / temperature)`` over the
-per-depth halting costs, with the trained six-term weights and temperature
-restored from the checkpoint.  ``--benchmark`` measures tokens/second with the
-early exit on and off and reports the speedup.
+``CalibratedExitReadout``) enable the reasoner loop's threshold-conjunction
+halting -- from the minimum depth on, the loop halts at the first cycle whose
+last-position prediction clears the confidence and probability-margin floors
+while the normalized state change stays under the delta ceiling; otherwise it
+runs to the full depth and stops there.  ``--benchmark`` measures
+tokens/second with the early exit on and off and reports the speedup.
 """
 
 from __future__ import annotations
 
 import argparse
 import time
-from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -25,7 +25,7 @@ from memory_transformer import MemoryTransformerConfig, MemoryTransformerForCaus
 from pretrain_data import load_tokenizer
 
 MAX_CHARS = 100
-DEFAULT_CHECKPOINT = Path("backups/checkpoints_20261008_054446/datasets/checkpoints/memory-transformer-24h-router03.pt")
+DEFAULT_CHECKPOINT = Path("checkpoints/last.pt")
 DEFAULT_TOKENIZER = "tokenizer/qwen"
 
 
@@ -54,23 +54,22 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_model(path: Path, device: torch.device) -> MemoryTransformerForCausalLM:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    config = MemoryTransformerConfig(**payload["config"]) if payload.get("config") else MemoryTransformerConfig()
-    if payload.get("config") and payload["config"] != asdict(config):
-        raise ValueError("checkpoint config does not match MemoryTransformerConfig")
+    if device.type != "cuda":
+        raise ValueError("GPU-only policy: model loading requires a CUDA device")
+    payload = torch.load(path, map_location=device, weights_only=False)
+    if payload.get("config"):
+        known = set(MemoryTransformerConfig.__dataclass_fields__)
+        config = MemoryTransformerConfig(
+            **{key: value for key, value in payload["config"].items() if key in known}
+        )
+    else:
+        config = MemoryTransformerConfig()
     model = MemoryTransformerForCausalLM(config)
     if any(name.startswith("exit_readout.") for name in payload["model"]):
         ensure_exit_readout(
             model, rank=int(payload.get("exit_readout_rank", config.exit_readout_rank))
         )
         model.config.early_exit_enabled = True
-        if payload.get("exit_loss_weights") is not None:
-            model.config.exit_selection_weights = tuple(
-                float(value) for value in payload["exit_loss_weights"]
-            )
-        if payload.get("exit_temperature") is not None:
-            model.config.exit_selection_temperature = float(payload["exit_temperature"])
-        model.config.__post_init__()
     model.load_state_dict(payload["model"])
     model.to(device)
     model.eval()
@@ -216,7 +215,9 @@ def main() -> None:
         raise ValueError("--max-chars must be positive")
     if not args.checkpoint.exists():
         raise FileNotFoundError(args.checkpoint)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not torch.cuda.is_available():
+        raise RuntimeError("GPU-only policy: inference requires CUDA")
+    device = torch.device("cuda")
     tokenizer = load_tokenizer(args.tokenizer, local_files_only=Path(args.tokenizer).exists())
     model = load_model(args.checkpoint, device)
     if args.no_early_exit:

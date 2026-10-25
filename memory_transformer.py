@@ -18,10 +18,15 @@ the depth-calibrated logits used by both the halting rule and the final
 readout.  Design references: CALM (arXiv 2207.07061), FPRM (arXiv 2606.18206),
 post-hoc readout diagnostics (arXiv 2607.20519), Huginn deep supervision
 (arXiv 2502.05171), RecurTrace (arXiv 2609.03379).
+
+Incremental generation (``generate(incremental=True)``): decode steps compute
+only the newest position, which routes on its own hidden state at every
+cycle—training keeps per-token routing, inference keeps the same per-position
+routing on the last token only, reusing cached per-cycle K/V for the prefix.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Optional
 
 import torch
 import torch.utils.checkpoint
@@ -48,19 +53,10 @@ class MemoryTransformerConfig:
     tie_word_embeddings: bool = False
     dropout: float = 0.0
     early_exit_enabled: bool = False
-    early_exit_min_depth: int = 8
-    early_exit_confidence_threshold: float = 0.9
+    early_exit_min_depth: int = 2
+    early_exit_confidence_threshold: float = 0.6
     early_exit_margin_threshold: float = 0.3
-    early_exit_state_delta_threshold: float = 0.05
-    exit_selection_weights: tuple = (
-        0.0,
-        0.14285714285714285,
-        0.14285714285714285,
-        0.14285714285714285,
-        0.42857142857142855,
-        0.14285714285714285,
-    )
-    exit_selection_temperature: float = 0.25
+    early_exit_state_delta_threshold: float = 0.2
     exit_readout_rank: int = 16
 
     def __post_init__(self) -> None:
@@ -96,7 +92,7 @@ class MemoryTransformerConfig:
             raise ValueError("dropout must be in [0, 1)")
         if not 1 <= self.early_exit_min_depth:
             # Values above num_layers are clamped at use time so the 24-cycle
-            # production default (8) also validates for smaller test models.
+            # production default (2) also validates for smaller test models.
             raise ValueError("early_exit_min_depth must be at least 1")
         if not 0 < self.early_exit_confidence_threshold <= 1:
             raise ValueError("early_exit_confidence_threshold must be in (0, 1]")
@@ -104,14 +100,6 @@ class MemoryTransformerConfig:
             raise ValueError("early_exit_margin_threshold must be non-negative")
         if self.early_exit_state_delta_threshold <= 0:
             raise ValueError("early_exit_state_delta_threshold must be positive")
-        if len(self.exit_selection_weights) != 6:
-            raise ValueError("exit_selection_weights must hold six values")
-        if any(weight < 0 for weight in self.exit_selection_weights):
-            raise ValueError("exit_selection_weights must be non-negative")
-        if abs(sum(self.exit_selection_weights) - 1.0) > 1e-3:
-            raise ValueError("exit_selection_weights must sum to one")
-        if self.exit_selection_temperature <= 0:
-            raise ValueError("exit_selection_temperature must be positive")
         if self.exit_readout_rank < 1:
             raise ValueError("exit_readout_rank must be positive")
 
@@ -155,8 +143,15 @@ class RotaryEmbedding(nn.Module):
         )
         self.register_buffer("inv_freq", inv, persistent=False)
 
-    def forward(self, q: Tensor, k: Tensor) -> tuple[Tensor, Tensor]:
-        positions = torch.arange(q.shape[-2], device=q.device, dtype=self.inv_freq.dtype)
+    def forward(
+        self, q: Tensor, k: Tensor, positions: Optional[Tensor] = None
+    ) -> tuple[Tensor, Tensor]:
+        if positions is None:
+            positions = torch.arange(
+                q.shape[-2], device=q.device, dtype=self.inv_freq.dtype
+            )
+        else:
+            positions = positions.to(device=q.device, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", positions, self.inv_freq)
         cos = freqs.cos()[None, None, :, :].to(q.dtype)
         sin = freqs.sin()[None, None, :, :].to(q.dtype)
@@ -631,29 +626,6 @@ def ensure_exit_readout(
     return model.exit_readout
 
 
-def selection_exit_depth(
-    losses: Sequence[float], min_depth: int, num_depths: int
-) -> tuple[int, bool]:
-    """Batch-level halting rule over per-depth selection costs.
-
-    ``losses[index]`` is the cost ``l_t`` of depth ``t = index + 1``.  The exit
-    depth is the argmax of the depth-selection distribution
-    ``softmax(-l_t / temperature)``, i.e. the smallest cost; online, the loop
-    halts at the first depth whose cost rises above the running minimum.
-    Depths below ``min_depth`` are never exit candidates.  Returns the 1-based
-    exit depth and whether halting happened before the full depth.
-    """
-    best: Optional[tuple[float, int]] = None
-    for index, loss in enumerate(losses):
-        if index + 1 < min_depth:
-            continue
-        if best is None or loss < best[0]:
-            best = (loss, index)
-        else:
-            return best[1] + 1, True
-    return num_depths, False
-
-
 class MemoryReasoner(nn.Module):
     """One recurrent reasoner cycle; memory is passed explicitly for FSDP safety."""
 
@@ -681,70 +653,377 @@ class MemoryReasoner(nn.Module):
         weights = F.softmax(values.float(), dim=-1).to(x.dtype)
         return indices, weights, probabilities
 
-    def forward(
+    def _project_qkv(
         self,
-        x: Tensor,
-        memory: SharedMemory,
-        attention_mask: Optional[Tensor] = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        normalized = self.norm1(x)
-        indices, weights, probabilities = self.route(normalized)
+        memory: "SharedMemory",
+        normalized: Tensor,
+        indices: Tensor,
+        weights: Tensor,
+        positions: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Routed Q/K/V projection plus RoPE; returns post-RoPE q, k, v."""
         q = memory("q", normalized, indices[..., 1, :], weights[..., 1, :])
         k = memory("k", normalized, indices[..., 2, :], weights[..., 2, :])
         v = memory("v", normalized, indices[..., 2, :], weights[..., 2, :])
-        q = q.view(x.shape[0], x.shape[1], self.config.num_attention_heads, -1)
-        k = k.view(x.shape[0], x.shape[1], self.config.num_key_value_heads, -1)
-        v = v.view(x.shape[0], x.shape[1], self.config.num_key_value_heads, -1)
-        q, k = self.rotary(q.transpose(1, 2), k.transpose(1, 2))
-        v = v.transpose(1, 2)
+        q = q.view(
+            *normalized.shape[:2], self.config.num_attention_heads, -1
+        ).transpose(1, 2)
+        k = k.view(
+            *normalized.shape[:2], self.config.num_key_value_heads, -1
+        ).transpose(1, 2)
+        v = v.view(
+            *normalized.shape[:2], self.config.num_key_value_heads, -1
+        ).transpose(1, 2)
+        q, k = self.rotary(q, k, positions)
+        return q, k, v
+
+    def _attend(
+        self, q: Tensor, k: Tensor, v: Tensor, attention_mask: Optional[Tensor]
+    ) -> Tensor:
+        """Causal SDPA over pre-shaped heads for a full-sequence pass."""
         dropout_p = self.dropout.p if self.training else 0.0
         if getattr(self, "use_gqa", False):
             if attention_mask is not None:
                 allowed = torch.tril(
-                    torch.ones(x.shape[1], x.shape[1], device=x.device, dtype=torch.bool)
+                    torch.ones(
+                        q.shape[-2], k.shape[-2], device=q.device, dtype=torch.bool
+                    )
                 ) & attention_mask[:, None, None, :].bool()
-                attn = F.scaled_dot_product_attention(
+                return F.scaled_dot_product_attention(
                     q, k, v, attn_mask=allowed, dropout_p=dropout_p, enable_gqa=True
                 )
-            else:
-                attn = F.scaled_dot_product_attention(
-                    q, k, v, is_causal=True, dropout_p=dropout_p, enable_gqa=True
-                )
-        else:
-            k = k.repeat_interleave(
-                self.config.num_attention_heads // self.config.num_key_value_heads, dim=1
+            return F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, dropout_p=dropout_p, enable_gqa=True
             )
-            v = v.repeat_interleave(
-                self.config.num_attention_heads // self.config.num_key_value_heads, dim=1
+        k = k.repeat_interleave(
+            self.config.num_attention_heads // self.config.num_key_value_heads, dim=1
+        )
+        v = v.repeat_interleave(
+            self.config.num_attention_heads // self.config.num_key_value_heads, dim=1
+        )
+        if attention_mask is not None:
+            allowed = torch.tril(
+                torch.ones(q.shape[-2], k.shape[-2], device=q.device, dtype=torch.bool)
             )
-            causal = torch.tril(
-                torch.ones(x.shape[1], x.shape[1], device=x.device, dtype=torch.bool)
+            allowed = allowed[None, None, :, :] & attention_mask[:, None, None, :].bool()
+            return F.scaled_dot_product_attention(
+                q, k, v, attn_mask=allowed, dropout_p=dropout_p
             )
-            allowed = causal[None, None, :, :]
-            if attention_mask is not None:
-                allowed = allowed & attention_mask[:, None, None, :].bool()
-                attn = F.scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    attn_mask=allowed,
-                    dropout_p=dropout_p,
-                )
-            else:
-                attn = F.scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    is_causal=True,
-                    dropout_p=dropout_p,
-                )
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, dropout_p=dropout_p
+        )
+
+    def _attend_last(
+        self, q: Tensor, k: Tensor, v: Tensor
+    ) -> Tensor:
+        """Unmasked SDPA for the single newest position (causal by construction)."""
+        dropout_p = self.dropout.p if self.training else 0.0
+        if getattr(self, "use_gqa", False):
+            return F.scaled_dot_product_attention(
+                q, k, v, dropout_p=dropout_p, enable_gqa=True
+            )
+        k = k.repeat_interleave(
+            self.config.num_attention_heads // self.config.num_key_value_heads, dim=1
+        )
+        v = v.repeat_interleave(
+            self.config.num_attention_heads // self.config.num_key_value_heads, dim=1
+        )
+        return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+
+    def cycle_full(
+        self,
+        x: Tensor,
+        memory: "SharedMemory",
+        attention_mask: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """One full-sequence cycle; also returns post-RoPE k, v for caching."""
+        normalized = self.norm1(x)
+        indices, weights, probabilities = self.route(normalized)
+        q, k, v = self._project_qkv(memory, normalized, indices, weights)
+        attn = self._attend(q, k, v, attention_mask)
         attn = attn.transpose(1, 2).reshape_as(x)
         attn = memory("o", attn, indices[..., 3, :], weights[..., 3, :])
         x = x + self.dropout(attn)
         x = x + self.dropout(
             memory("ffn", self.norm2(x), indices[..., 0, :], weights[..., 0, :])
         )
+        return x, k, v, indices, weights, probabilities
+
+    def forward_single(
+        self,
+        x: Tensor,
+        memory: "SharedMemory",
+        k_cache: Optional[Tensor],
+        v_cache: Optional[Tensor],
+        position: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """One cycle on the newest position only, against cached K/V.
+
+        ``x`` is the [1, 1, hidden] residual of that position before the
+        cycle; ``k_cache``/``v_cache`` hold the post-RoPE keys/values this
+        cycle produced for all earlier positions.  The position routes on its
+        own hidden state, so the result matches a full-prefix recompute
+        exactly (causality, eval mode).  Returns the new residual plus the
+        updated full K/V tensors for this cycle.
+        """
+        normalized = self.norm1(x)
+        indices, weights, _probabilities = self.route(normalized)
+        q, k, v = self._project_qkv(
+            memory,
+            normalized,
+            indices,
+            weights,
+            positions=torch.arange(position, position + 1, device=x.device),
+        )
+        if k_cache is not None:
+            k = torch.cat([k_cache, k], dim=2)
+            v = torch.cat([v_cache, v], dim=2)
+        attn = self._attend_last(q, k, v)
+        attn = attn.transpose(1, 2).reshape_as(x)
+        attn = memory("o", attn, indices[..., 3, :], weights[..., 3, :])
+        x = x + self.dropout(attn)
+        x = x + self.dropout(
+            memory("ffn", self.norm2(x), indices[..., 0, :], weights[..., 0, :])
+        )
+        return x, k, v
+
+    def forward(
+        self,
+        x: Tensor,
+        memory: SharedMemory,
+        attention_mask: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        x, _k, _v, indices, weights, probabilities = self.cycle_full(
+            x, memory, attention_mask
+        )
         return x, indices, weights, probabilities
+
+
+class _IncrementalRecursionState:
+    """Per-sample causal-recursion cache for incremental generation.
+
+    Each decode step computes only the newest position, which routes on its
+    own hidden state at every cycle; earlier positions reuse the post-RoPE
+    K/V they produced when they were newest, so every (position, cycle)
+    quantity equals a full-prefix recompute (causality, eval mode).  Cycles
+    ``1..depth`` are cached for the whole prefix.  A step that must evaluate
+    cycles deeper than ``depth`` extends the cache with full-prefix passes
+    (the new position rides along); a step that halts shallower backfills the
+    new position to ``depth`` so cached cycles keep whole-prefix coverage.
+    ``delta_sum[t]`` accumulates the per-position state-change terms so the
+    halting-rule delta mean matches the full-sequence mean exactly.
+    """
+
+    def __init__(
+        self,
+        model: "MemoryTransformerForCausalLM",
+        input_ids: Tensor,
+        early_exit: bool,
+    ) -> None:
+        self.model = model
+        self.enabled = bool(early_exit)
+        self.keys: list[Tensor] = []
+        self.values: list[Tensor] = []
+        self.delta_sum: list[Optional[Tensor]] = []
+        self.frontier: Optional[Tensor] = None
+        self.depth = 0
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError("prefill expects a single [1, sequence] row")
+        if input_ids.shape[1] > model.config.max_position_embeddings:
+            raise ValueError(
+                f"sequence length {input_ids.shape[1]} exceeds "
+                f"max_position_embeddings={model.config.max_position_embeddings}"
+            )
+        x = model.embed_tokens(input_ids)
+        x, halted, halt_depth, halt_normed_last = self._full_pass(x, 0)
+        self.logits, self.exit_depth = self._finalize(
+            x, halted, halt_depth, halt_normed_last
+        )
+
+    def _min_depth(self) -> int:
+        return min(
+            self.model.config.early_exit_min_depth, self.model.config.num_layers
+        )
+
+    def _last_position_stats(
+        self, normed_last: Tensor, depth_index: int
+    ) -> tuple[Tensor, Tensor]:
+        logits = self.model._exit_readout_logits(depth_index, normed_last)
+        probabilities = torch.softmax(logits.float(), dim=-1)
+        top2 = torch.topk(probabilities, 2, dim=-1).values
+        return top2[:, 0], top2[:, 0] - top2[:, 1]
+
+    def _delta_update(
+        self, depth_index: int, normed: Tensor, prev_normed: Optional[Tensor]
+    ) -> None:
+        """Extend ``delta_sum[depth_index]`` with one position's contribution."""
+        if prev_normed is None:
+            return
+        difference = normed.float() - prev_normed
+        denominator = normed.float().norm(dim=-1).clamp_min(1e-6)
+        contribution = (difference.norm(dim=-1) / denominator).sum()
+        self.delta_sum[depth_index] = self.delta_sum[depth_index] + contribution
+
+    def _full_pass(
+        self, x: Tensor, start: int
+    ) -> tuple[Tensor, bool, Optional[int], Optional[Tensor]]:
+        """Full-prefix cycles ``start..L-1`` (0-based), extending the cache.
+
+        Mirrors the legacy forward loop: each cycle runs for every position
+        and, when early exit is enabled, the threshold rule reads the last
+        position from ``min_depth`` on and the loop halts at the first cycle
+        meeting all three thresholds (the final cycle is a forced stop).
+        Returns the residual after the last computed cycle plus the exit
+        bookkeeping.
+        """
+        model = self.model
+        total = x.shape[1]
+        prev_normed = None if start == 0 else model.norm(x)
+        halted = False
+        halt_depth: Optional[int] = None
+        halt_normed_last: Optional[Tensor] = None
+        for depth_index in range(start, model.config.num_layers):
+            x, k, v, *_rest = model.layers[depth_index].cycle_full(
+                x, model.memory, None
+            )
+            self.keys.append(k)
+            self.values.append(v)
+            normed = model.norm(x)
+            if prev_normed is None:
+                self.delta_sum.append(None)
+            else:
+                difference = normed.float() - prev_normed
+                denominator = normed.float().norm(dim=-1).clamp_min(1e-6)
+                self.delta_sum.append(
+                    (difference.norm(dim=-1) / denominator).sum()
+                )
+            prev_normed = normed
+            if (
+                self.enabled
+                and depth_index + 1 >= self._min_depth()
+                and depth_index + 1 < model.config.num_layers
+            ):
+                confidence, margin = self._last_position_stats(
+                    normed[:, -1, :], depth_index
+                )
+                delta = (
+                    None
+                    if self.delta_sum[-1] is None
+                    else self.delta_sum[-1] / total
+                )
+                if model._thresholds_met(confidence, margin, delta):
+                    halted = True
+                    halt_depth = depth_index
+                    halt_normed_last = normed[:, -1, :]
+                    break
+        self.depth = len(self.keys)
+        self.frontier = x
+        return x, halted, halt_depth, halt_normed_last
+
+    def _finalize(
+        self,
+        x_full_depth: Tensor,
+        halted: bool,
+        halt_depth: Optional[int],
+        halt_normed_last: Optional[Tensor],
+    ) -> tuple[Tensor, int]:
+        """Last-position logits at the exit depth.
+
+        A halted step predicts with the halting cycle's state and readout;
+        otherwise the full-depth readout is used.
+        """
+        model = self.model
+        if halted:
+            final_last = halt_normed_last
+            head_index = halt_depth
+        else:
+            final_last = model.norm(x_full_depth)[:, -1, :]
+            head_index = model.config.num_layers - 1
+        if self.enabled and model.exit_readout is not None:
+            logits = model.exit_readout.logits_at(
+                head_index, final_last, model.lm_head.weight
+            )
+        else:
+            logits = model.lm_head(final_last)
+        exit_depth = head_index + 1 if halted else model.config.num_layers
+        return logits, exit_depth
+
+    def step(self, token_id: Tensor) -> tuple[Tensor, int]:
+        """Advance one token; returns (logits [1, vocab], exit_depth)."""
+        model = self.model
+        config = model.config
+        position = self.keys[0].shape[2]
+        if position + 1 > config.max_position_embeddings:
+            raise ValueError(
+                f"sequence length {position + 1} exceeds "
+                f"max_position_embeddings={config.max_position_embeddings}"
+            )
+        assert all(key.shape[2] == position for key in self.keys)
+        x = model.embed_tokens(token_id.view(1, 1))
+        prev_normed: Optional[Tensor] = None
+        halted = False
+        chain_halted = False
+        chain_end = self.depth
+        halt_depth: Optional[int] = None
+        halt_normed_last: Optional[Tensor] = None
+        min_depth = self._min_depth()
+        for depth_index in range(self.depth):
+            x, k, v = model.layers[depth_index].forward_single(
+                x,
+                model.memory,
+                self.keys[depth_index],
+                self.values[depth_index],
+                position,
+            )
+            self.keys[depth_index] = k
+            self.values[depth_index] = v
+            normed = model.norm(x)
+            self._delta_update(depth_index, normed, prev_normed)
+            prev_normed = normed
+            if (
+                self.enabled
+                and depth_index + 1 >= min_depth
+                and depth_index + 1 < config.num_layers
+            ):
+                confidence, margin = self._last_position_stats(
+                    normed[:, -1, :], depth_index
+                )
+                delta = (
+                    None
+                    if depth_index == 0
+                    else self.delta_sum[depth_index] / (position + 1)
+                )
+                if model._thresholds_met(confidence, margin, delta):
+                    halted = True
+                    chain_halted = True
+                    chain_end = depth_index + 1
+                    halt_depth = depth_index
+                    halt_normed_last = normed[:, -1, :]
+                    break
+        if chain_halted:
+            # Cache-warm the new position up to the uniform depth (no
+            # halting logic): keeps every cached cycle whole-prefix.
+            for depth_index in range(chain_end, self.depth):
+                x, k, v = model.layers[depth_index].forward_single(
+                    x,
+                    model.memory,
+                    self.keys[depth_index],
+                    self.values[depth_index],
+                    position,
+                )
+                self.keys[depth_index] = k
+                self.values[depth_index] = v
+                normed = model.norm(x)
+                self._delta_update(depth_index, normed, prev_normed)
+                prev_normed = normed
+        elif self.depth < config.num_layers:
+            # Deeper cycles than ever computed: run them as full-prefix
+            # passes; the new position rides along as the last row.
+            x_full = torch.cat([self.frontier, x], dim=1)
+            x, halted, halt_depth, halt_normed_last = self._full_pass(
+                x_full, self.depth
+            )
+        return self._finalize(x, halted, halt_depth, halt_normed_last)
 
 
 class MemoryTransformerForCausalLM(nn.Module):
@@ -784,52 +1063,26 @@ class MemoryTransformerForCausalLM(nn.Module):
             return self.exit_readout.logits_at(depth_index, states, self.lm_head.weight)
         return F.linear(states, self.lm_head.weight)
 
-    def _exit_selection_cost(
-        self,
-        confidence: Tensor,
-        margin: Tensor,
-        delta: Optional[Tensor],
-        depth_index: int,
-    ) -> Tensor:
-        """Batch-mean halting cost ``l_t`` at one depth (lower is better).
+    def _thresholds_met(
+        self, confidence: Tensor, margin: Tensor, delta: Optional[Tensor]
+    ) -> bool:
+        """Document halting rule: all three inference thresholds satisfied.
 
-        Weighted sum of the inference-available terms of the readout-training
-        objective, matching the training cost definition: confidence deficit
-        ``1 - q1``, probability-margin deficit ``1 - (q1 - q2)``, relative
-        state change over the delta threshold, speed ``t/num_depths``, and the
-        clamped min-depth guard ``max(0, (d_min - d) / D)``.  The shortlist
-        cross-entropy term has no ground truth at inference and its annealed
-        prior mass is zero, so it is omitted.
+        Confidence ``p`` and probability margin ``m = p1 - p2`` must clear
+        their floors and the normalized state change must stay under the
+        delta ceiling.  A ``None`` delta (first cycle, state change zero)
+        counts as satisfied.
         """
-        weights = self.config.exit_selection_weights
-        td = self.config.early_exit_state_delta_threshold
-        if td <= 0:
-            raise ValueError("exit state delta threshold must be positive")
-        cost = weights[1] * (1.0 - confidence).mean()
-        cost = cost + weights[2] * (1.0 - margin).mean()
-        if delta is not None and weights[3] > 0:
-            cost = cost + weights[3] * (delta.float() / td).mean()
-        num_depths = self.config.num_layers
-        cost = cost + weights[4] * confidence.new_tensor((depth_index + 1) / num_depths)
-        min_depth = min(self.config.early_exit_min_depth, num_depths)
-        guard = confidence.new_tensor(
-            max(0.0, (min_depth - (depth_index + 1)) / num_depths)
-        )
-        cost = cost + weights[5] * guard
-        return cost
-
-    def apply_exit_selection(
-        self,
-        weights: Sequence[float],
-        temperature: float,
-        enable: bool = True,
-    ) -> None:
-        """Attach trained depth-selection weights and temperature to the config."""
-        self.config.exit_selection_weights = tuple(float(value) for value in weights)
-        self.config.exit_selection_temperature = float(temperature)
-        if enable:
-            self.config.early_exit_enabled = True
-        self.config.__post_init__()
+        config = self.config
+        if bool(confidence < config.early_exit_confidence_threshold):
+            return False
+        if bool(margin < config.early_exit_margin_threshold):
+            return False
+        if delta is not None and bool(
+            delta > config.early_exit_state_delta_threshold
+        ):
+            return False
+        return True
 
     @staticmethod
     def load_balance_loss(
@@ -851,46 +1104,6 @@ class MemoryTransformerForCausalLM(nn.Module):
         assignment = F.one_hot(index_rows, num_classes=blocks).float()
         load = assignment.mean(dim=(0, 2))
         return blocks * (importance * load).sum(dim=-1).mean()
-
-    def _per_sample_exit_depths(
-        self,
-        confidence: list[Tensor],
-        margin: list[Tensor],
-        deltas: list[Optional[Tensor]],
-    ) -> Tensor:
-        """Per-sample halting depths (1-based) via the batch rule applied per row."""
-        weights = self.config.exit_selection_weights
-        num_depths = len(confidence)
-        min_depth = min(self.config.early_exit_min_depth, num_depths)
-        device = confidence[0].device
-        rows = confidence[0].shape[0]
-        best = torch.full((rows,), float("inf"), device=device)
-        best_depth = torch.zeros(rows, dtype=torch.long, device=device)
-        exited = torch.full((rows,), float(num_depths), device=device)
-        done = torch.zeros(rows, dtype=torch.bool, device=device)
-        for depth_index in range(num_depths):
-            if depth_index + 1 < min_depth:
-                continue
-            cost = weights[1] * (
-                self.config.early_exit_confidence_threshold - confidence[depth_index]
-            ).clamp_min(0.0)
-            cost = cost + weights[2] * (
-                self.config.early_exit_margin_threshold - margin[depth_index]
-            ).clamp_min(0.0)
-            delta = deltas[depth_index]
-            if delta is not None and weights[3] > 0:
-                cost = cost + weights[3] * (
-                    delta.to(cost.dtype) - self.config.early_exit_state_delta_threshold
-                ).clamp_min(0.0)
-            cost = cost + weights[4] * ((depth_index + 1) / num_depths)
-            cost = cost + weights[5] * (max(0, min_depth - (depth_index + 1)) / num_depths)
-            improve = cost < best
-            best = torch.where(improve, cost, best)
-            best_depth = torch.where(improve, depth_index, best_depth)
-            halt = (~improve) & (~done)
-            exited = torch.where(halt, best_depth.to(exited.dtype) + 1.0, exited)
-            done = done | halt
-        return exited
 
     def forward(
         self,
@@ -959,9 +1172,6 @@ class MemoryTransformerForCausalLM(nn.Module):
         exit_margin: list[Tensor] = []
         exit_delta: list[Optional[Tensor]] = []
         exit_normed: Optional[Tensor] = None
-        best_cost: Optional[Tensor] = None
-        best_depth: Optional[int] = None
-        best_normed: Optional[Tensor] = None
         prev_normed: Optional[Tensor] = None
         halted = False
         for depth_index, layer in enumerate(self.layers):
@@ -1032,16 +1242,15 @@ class MemoryTransformerForCausalLM(nn.Module):
                 self.config.early_exit_min_depth, self.config.num_layers
             ):
                 continue
-            cost = self._exit_selection_cost(confidence, margin, delta, depth_index)
-            if best_cost is None or bool(cost < best_cost):
-                best_cost = cost
-                best_depth = depth_index
-                best_normed = normed
+            if depth_index + 1 >= self.config.num_layers:
+                # The final cycle is always a forced stop: thresholds never
+                # halt at full depth, so exit_halted stays false there.
                 continue
-            exit_depth = best_depth + 1
-            exit_normed = best_normed
-            halted = True
-            break
+            if self._thresholds_met(confidence, margin, delta):
+                exit_depth = depth_index + 1
+                exit_normed = normed
+                halted = True
+                break
         # Chunked training CE: skip materializing the [batch, seq, vocab]
         # logits entirely and let the labels branch below compute the loss
         # row-chunk by row-chunk (training mode never early-exits, so the
@@ -1151,52 +1360,6 @@ class MemoryTransformerForCausalLM(nn.Module):
         return ce_sum / masked_count
 
     @torch.no_grad()
-    def exit_depth_stats(
-        self, input_ids: Tensor, attention_mask: Optional[Tensor] = None
-    ) -> Tensor:
-        """Per-sample halting depths (1-based) from one full-depth no-grad probe.
-
-        Diagnostic helper for the trainer's log line: runs every reasoner
-        cycle without grad, records per-depth confidence/margin/delta, and
-        applies the selection-cost halting rule per row.  Never materializes
-        full-vocabulary logits, so the transient peak stays well below the
-        training step's.
-        """
-        x = self.embed_tokens(input_ids)
-        if attention_mask is not None:
-            x = x * attention_mask.unsqueeze(-1).to(x.dtype)
-        confidence: list[Tensor] = []
-        margin: list[Tensor] = []
-        deltas: list[Optional[Tensor]] = []
-        prev_normed: Optional[Tensor] = None
-        for depth_index, layer in enumerate(self.layers):
-            x, _indices, _weights, _probabilities = layer(
-                x, self.memory, attention_mask=attention_mask
-            )
-            if attention_mask is not None:
-                x = x * attention_mask.unsqueeze(-1).to(x.dtype)
-            normed = self.norm(x)
-            if prev_normed is None:
-                delta = None
-            else:
-                difference = normed.float() - prev_normed
-                denominator = normed.float().norm(dim=-1).clamp_min(1e-6)
-                per_position = difference.norm(dim=-1) / denominator
-                if attention_mask is not None:
-                    mask = attention_mask.to(per_position.dtype)
-                    delta = (per_position * mask).sum(-1) / mask.sum(-1).clamp_min(1.0)
-                else:
-                    delta = per_position.mean(-1)
-            last_logits = self._exit_readout_logits(depth_index, normed[:, -1, :])
-            last_probabilities = torch.softmax(last_logits.float(), dim=-1)
-            top2 = torch.topk(last_probabilities, 2, dim=-1).values
-            confidence.append(top2[:, 0])
-            margin.append(top2[:, 0] - top2[:, 1])
-            deltas.append(delta)
-            prev_normed = normed
-        return self._per_sample_exit_depths(confidence, margin, deltas)
-
-    @torch.no_grad()
     def exit_rollout(
         self, input_ids: Tensor, attention_mask: Optional[Tensor] = None
     ) -> dict[str, Tensor]:
@@ -1250,14 +1413,20 @@ class MemoryTransformerForCausalLM(nn.Module):
 
     @torch.inference_mode()
     def joint_rollout(
-        self, input_ids: Tensor, attention_mask: Optional[Tensor] = None
+        self,
+        input_ids: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        compute_deltas: bool = True,
     ) -> dict[str, Tensor]:
         """Full-depth no-grad pass collecting phase-A inputs for joint training.
 
         Like :meth:`exit_rollout` but additionally caches the last-position
         ``W h`` products (the ``lm_head`` base logits at each depth) so the
         phase-A halting losses never re-run the vocabulary matmul, and the
-        per-cycle router losses needed by the phase-B CE objective.
+        per-cycle router losses needed by the phase-B CE objective.  The
+        per-depth state deltas are only computed when ``compute_deltas`` is
+        set (lossB now trains the selected depth's delta through
+        :meth:`forward_until`, so the phase-A cost matrix omits it).
         """
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, sequence]")
@@ -1283,27 +1452,30 @@ class MemoryTransformerForCausalLM(nn.Module):
             )
             normed = self.norm(x)
             states.append(normed[:, -1, :])
-            if prev_normed is None:
-                deltas.append(x.new_zeros(x.shape[0]))
-            else:
-                difference = normed.float() - prev_normed
-                denominator = normed.float().norm(dim=-1).clamp_min(1e-6)
-                per_position = difference.norm(dim=-1) / denominator
-                if attention_mask is not None:
-                    mask = attention_mask.to(per_position.dtype)
-                    deltas.append(
-                        (per_position * mask).sum(-1) / mask.sum(-1).clamp_min(1.0)
-                    )
+            if compute_deltas:
+                if prev_normed is None:
+                    deltas.append(x.new_zeros(x.shape[0]))
                 else:
-                    deltas.append(per_position.mean(-1))
+                    difference = normed.float() - prev_normed
+                    denominator = normed.float().norm(dim=-1).clamp_min(1e-6)
+                    per_position = difference.norm(dim=-1) / denominator
+                    if attention_mask is not None:
+                        mask = attention_mask.to(per_position.dtype)
+                        deltas.append(
+                            (per_position * mask).sum(-1) / mask.sum(-1).clamp_min(1.0)
+                        )
+                    else:
+                        deltas.append(per_position.mean(-1))
             prev_normed = normed.detach()
         stacked = torch.stack(states)
-        return {
+        result = {
             "states": stacked,
-            "deltas": torch.stack(deltas),
             "base_logits": F.linear(stacked, self.lm_head.weight),
             "router_losses": torch.stack(router_losses),
         }
+        if compute_deltas:
+            result["deltas"] = torch.stack(deltas)
+        return result
 
     def forward_until(
         self,
@@ -1311,6 +1483,7 @@ class MemoryTransformerForCausalLM(nn.Module):
         num_cycles: int,
         attention_mask: Optional[Tensor] = None,
         collect_states: bool = False,
+        collect_delta: bool = False,
     ) -> dict[str, Tensor]:
         """Gradient pass through the first ``num_cycles`` reasoner cycles.
 
@@ -1318,7 +1491,10 @@ class MemoryTransformerForCausalLM(nn.Module):
         recurrent loop so the autograd graph (and the backward cost) scales
         with the selected exit depth instead of the full 24 cycles.  Returns
         the final-normed full-sequence state and, optionally, the per-cycle
-        router losses and the intermediate normed states.
+        router losses, the intermediate normed states, and ``final_delta`` --
+        the selected depth's relative state change (the mask-normalized mean
+        between the final two cycles, matching :meth:`joint_rollout`'s delta
+        definition) whose gradient reaches both cycles through the backbone.
         """
         if not 1 <= num_cycles <= self.config.num_layers:
             raise ValueError(
@@ -1333,7 +1509,10 @@ class MemoryTransformerForCausalLM(nn.Module):
             x = x * attention_mask.unsqueeze(-1).to(x.dtype)
         router_losses: list[Tensor] = []
         normed_states: list[Tensor] = []
-        for layer in self.layers[:num_cycles]:
+        prev_normed: Optional[Tensor] = None
+        final_delta: Optional[Tensor] = None
+        last_normed: Optional[Tensor] = None
+        for layer_index, layer in enumerate(self.layers[:num_cycles]):
             if (
                 self.gradient_checkpointing
                 and self.training
@@ -1351,14 +1530,32 @@ class MemoryTransformerForCausalLM(nn.Module):
             router_losses.append(
                 self.load_balance_loss(indices, probabilities, attention_mask)
             )
-            if collect_states:
-                normed_states.append(self.norm(x))
+            if collect_states or collect_delta:
+                last_normed = self.norm(x)
+                if collect_states:
+                    normed_states.append(last_normed)
+                if collect_delta:
+                    if layer_index == num_cycles - 1:
+                        if prev_normed is None:
+                            final_delta = x.new_zeros(x.shape[0])
+                        else:
+                            difference = last_normed.float() - prev_normed
+                            denominator = last_normed.float().norm(dim=-1).clamp_min(1e-6)
+                            per_position = difference.norm(dim=-1) / denominator
+                            if attention_mask is not None:
+                                keep = attention_mask.to(per_position.dtype)
+                                final_delta = (per_position * keep).sum(-1) / keep.sum(-1).clamp_min(1.0)
+                            else:
+                                final_delta = per_position.mean(-1)
+                    prev_normed = last_normed
         result: dict[str, Tensor] = {
-            "final_normed": self.norm(x),
+            "final_normed": last_normed if last_normed is not None else self.norm(x),
             "router_losses": torch.stack(router_losses),
         }
         if collect_states:
             result["normed_states"] = torch.stack(normed_states)
+        if collect_delta:
+            result["final_delta"] = final_delta
         return result
 
     @torch.no_grad()
@@ -1369,28 +1566,81 @@ class MemoryTransformerForCausalLM(nn.Module):
         eos_token_id: Optional[int] = None,
         early_exit: Optional[bool] = None,
         return_stats: bool = False,
+        incremental: bool = True,
     ) -> Tensor | tuple[Tensor, dict[str, float]]:
+        """Autoregressive decoding.
+
+        ``incremental=True`` (default) keeps a per-sample causal-recursion
+        cache: each step computes only the newest position, which routes on
+        its own hidden state at every cycle exactly as a full-prefix recompute
+        would; earlier positions reuse their cached per-cycle K/V.
+        ``incremental=False`` re-runs the whole prefix every step (legacy
+        path) for A/B comparison.
+        """
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be non-negative")
+        enabled = (
+            self.config.early_exit_enabled if early_exit is None else bool(early_exit)
+        )
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         exit_depths: list[int] = []
-        for _ in range(max_new_tokens):
-            output = self(input_ids, early_exit=early_exit)
-            if "exit_depth" in output:
-                depths = output["exit_depth"]
-                exit_depths.extend(depths if isinstance(depths, list) else [int(depths)])
-            logits = output["logits"][:, -1]
-            next_token = logits.argmax(-1, keepdim=True)
-            if eos_token_id is not None:
-                next_token = torch.where(
-                    finished[:, None],
-                    torch.full_like(next_token, eos_token_id),
-                    next_token,
+        if incremental and max_new_tokens > 0:
+            if self.training:
+                raise ValueError(
+                    "incremental generation requires eval mode: dropout would "
+                    "make the per-position K/V cache inconsistent"
                 )
-                finished |= next_token[:, 0].eq(eos_token_id)
-            input_ids = torch.cat((input_ids, next_token), dim=-1)
-            if eos_token_id is not None and bool(finished.all()):
-                break
+            if input_ids.ndim != 2:
+                raise ValueError("input_ids must have shape [batch, sequence]")
+            if input_ids.shape[1] > self.config.max_position_embeddings:
+                raise ValueError(
+                    f"sequence length {input_ids.shape[1]} exceeds "
+                    f"max_position_embeddings={self.config.max_position_embeddings}"
+                )
+            states = [
+                _IncrementalRecursionState(self, input_ids[i : i + 1], enabled)
+                for i in range(input_ids.shape[0])
+            ]
+            outputs = [(state.logits, state.exit_depth) for state in states]
+            for iteration in range(max_new_tokens):
+                logits = torch.cat([row for row, _depth in outputs], dim=0)
+                if enabled:
+                    exit_depths.extend(int(depth) for _row, depth in outputs)
+                next_token = logits.argmax(-1, keepdim=True)
+                if eos_token_id is not None:
+                    next_token = torch.where(
+                        finished[:, None],
+                        torch.full_like(next_token, eos_token_id),
+                        next_token,
+                    )
+                    finished |= next_token[:, 0].eq(eos_token_id)
+                input_ids = torch.cat((input_ids, next_token), dim=-1)
+                if eos_token_id is not None and bool(finished.all()):
+                    break
+                if iteration + 1 == max_new_tokens:
+                    break
+                outputs = [
+                    state.step(next_token[i : i + 1])
+                    for i, state in enumerate(states)
+                ]
+        else:
+            for _ in range(max_new_tokens):
+                output = self(input_ids, early_exit=early_exit)
+                if "exit_depth" in output:
+                    depths = output["exit_depth"]
+                    exit_depths.extend(depths if isinstance(depths, list) else [int(depths)])
+                logits = output["logits"][:, -1]
+                next_token = logits.argmax(-1, keepdim=True)
+                if eos_token_id is not None:
+                    next_token = torch.where(
+                        finished[:, None],
+                        torch.full_like(next_token, eos_token_id),
+                        next_token,
+                    )
+                    finished |= next_token[:, 0].eq(eos_token_id)
+                input_ids = torch.cat((input_ids, next_token), dim=-1)
+                if eos_token_id is not None and bool(finished.all()):
+                    break
         if return_stats:
             steps = len(exit_depths)
             if steps:
