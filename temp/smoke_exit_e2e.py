@@ -139,10 +139,9 @@ def run_joint_smoke(store: Path, base: Path) -> None:
         "--num-layers", "4", "--hidden-size", "32", "--intermediate-size", "64",
         "--num-attention-heads", "4", "--num-key-value-heads", "2",
         "--num-memory-blocks", "4", "--top-k", "2", "--max-position-embeddings", "32",
-        "--sequence-length", "8", "--batch-size", "2", "--gradient-accumulation", "2",
+        "--sequence-length", "8", "--batch-size", "2", "--gradient-accumulation", "1",
         "--log-steps", "1", "--device", "cuda", "--precision", "fp32",
         "--exit-min-depth", "2", "--exit-joint-readout-lr", "5e-3",
-        "--loss-weight-prior", "0.0,0.15,0.15,0.10,0.45,0.15",
         "--lr", "1e-2", "--warmup-steps", "1",
     ]
     run([
@@ -152,12 +151,12 @@ def run_joint_smoke(store: Path, base: Path) -> None:
     ])
     payload = torch.load(joint, map_location="cpu", weights_only=False)
     assert "exit_loss_weights" in payload and "exit_temperature" in payload
-    assert "loss_weights_raw" in payload and "optimizer_readout" in payload
+    assert "exit_selection_delta_weight" in payload and "optimizer_readout" in payload
     assert any(name.startswith("exit_readout.") for name in payload["model"])
     weights = torch.tensor(payload["exit_loss_weights"].tolist())
     assert abs(float(weights.sum()) - 1.0) < 1e-3
-    assert float(weights[0]) < 0.05, "CE slot of the selection weights must stay ~0"
-    assert float(weights[4]) >= 0.3, "speed weight must stay dominant"
+    assert float(weights[0]) >= 0.6, "CE slot must dominate (patent example weights)"
+    assert float(weights[3]) <= 0.2, "speed weight must not dominate"
 
     # Phase isolation: run one manual two-phase update and check gradients.
     config = MemoryTransformerConfig(**{
@@ -243,8 +242,8 @@ def run_joint_smoke(store: Path, base: Path) -> None:
     resumed = torch.load(joint, map_location="cpu", weights_only=False)
     assert resumed["step"] == 6
     assert torch.allclose(
-        resumed["loss_weights_raw"], payload["loss_weights_raw"], atol=1e-6
-    ) or True  # weights continue training; existence is the contract
+        resumed["exit_loss_weights"], payload["exit_loss_weights"], atol=1e-9
+    )  # fixed selection weights must survive the resume roundtrip
     print("JOINT SMOKE OK", flush=True)
 
 

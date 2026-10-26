@@ -1,6 +1,17 @@
+import argparse
+import math
+
+import pytest
 import torch
-from train import joint_sample_losses, joint_token_rows
-from test_early_exit import tiny_model
+
+from memory_transformer import ensure_exit_readout
+from train import (
+    _joint_prior_and_kappa,
+    assemble_exit_terms,
+    joint_sample_losses,
+    joint_token_rows,
+)
+from test_early_exit import permissive_args, tiny_model
 
 
 def test_sample_choices_and_gradient_scopes():
@@ -114,3 +125,96 @@ def test_joint_sequence_ce_uses_already_shifted_targets_and_last_position():
     loss.backward()
     assert logits.grad[:, -1].abs().sum() > 0
     assert logits.grad[1, 2].count_nonzero() == 0
+
+
+def test_selection_delta_term_matches_six_term_reference():
+    depth, batch = 4, 3
+    torch.manual_seed(7)
+    terms6 = torch.rand(6, depth, batch) * 0.5  # [CE, conf, margin, delta, speed, guard]
+    weights6 = torch.tensor([0.65, 0.05, 0.05, 0.05, 0.15, 0.05])
+    costs_old = (weights6[:, None, None] * terms6).sum(0)
+    floor = 1  # hard_min_depth 2
+    chosen_old0 = costs_old[floor:].argmin(0) + floor
+    terms5 = torch.cat([terms6[:3], terms6[4:]])
+    weights5 = torch.cat([weights6[:3], weights6[4:]])
+    a1, _, chosen_new, _, _ = joint_sample_losses(
+        terms5, weights5, 0.25, 0.05, hard_min_depth=2,
+        delta_costs=terms6[3], kappa=float(weights6[3]),
+    )
+    assert torch.equal(chosen_new, chosen_old0 + 1)  # the function returns 1-based depths
+    selection_costs = (weights5[:, None, None] * terms5).sum(0) + float(weights6[3]) * terms6[3]
+    assert torch.allclose(selection_costs, costs_old, atol=1e-6)
+    # A1 is the five-term cost at the chosen depth, not the selection cost
+    a1_reference = (weights5[:, None, None] * terms5).sum(0)[chosen_old0, torch.arange(batch)].mean()
+    assert torch.allclose(a1, a1_reference, atol=1e-6)
+
+
+def test_delta_costs_do_not_enter_loss_a():
+    depth, batch = 4, 2
+    terms = torch.zeros(5, depth, batch)
+    terms[0] = torch.tensor([0.1, 0.2, 0.3, 0.4])[:, None].expand(depth, batch)
+    weights = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0])
+    delta_costs = torch.tensor([10.0, 5.0, 0.3, 0.9])[:, None].expand(depth, batch).clone()
+    a1, a2, chosen, p, entropy = joint_sample_losses(
+        terms, weights, 0.25, 0.05, hard_min_depth=1,
+        delta_costs=delta_costs, kappa=1.0,
+    )
+    # the state-change term moves the argmin to the 0-based depth 2 (returned 3)
+    assert torch.equal(chosen, torch.full((batch,), 3))
+    # A1 and the selection distribution are computed from the five-term cost
+    assert torch.allclose(a1, torch.tensor(0.3), atol=1e-6)
+    log_p_ref = (-torch.tensor([0.1, 0.2, 0.3, 0.4]) / 0.25).log_softmax(0)
+    p_ref = log_p_ref.exp()
+    assert torch.allclose(p, p_ref[:, None].expand(depth, batch), atol=1e-6)
+    ce_ref = -log_p_ref[2]
+    entropy_ref = -(p_ref * log_p_ref).sum() / math.log(depth)
+    assert torch.allclose(a2, ce_ref + 0.05 * entropy_ref, atol=1e-6)
+
+
+def test_delta_term_steers_selection_deeper():
+    model = tiny_model().eval()
+    ensure_exit_readout(model)
+    ids = torch.arange(16).view(2, 8) % 32
+    rollout = model.joint_rollout(ids)
+    rollout = {key: value.clone() for key, value in rollout.items()}
+    target = torch.tensor([7, 11])
+    args = permissive_args(exit_min_depth=2)
+    terms, _, _ = assemble_exit_terms(
+        model, {"states": rollout["states"], "deltas": rollout["deltas"]},
+        target, args, 4, base_logits=rollout["base_logits"], include_delta=False,
+    )
+    weights = torch.tensor([0.65, 0.06, 0.06, 0.17, 0.06])
+    _, _, base_chosen, _, _ = joint_sample_losses(terms, weights, 0.25, 0.05, hard_min_depth=2)
+    # punish the three shallower candidates so the argmin must land deepest
+    delta_costs = torch.zeros(4, 2)
+    delta_costs[:3] = 1e3
+    _, _, steered_chosen, _, _ = joint_sample_losses(
+        terms, weights, 0.25, 0.05, hard_min_depth=2,
+        delta_costs=delta_costs, kappa=1.0,
+    )
+    assert torch.equal(steered_chosen, torch.full((2,), 4))
+
+
+def test_joint_prior_validation():
+    ok = argparse.Namespace(
+        loss_weight_prior="0.65,0.06,0.06,0.17,0.06",
+        exit_selection_delta_weight=0.05,
+    )
+    prior, kappa = _joint_prior_and_kappa(ok)
+    assert torch.allclose(prior, torch.tensor([0.65, 0.06, 0.06, 0.17, 0.06]))
+    assert kappa == 0.05
+    with pytest.raises(ValueError, match="five values"):
+        _joint_prior_and_kappa(argparse.Namespace(
+            loss_weight_prior="0.0,0.15,0.15,0.10,0.45,0.15",  # legacy six-value input
+            exit_selection_delta_weight=0.05,
+        ))
+    with pytest.raises(ValueError, match="five values"):
+        _joint_prior_and_kappa(argparse.Namespace(
+            loss_weight_prior="0.5,0.2,0.2,0.2,0.2",  # sums to 1.3
+            exit_selection_delta_weight=0.05,
+        ))
+    with pytest.raises(ValueError, match="non-negative"):
+        _joint_prior_and_kappa(argparse.Namespace(
+            loss_weight_prior="0.65,0.06,0.06,0.17,0.06",
+            exit_selection_delta_weight=-0.1,
+        ))

@@ -1425,8 +1425,10 @@ class MemoryTransformerForCausalLM(nn.Module):
         phase-A halting losses never re-run the vocabulary matmul, and the
         per-cycle router losses needed by the phase-B CE objective.  The
         per-depth state deltas are only computed when ``compute_deltas`` is
-        set (lossB now trains the selected depth's delta through
-        :meth:`forward_until`, so the phase-A cost matrix omits it).
+        set; the joint trainer feeds them to the depth-selection argmin as the
+        ``kappa * delta / tau_s`` term (loss_A keeps the five-term cost
+        matrix), while lossB trains the selected depth's delta through
+        :meth:`forward_until`.
         """
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, sequence]")

@@ -172,14 +172,22 @@ def parse_args() -> argparse.Namespace:
         "from past joint logs; 1.1 ~= 20%% share at lossB_ce 8.5, d=0.99",
     )
     parser.add_argument(
+        "--exit-selection-delta-weight",
+        type=float,
+        default=0.05,
+        help="kappa: weight of kappa*delta/tau_s added to the five-term cost for "
+        "the depth-selection argmin only (patent rule d_i=argmin(l+kappa*delta/"
+        "tau_s)); loss_A keeps the five-term cost and tau_s is --exit-tau-delta",
+    )
+    parser.add_argument(
         "--loss-weight-prior",
         default="0.65,0.06,0.06,0.17,0.06",
-        help="fixed target distribution over the five cost terms "
-        "[CE, confidence, margin, speed, guard] (C_1..C_5); six-value inputs "
-        "[CE, confidence, margin, delta, speed, guard] are still accepted for "
-        "backward compatibility: the joint trainer drops the delta slot (its "
-        "state-change term trains lossB via --exit-delta-weight) and "
-        "renormalizes the remaining five",
+        help="fixed weights over the five cost terms [CE, confidence, margin, "
+        "speed, guard] (C_1..C_5), summing to one; the state-change term is not "
+        "part of the weighted cost -- it enters the joint depth argmin through "
+        "--exit-selection-delta-weight and lossB through --exit-delta-weight. "
+        "The joint trainer rejects the legacy six-value input (with a delta "
+        "slot); the readout trainer still maps it onto its six-term loss",
     )
     parser.add_argument(
         "--pi1-anneal-start",
@@ -1032,6 +1040,8 @@ def train_exit_readout(args: argparse.Namespace) -> None:
                     "optimizer": optimizer.state_dict(),
                     "config": asdict(config),
                     "exit_readout_rank": model.exit_readout.rank,
+                    "exit_loss_weights": weights.detach().cpu(),
+                    "exit_temperature": stats["temperature"],
                 },
                 args.checkpoint,
             )
@@ -1055,6 +1065,8 @@ def train_exit_readout(args: argparse.Namespace) -> None:
                     "optimizer": optimizer.state_dict(),
                     "config": asdict(config),
                     "exit_readout_rank": model.exit_readout.rank,
+                    "exit_loss_weights": weights.detach().cpu(),
+                    "exit_temperature": stats["temperature"],
                 },
                 args.checkpoint,
             )
@@ -1072,6 +1084,8 @@ def train_exit_readout(args: argparse.Namespace) -> None:
                 "optimizer": optimizer.state_dict(),
                 "config": asdict(config),
                 "exit_readout_rank": model.exit_readout.rank,
+                "exit_loss_weights": weights.detach().cpu(),
+                "exit_temperature": stats["temperature"],
             },
             args.checkpoint,
         )
@@ -1120,30 +1134,66 @@ def joint_token_rows(hidden, next_token_labels):
     return hidden.reshape(-1, hidden.size(-1)), next_token_labels.reshape(-1)
 
 
-def joint_sample_losses(terms, weights, temperature, beta, hard_min_depth=1):
+def joint_sample_losses(terms, weights, temperature, beta, hard_min_depth=1,
+                        delta_costs=None, kappa=0.0):
     """A1 selected weighted cost; A2 per-sample self-label CE + entropy.
 
     Candidates start at hard_min_depth; the guard independently penalizes
     depths below its soft threshold.  The contribution alignment term
     is dropped: the fixed weights already set each cost's share of the total.
+
+    ``delta_costs`` is the per-depth state-change row ``delta / tau_s`` with
+    shape ``[D, N]``; ``kappa`` scales it into the SELECTION cost only, per
+    the patent rule ``d_i = argmin(ℓ + κ·δ/τ_s)``.  loss_A stays on the
+    five-term cost: A1, the selection distribution and the entropy never see
+    the state-change term (it carries no readout gradient and trains the
+    backbone through lossB instead).
     """
     if temperature <= 0 or beta < 0:
         raise ValueError("temperature must be positive and beta non-negative")
     weighted = weights[:, None, None] * terms
     costs = weighted.sum(0)
+    selection_costs = costs
+    if delta_costs is not None and kappa != 0.0:
+        if delta_costs.shape != costs.shape:
+            raise ValueError("delta_costs must share the [depth, sample] cost shape")
+        selection_costs = costs + kappa * delta_costs
     if not 1 <= hard_min_depth <= costs.shape[0]:
         raise ValueError("hard_min_depth must be within the available depths")
     floor = hard_min_depth - 1
-    candidate = costs[floor:]
-    chosen = candidate.detach().argmin(0) + floor
+    chosen = selection_costs[floor:].detach().argmin(0) + floor
     sample = torch.arange(costs.shape[1], device=costs.device)
     a1 = costs[chosen, sample].mean()
+    candidate = costs[floor:]
     log_p = (-candidate / temperature).log_softmax(0)
     p = log_p.exp()
     ce = -log_p[chosen - floor, sample].mean()
     entropy = -(p * log_p).sum(0).mean() / np.log(candidate.shape[0]) if candidate.shape[0] > 1 else ce * 0
     a2 = ce + beta * entropy
     return a1, a2, chosen + 1, p, entropy
+
+
+def _joint_prior_and_kappa(args):
+    """Five cost weights [CE, confidence, margin, speed, guard] plus kappa.
+
+    The legacy six-value prior (with a delta slot) is retired: the
+    state-change term now enters the joint depth argmin through the
+    standalone ``--exit-selection-delta-weight`` and lossB through
+    --exit-delta-weight, so the five weights must sum to one.
+    """
+    prior = torch.tensor(
+        [float(value) for value in args.loss_weight_prior.split(",")], dtype=torch.float32
+    )
+    if prior.numel() != 5 or abs(float(prior.sum()) - 1.0) > 1e-4:
+        raise ValueError(
+            "--loss-weight-prior must hold exactly five values summing to one: "
+            "[CE, confidence, margin, speed, guard]; the legacy delta slot moved "
+            "to --exit-selection-delta-weight"
+        )
+    kappa = float(args.exit_selection_delta_weight)
+    if kappa < 0:
+        raise ValueError("--exit-selection-delta-weight must be non-negative")
+    return prior, kappa
 
 
 def readout_optimizer_without_weight_group(state):
@@ -1167,17 +1217,7 @@ def train_joint_exit(args: argparse.Namespace) -> None:
         raise ValueError("joint training currently requires --gradient-accumulation 1")
     if args.steps <= 0:
         raise ValueError("steps must be positive")
-    prior = torch.tensor(
-        [float(value) for value in args.loss_weight_prior.split(",")], dtype=torch.float32
-    )
-    if prior.numel() not in (5, 6) or abs(float(prior.sum()) - 1.0) > 1e-4:
-        raise ValueError("--loss-weight-prior must hold five or six values summing to one")
-    if prior.numel() == 6:
-        # The joint cost matrix has five terms: the state-change row now
-        # trains the backbone through lossB (--exit-delta-weight), so drop
-        # the delta slot and renormalize to keep the selection scale.
-        cost_prior = torch.cat([prior[:3], prior[4:]])
-        prior = cost_prior / cost_prior.sum()
+    prior, kappa = _joint_prior_and_kappa(args)
     seed_everything(args.seed, rank)
     store = TokenStore(args.dataset_dir)
     vocab_size = int(store.manifest["vocab_size"])
@@ -1228,7 +1268,7 @@ def train_joint_exit(args: argparse.Namespace) -> None:
     start_step = resume_step
     if rank == 0:
         print(f"joint_start source={source_path or 'random'} step={start_step} seed={args.seed} "
-              "init=linear:xavier,gate:kaiming_relu_approx,router:xavier", flush=True)
+              f"kappa={kappa} init=linear:xavier,gate:kaiming_relu_approx,router:xavier", flush=True)
     remaining_steps = args.steps - start_step
     if remaining_steps <= 0:
         raise ValueError(f"--steps {args.steps} already reached by resumed step {start_step}")
@@ -1240,6 +1280,13 @@ def train_joint_exit(args: argparse.Namespace) -> None:
         p for n, p in model.named_parameters() if not n.startswith("exit_readout.")
     ]
     fixed_weights = prior.to(device)
+    saved_kappa = resume_optimizers.get("exit_selection_delta_weight")
+    if saved_kappa is not None and abs(float(saved_kappa) - kappa) > 1e-9:
+        print(
+            f"joint_kappa checkpoint={float(saved_kappa):.6g} cli={kappa:.6g}; "
+            "keeping the CLI value",
+            flush=True,
+        )
     optimizer_a = torch.optim.AdamW(
         [
             {"params": readout_parameters, "weight_decay": args.exit_readout_weight_decay},
@@ -1330,7 +1377,7 @@ def train_joint_exit(args: argparse.Namespace) -> None:
         t_rollout = time.perf_counter()
         try:
             with autocast:
-                rollout = model.joint_rollout(input_tensor, compute_deltas=False)
+                rollout = model.joint_rollout(input_tensor, compute_deltas=True)
         except torch.OutOfMemoryError:
             torch.cuda.empty_cache()
             oom_skips += 1
@@ -1341,6 +1388,7 @@ def train_joint_exit(args: argparse.Namespace) -> None:
             t_aterms = time.perf_counter()
             states = rollout["states"].clone()
             base_logits = rollout["base_logits"].clone()
+            deltas = rollout["deltas"].clone()
             router_all = rollout["router_losses"].clone()
             del rollout
             phase_a_rollout = {"states": states}
@@ -1356,6 +1404,8 @@ def train_joint_exit(args: argparse.Namespace) -> None:
                 term_rows, weights, args.exit_temp_end,
                 args.joint_selection_entropy_beta,
                 hard_min_depth=args.exit_hard_min_depth,
+                delta_costs=deltas / args.exit_tau_delta,
+                kappa=kappa,
             )
             loss_a = loss_a1 + loss_a2
             _phase("a_terms", t_aterms)
@@ -1428,14 +1478,15 @@ def train_joint_exit(args: argparse.Namespace) -> None:
                         raw_ce.append((lse - target_logit).mean().item())
                 contributions = (fresh[:, None, None] * term_rows).mean(dim=-1).detach().tolist()
                 print(f"joint_depth rank={rank} micro={local_step+1} selected={depth} "
-                      f"ce_by_depth={raw_ce} weighted_terms={contributions} weights={fresh.tolist()}", flush=True)
+                      f"ce_by_depth={raw_ce} weighted_terms={contributions} weights={fresh.tolist()} "
+                      f"kappa={kappa}", flush=True)
                 diagnostic = {"rank": rank, "micro": local_step + 1, "selected": selected_depths.tolist(),
                               "loss_a1": float(loss_a1.detach()), "loss_a2": float(loss_a2.detach()),
                               "selection_entropy": float(entropy.detach()),
                               "training_min_depth": args.exit_min_depth,
                               "hard_min_depth": args.exit_hard_min_depth,
                               "ce_by_depth": raw_ce, "weighted_terms": contributions,
-                              "weights": fresh.tolist()}
+                              "weights": fresh.tolist(), "selection_kappa": kappa}
         _phase("diag", t_diag)
 
         # Phase B: backbone CE at the selected depth (readout detached).
@@ -1703,10 +1754,13 @@ def train_joint_exit(args: argparse.Namespace) -> None:
                         "scheduler_readout": scheduler_a.state_dict(),
                         "config": asdict(config),
                         "exit_cost_mapping": "linear_v1",
-                        "joint_objective": "sample_a1_a2_v3",
+                        "joint_objective": "sample_a1_a2_v4",
                         "joint_selection_entropy_beta": args.joint_selection_entropy_beta,
                         "exit_hard_min_depth": args.exit_hard_min_depth,
                         "exit_guard_min_depth": args.exit_min_depth,
+                        "exit_loss_weights": fixed_weights.detach().cpu(),
+                        "exit_temperature": args.exit_temp_end,
+                        "exit_selection_delta_weight": kappa,
                     },
                     args.checkpoint,
                 )
@@ -1778,10 +1832,13 @@ def train_joint_exit(args: argparse.Namespace) -> None:
                 "scheduler_readout": scheduler_a.state_dict(),
                 "config": asdict(config),
                 "exit_cost_mapping": "linear_v1",
-                "joint_objective": "sample_a1_a2_v3",
+                "joint_objective": "sample_a1_a2_v4",
                 "joint_selection_entropy_beta": args.joint_selection_entropy_beta,
                 "exit_hard_min_depth": args.exit_hard_min_depth,
                 "exit_guard_min_depth": args.exit_min_depth,
+                "exit_loss_weights": fixed_weights.detach().cpu(),
+                "exit_temperature": args.exit_temp_end,
+                "exit_selection_delta_weight": kappa,
             },
             args.checkpoint,
         )
