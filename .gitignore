@@ -6,3 +6,5 @@ __pycache__/
 .pytest_cache/
 checkpoints/
 data/tokens_v2/*.bin
+logs/
+*.pid
